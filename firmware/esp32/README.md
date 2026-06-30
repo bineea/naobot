@@ -2,6 +2,14 @@
 
 本目录是 KT2 身体控制层固件骨架。固件只负责硬件驱动、事件采集、安全动作执行、本地降级和 WebSocket 连接，不负责 LLM、长期记忆、图形化编程或裸舵机角度执行。
 
+## 主固件能力
+
+- `hardware/display.py` 集成 SSD1306 I2C OLED，默认 `SDA=GPIO8`、`SCL=GPIO9`、地址 `0x3C`。
+- `hardware/imu.py` 集成 MPU6050，读取加速度/陀螺仪并输出 `upright`、`fallen`、`unknown` 姿态。
+- OLED 或 MPU6050 缺失时主循环不崩溃；显示屏退回 console 输出，IMU 姿态按 `unknown` 处理。
+- `unknown` 或 `fallen` 姿态会触发安全故障，禁止运动动作。
+- `demo/` 目录只用于硬件 bring-up 验证，不参与主固件运行链路。
+
 ## 上传
 
 ```powershell
@@ -26,6 +34,7 @@ mpremote connect COM3 soft-reset
 
 - Agent 只能调用白名单动作。
 - 低电量、姿态异常、跌倒后拒绝运动动作。
+- MPU6050 缺失或读取失败按 `unknown` 姿态处理，禁止运动动作。
 - `stop` 是最高优先级动作。
 - 不支持 LLM 下发裸舵机角度。
 - Agent 离线时进入本地降级。

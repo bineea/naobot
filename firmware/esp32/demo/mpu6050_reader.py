@@ -1,5 +1,6 @@
-from machine import Pin, I2C
 import time
+
+from machine import I2C, Pin
 
 MPU_ADDR = 0x68
 
@@ -72,7 +73,7 @@ def calibrate_mpu6050(samples=300):
     ay_sum = 0
     az_sum = 0
 
-    for i in range(samples):
+    for _ in range(samples):
         ax, ay, az, gx, gy, gz, temp_raw = read_raw_data()
 
         ax_sum += ax
@@ -135,9 +136,9 @@ else:
     while True:
         ax, ay, az, gx, gy, gz, temp = read_mpu6050()
 
-        print("ACC: X={:.3f}g Y={:.3f}g Z={:.3f}g".format(ax, ay, az))
-        print("GYRO: X={:.3f} Y={:.3f} Z={:.3f} deg/s".format(gx, gy, gz))
-        print("TEMP: {:.2f} C".format(temp))
+        print(f"ACC: X={ax:.3f}g Y={ay:.3f}g Z={az:.3f}g")
+        print(f"GYRO: X={gx:.3f} Y={gy:.3f} Z={gz:.3f} deg/s")
+        print(f"TEMP: {temp:.2f} C")
         print("-----------------------")
 
         time.sleep(0.5)

@@ -1,6 +1,7 @@
-from machine import Pin, I2C
-import ssd1306
 import time
+
+import ssd1306
+from machine import I2C, Pin
 
 # 按你的实际接线修改
 SCL = 9

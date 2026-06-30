@@ -1,5 +1,5 @@
-from machine import Pin, I2C
-import time
+
+from machine import I2C, Pin
 
 print("Program started")
 

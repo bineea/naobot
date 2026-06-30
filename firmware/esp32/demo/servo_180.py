@@ -1,6 +1,6 @@
-from machine import Pin, PWM
 from time import sleep_ms
 
+from machine import PWM, Pin
 
 # =========================
 # 基本配置
