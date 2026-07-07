@@ -3,7 +3,22 @@ try:
 except ImportError:
     import asyncio
 
-from config import AGENT_WS_URL
+try:
+    import utime as time
+except ImportError:
+    import time
+
+from comm.websocket_client import WebSocketClient
+from comm.wifi_config import connect_wifi
+from config import (
+    AGENT_WS_URL,
+    HEARTBEAT_INTERVAL_MS,
+    SESSION_ID,
+    WIFI_CONNECT_TIMEOUT_MS,
+    WIFI_PASSWORD,
+    WIFI_SSID,
+    WS_RECONNECT_DELAY_MS,
+)
 from hardware.display import Display
 from hardware.imu import IMU
 from hardware.power import PowerMonitor
@@ -13,6 +28,139 @@ from interaction.event_adapter import EventAdapter
 from interaction.local_fallback import LocalFallback
 from motion.action_player import ActionPlayer
 from safety.guard import SafetyGuard
+
+
+def now_ms():
+    if hasattr(time, "ticks_ms"):
+        return time.ticks_ms()
+    return int(time.time() * 1000)
+
+
+def ticks_diff(end, start):
+    if hasattr(time, "ticks_diff"):
+        return time.ticks_diff(end, start)
+    return end - start
+
+
+async def sleep_ms(ms):
+    if hasattr(asyncio, "sleep_ms"):
+        await asyncio.sleep_ms(ms)
+    else:
+        await asyncio.sleep(ms / 1000)
+
+
+class FirmwareProtocol:
+    def __init__(self, session_id):
+        self.session_id = session_id
+        self.seq = 0
+
+    def envelope(self, msg_type, payload=None, priority=3, msg_id=None):
+        self.seq += 1
+        if not msg_id:
+            msg_id = f"{msg_type}_{now_ms()}_{self.seq}"
+        return {
+            "type": msg_type,
+            "id": msg_id,
+            "seq": self.seq,
+            "ts_ms": now_ms(),
+            "session_id": self.session_id,
+            "priority": priority,
+            "payload": payload or {},
+        }
+
+    def event(self, name, power, imu):
+        return self.envelope(
+            "event",
+            {
+                "name": name,
+                "source": "esp32",
+                "battery_pct": power.battery_pct,
+                "posture": imu.read_posture(),
+            },
+        )
+
+    def ack(self, intent_id, status="accepted"):
+        return self.envelope("ack", {"intent_id": intent_id, "status": status})
+
+    def error(self, code, message, intent_id=None):
+        payload = {"code": code, "message": message}
+        if intent_id:
+            payload["intent_id"] = intent_id
+        return self.envelope("error", payload, priority=8)
+
+    def heartbeat(self, power, imu):
+        return self.envelope(
+            "heartbeat",
+            {"battery_pct": power.battery_pct, "posture": imu.read_posture()},
+            priority=1,
+        )
+
+
+def execute_intent(message, actions, safety, protocol, ws):
+    intent_id = message.get("id")
+    payload = message.get("payload", {})
+    action_list = payload.get("actions")
+    if not isinstance(action_list, list):
+        ws.send_json(protocol.error("INVALID_INTENT", "payload.actions must be a list", intent_id))
+        return
+
+    if any(action.get("name") == "stop" for action in action_list):
+        actions.stop()
+        ws.send_json(protocol.ack(intent_id))
+        return
+
+    for action in action_list:
+        if not isinstance(action, dict) or not safety.can_execute(action):
+            ws.send_json(protocol.error("POLICY_DENIED", "firmware rejected unsafe action", intent_id))
+            return
+
+    for action in action_list:
+        actions.execute(action)
+    ws.send_json(protocol.ack(intent_id))
+
+
+def handle_agent_message(message, actions, safety, protocol, ws):
+    if not isinstance(message, dict):
+        return
+    msg_type = message.get("type")
+    if msg_type == "intent":
+        execute_intent(message, actions, safety, protocol, ws)
+
+
+async def network_loop(display, power, imu, actions, safety, protocol, state):
+    while True:
+        if not connect_wifi(WIFI_SSID, WIFI_PASSWORD, WIFI_CONNECT_TIMEOUT_MS):
+            display.show_status("wifi offline")
+            await sleep_ms(WS_RECONNECT_DELAY_MS)
+            continue
+
+        ws = WebSocketClient(AGENT_WS_URL)
+        if not ws.connect():
+            display.show_status("agent offline")
+            await sleep_ms(WS_RECONNECT_DELAY_MS)
+            continue
+
+        state["ws"] = ws
+        display.show_status("agent online")
+        ws.send_json(protocol.envelope("status", {"battery_pct": power.battery_pct, "posture": imu.read_posture()}))
+        last_heartbeat = now_ms()
+
+        while ws.connected:
+            try:
+                message = ws.recv_json()
+                if message:
+                    handle_agent_message(message, actions, safety, protocol, ws)
+                if ticks_diff(now_ms(), last_heartbeat) >= HEARTBEAT_INTERVAL_MS:
+                    ws.send_json(protocol.heartbeat(power, imu))
+                    last_heartbeat = now_ms()
+            except Exception as exc:
+                print("network loop error:", exc)
+                ws.close()
+            await sleep_ms(100)
+
+        state["ws"] = None
+        display.show_status("agent offline")
+        await sleep_ms(WS_RECONNECT_DELAY_MS)
 
 
 async def main():
@@ -25,9 +173,12 @@ async def main():
     safety = SafetyGuard(power, imu)
     fallback = LocalFallback(display, actions)
     adapter = EventAdapter(touch, imu, power)
+    protocol = FirmwareProtocol(SESSION_ID)
+    network_state = {"ws": None}
 
     display.set_face("idle")
     print("naobot firmware booted; agent:", AGENT_WS_URL)
+    asyncio.create_task(network_loop(display, power, imu, actions, safety, protocol, network_state))
 
     while True:
         event = adapter.poll()
@@ -36,11 +187,15 @@ async def main():
                 actions.stop()
                 display.set_face("alert")
             else:
-                fallback.handle(event)
-        await asyncio.sleep_ms(50)
+                ws = network_state.get("ws")
+                envelope = protocol.event(event, power, imu)
+                if not ws or not ws.connected or not ws.send_json(envelope):
+                    fallback.handle(event)
+        await sleep_ms(50)
 
 
-try:
-    asyncio.run(main())
-except Exception as exc:
-    print("fatal:", exc)
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except Exception as exc:
+        print("fatal:", exc)

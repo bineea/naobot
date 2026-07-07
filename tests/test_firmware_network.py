@@ -1,0 +1,141 @@
+import importlib
+import sys
+from pathlib import Path
+
+FIRMWARE_ROOT = Path(__file__).resolve().parents[1] / "firmware" / "esp32"
+if str(FIRMWARE_ROOT) not in sys.path:
+    sys.path.insert(0, str(FIRMWARE_ROOT))
+
+firmware_main = importlib.import_module("main")
+
+from comm.websocket_client import WebSocketClient, parse_ws_url  # noqa: E402
+
+
+def decode_masked_payload(frame: bytes) -> bytes:
+    length = frame[1] & 0x7F
+    offset = 2
+    if length == 126:
+        length = (frame[2] << 8) | frame[3]
+        offset = 4
+    mask = frame[offset : offset + 4]
+    payload = frame[offset + 4 : offset + 4 + length]
+    return bytes(payload[i] ^ mask[i % 4] for i in range(length))
+
+
+class FakeActions:
+    def __init__(self):
+        self.executed = []
+        self.stopped = False
+
+    def execute(self, action):
+        self.executed.append(action)
+
+    def stop(self):
+        self.stopped = True
+
+
+class FakeSafety:
+    def __init__(self, allowed=True):
+        self.allowed = allowed
+
+    def can_execute(self, action):
+        return self.allowed and action.get("name") != "unsafe"
+
+
+class FakeWs:
+    def __init__(self):
+        self.sent = []
+
+    def send_json(self, payload):
+        self.sent.append(payload)
+        return True
+
+
+def test_parse_ws_url_with_port_and_path() -> None:
+    assert parse_ws_url("ws://192.168.1.2:8765/ws/kt2") == ("192.168.1.2", 8765, "/ws/kt2")
+    assert parse_ws_url("ws://host.local") == ("host.local", 80, "/")
+
+
+def test_parse_ws_url_rejects_wss() -> None:
+    try:
+        parse_ws_url("wss://example.com/ws")
+    except ValueError as exc:
+        assert "ws://" in str(exc)
+    else:
+        raise AssertionError("wss url should be rejected")
+
+
+def test_websocket_text_frame_is_masked() -> None:
+    frame = WebSocketClient("ws://host/ws")._encode_frame(b"hello")
+
+    assert frame[0] == 0x81
+    assert frame[1] & 0x80
+    assert decode_masked_payload(frame) == b"hello"
+
+
+def test_firmware_protocol_event_shape() -> None:
+    class Power:
+        battery_pct = 77
+
+    class Imu:
+        def read_posture(self):
+            return "upright"
+
+    protocol = firmware_main.FirmwareProtocol("kt2-test")
+    event = protocol.event("touch_head", Power(), Imu())
+
+    assert event["type"] == "event"
+    assert event["session_id"] == "kt2-test"
+    assert event["payload"]["name"] == "touch_head"
+    assert event["payload"]["battery_pct"] == 77
+    assert event["payload"]["posture"] == "upright"
+
+
+def test_execute_intent_runs_safe_actions_and_acks() -> None:
+    actions = FakeActions()
+    ws = FakeWs()
+    protocol = firmware_main.FirmwareProtocol("kt2-test")
+    message = {
+        "id": "intent-1",
+        "type": "intent",
+        "payload": {"actions": [{"name": "set_face", "args": {"face": "happy"}}]},
+    }
+
+    firmware_main.execute_intent(message, actions, FakeSafety(), protocol, ws)
+
+    assert actions.executed == [{"name": "set_face", "args": {"face": "happy"}}]
+    assert ws.sent[-1]["type"] == "ack"
+    assert ws.sent[-1]["payload"]["intent_id"] == "intent-1"
+
+
+def test_execute_intent_rejects_unsafe_action_without_execution() -> None:
+    actions = FakeActions()
+    ws = FakeWs()
+    protocol = firmware_main.FirmwareProtocol("kt2-test")
+    message = {
+        "id": "intent-2",
+        "type": "intent",
+        "payload": {"actions": [{"name": "unsafe", "args": {}}]},
+    }
+
+    firmware_main.execute_intent(message, actions, FakeSafety(), protocol, ws)
+
+    assert actions.executed == []
+    assert ws.sent[-1]["type"] == "error"
+    assert ws.sent[-1]["payload"]["code"] == "POLICY_DENIED"
+
+
+def test_execute_intent_stop_bypasses_policy() -> None:
+    actions = FakeActions()
+    ws = FakeWs()
+    protocol = firmware_main.FirmwareProtocol("kt2-test")
+    message = {
+        "id": "intent-3",
+        "type": "intent",
+        "payload": {"actions": [{"name": "stop", "args": {}}]},
+    }
+
+    firmware_main.execute_intent(message, actions, FakeSafety(allowed=False), protocol, ws)
+
+    assert actions.stopped is True
+    assert ws.sent[-1]["type"] == "ack"
