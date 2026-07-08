@@ -75,6 +75,24 @@ class SSD1306_I2C:
     def fill(self, color):
         self.framebuf.fill(color)
 
+    def pixel(self, x, y, color):
+        self.framebuf.pixel(x, y, color)
+
+    def hline(self, x, y, width, color):
+        self.framebuf.hline(x, y, width, color)
+
+    def vline(self, x, y, height, color):
+        self.framebuf.vline(x, y, height, color)
+
+    def line(self, x1, y1, x2, y2, color):
+        self.framebuf.line(x1, y1, x2, y2, color)
+
+    def rect(self, x, y, width, height, color):
+        self.framebuf.rect(x, y, width, height, color)
+
+    def fill_rect(self, x, y, width, height, color):
+        self.framebuf.fill_rect(x, y, width, height, color)
+
     def text(self, text, x, y, color=1):
         self.framebuf.text(text, x, y, color)
 
@@ -86,4 +104,3 @@ class SSD1306_I2C:
         self._write_cmd(0)
         self._write_cmd(self.pages - 1)
         self._write_data(self.buffer)
-

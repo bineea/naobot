@@ -4,7 +4,8 @@
 
 ## 主固件能力
 
-- `hardware/display.py` 集成 SSD1306 I2C OLED，默认 `SDA=GPIO8`、`SCL=GPIO9`、地址 `0x3C`。
+- `hardware/display.py` 集成 0.96 寸 128x64 SSD1306 I2C OLED，默认 `SDA=GPIO8`、`SCL=GPIO9`、地址 `0x3C`，使用圆圆护目镜风格的眼睛驱动表情，不画大号 emoji、嘴巴或复杂文字。
+- OLED 表情支持短动画帧：`idle` 左右看、`happy` 开心眯眼、`alert` 警觉抖动、`sleepy` 缓慢闭眼，`blink` 快速闭眼后恢复当前表情。
 - `hardware/imu.py` 集成 MPU6050，读取加速度/陀螺仪并输出 `upright`、`fallen`、`unknown` 姿态。
 - OLED 或 MPU6050 缺失时主循环不崩溃；显示屏退回 console 输出，IMU 姿态按 `unknown` 处理。
 - `unknown` 或 `fallen` 姿态会触发安全故障，禁止运动动作。
