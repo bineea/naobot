@@ -9,6 +9,7 @@ if str(FIRMWARE_ROOT) not in sys.path:
 firmware_main = importlib.import_module("main")
 
 from comm.websocket_client import WebSocketClient, parse_ws_url  # noqa: E402
+from motion.action_player import ActionResult  # noqa: E402
 
 
 def decode_masked_payload(frame: bytes) -> bytes:
@@ -29,6 +30,7 @@ class FakeActions:
 
     def execute(self, action):
         self.executed.append(action)
+        return ActionResult(True)
 
     def stop(self):
         self.stopped = True
@@ -49,6 +51,12 @@ class FakeWs:
     def send_json(self, payload):
         self.sent.append(payload)
         return True
+
+
+class FailingActions(FakeActions):
+    def execute(self, action):
+        self.executed.append(action)
+        return ActionResult(False, "测试执行失败")
 
 
 def test_parse_ws_url_with_port_and_path() -> None:
@@ -123,6 +131,23 @@ def test_execute_intent_rejects_unsafe_action_without_execution() -> None:
     assert actions.executed == []
     assert ws.sent[-1]["type"] == "error"
     assert ws.sent[-1]["payload"]["code"] == "POLICY_DENIED"
+
+
+def test_execute_intent_reports_execution_failure() -> None:
+    actions = FailingActions()
+    ws = FakeWs()
+    protocol = firmware_main.FirmwareProtocol("kt2-test")
+    message = {
+        "id": "intent-4",
+        "type": "intent",
+        "payload": {"actions": [{"name": "set_face", "args": {"face": "happy"}}]},
+    }
+
+    firmware_main.execute_intent(message, actions, FakeSafety(), protocol, ws)
+
+    assert actions.executed == [{"name": "set_face", "args": {"face": "happy"}}]
+    assert ws.sent[-1]["type"] == "error"
+    assert ws.sent[-1]["payload"]["code"] == "EXECUTION_FAILED"
 
 
 def test_execute_intent_stop_bypasses_policy() -> None:

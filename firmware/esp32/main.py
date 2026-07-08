@@ -19,6 +19,7 @@ from config import (
     WIFI_SSID,
     WS_RECONNECT_DELAY_MS,
 )
+from hardware.buzzer import Buzzer
 from hardware.display import Display
 from hardware.imu import IMU
 from hardware.power import PowerMonitor
@@ -104,7 +105,7 @@ def execute_intent(message, actions, safety, protocol, ws):
         ws.send_json(protocol.error("INVALID_INTENT", "payload.actions must be a list", intent_id))
         return
 
-    if any(action.get("name") == "stop" for action in action_list):
+    if any(isinstance(action, dict) and action.get("name") == "stop" for action in action_list):
         actions.stop()
         ws.send_json(protocol.ack(intent_id))
         return
@@ -115,7 +116,10 @@ def execute_intent(message, actions, safety, protocol, ws):
             return
 
     for action in action_list:
-        actions.execute(action)
+        result = actions.execute(action)
+        if not result.accepted:
+            ws.send_json(protocol.error("EXECUTION_FAILED", result.reason, intent_id))
+            return
     ws.send_json(protocol.ack(intent_id))
 
 
@@ -169,7 +173,8 @@ async def main():
     power = PowerMonitor()
     touch = TouchInputs()
     servos = ServoBank()
-    actions = ActionPlayer(servos, display)
+    buzzer = Buzzer()
+    actions = ActionPlayer(servos, display, buzzer)
     safety = SafetyGuard(power, imu)
     fallback = LocalFallback(display, actions)
     adapter = EventAdapter(touch, imu, power)

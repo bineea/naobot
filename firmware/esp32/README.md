@@ -10,6 +10,8 @@
 - `unknown` 或 `fallen` 姿态会触发安全故障，禁止运动动作。
 - `main.py` 会尝试连接 WiFi 和 Host WebSocket；当前只支持明文 `ws://`，不支持 `wss://`。
 - 网络不可用时，固件继续使用本地 fallback，不阻塞安全循环。
+- `motion/action_player.py` 已实现 Host 白名单动作：`set_face`、`blink`、`wave`、`small_step_forward`、`turn_left`、`turn_right`、`gentle_nudge`、`sit`、`chirp`、`sleep`、`stop`。
+- 当前动作假设四个 180 度关节舵机按 `lf/rf/lr/rr` 表示左前、右前、左后、右后；动作序列以明显可见和可调参为目标。
 - `demo/` 目录只用于硬件 bring-up 验证，不参与主固件运行链路。
 
 ## 网络配置
@@ -50,6 +52,7 @@ mpremote connect COM3 soft-reset
 - 低电量、姿态异常、跌倒后拒绝运动动作。
 - MPU6050 缺失或读取失败按 `unknown` 姿态处理，禁止运动动作。
 - Host 下发的 intent 仍需通过固件 `SafetyGuard`，固件不会盲信网络指令。
+- 固件动作执行失败时返回 `error`，不会对未执行动作回假 `ack`。
 - `stop` 是最高优先级动作。
 - 不支持 LLM 下发裸舵机角度。
 - Agent 离线时进入本地降级。

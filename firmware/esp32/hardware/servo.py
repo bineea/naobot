@@ -6,6 +6,18 @@ except ImportError:
 
 from config import SERVO_LIMITS, SERVO_PINS
 
+try:
+    import utime as time
+except ImportError:
+    import time
+
+
+def sleep_ms(ms):
+    if hasattr(time, "sleep_ms"):
+        time.sleep_ms(ms)
+    else:
+        time.sleep(ms / 1000)
+
 
 class Servo:
     def __init__(self, pin):
@@ -37,6 +49,21 @@ class ServoBank:
     def set_all(self, degrees):
         for servo in self.servos.values():
             servo.angle(degrees)
+
+    def set(self, name, degrees):
+        servo = self.servos.get(name)
+        if not servo:
+            raise ValueError(f"unknown servo: {name}")
+        servo.angle(degrees)
+
+    def pose(self, positions):
+        for name, degrees in positions.items():
+            self.set(name, degrees)
+
+    def sequence(self, frames, delay_ms=180):
+        for frame in frames:
+            self.pose(frame)
+            sleep_ms(delay_ms)
 
     def stop(self):
         for servo in self.servos.values():
