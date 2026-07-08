@@ -61,11 +61,11 @@ def _b64(data):
 
 def _random_bytes(length):
     try:
-        return random.getrandbits(length * 8).to_bytes(length, "big")
+        return random.urandom(length)
     except AttributeError:
         pass
     try:
-        return random.urandom(length)
+        return bytes(random.getrandbits(8) for _ in range(length))
     except AttributeError:
         seed = int(time.time() * 1000)
         return bytes((seed + i * 37) & 0xFF for i in range(length))

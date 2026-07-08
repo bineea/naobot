@@ -1,5 +1,3 @@
-from dataclasses import dataclass
-
 MOVEMENT_ACTIONS = ("wave", "small_step_forward", "turn_left", "turn_right", "gentle_nudge")
 
 NEUTRAL = {"lf": 90, "rf": 90, "lr": 90, "rr": 90}
@@ -14,10 +12,10 @@ NUDGE_A = {"lf": 112, "rf": 68, "lr": 112, "rr": 68}
 NUDGE_B = {"lf": 78, "rf": 102, "lr": 78, "rr": 102}
 
 
-@dataclass
 class ActionResult:
-    accepted: bool
-    reason: str = ""
+    def __init__(self, accepted, reason=""):
+        self.accepted = accepted
+        self.reason = reason
 
 
 class ActionPlayer:

@@ -7,6 +7,7 @@ if str(FIRMWARE_ROOT) not in sys.path:
     sys.path.insert(0, str(FIRMWARE_ROOT))
 
 firmware_main = importlib.import_module("main")
+websocket_client = importlib.import_module("comm.websocket_client")
 
 from comm.websocket_client import WebSocketClient, parse_ws_url  # noqa: E402
 from motion.action_player import ActionResult  # noqa: E402
@@ -79,6 +80,23 @@ def test_websocket_text_frame_is_masked() -> None:
     assert frame[0] == 0x81
     assert frame[1] & 0x80
     assert decode_masked_payload(frame) == b"hello"
+
+
+def test_random_bytes_uses_byte_sized_getrandbits(monkeypatch) -> None:
+    class MicroPythonRandom:
+        calls = []
+
+        @staticmethod
+        def getrandbits(bits):
+            MicroPythonRandom.calls.append(bits)
+            if bits > 32:
+                raise ValueError("bits must be 32 or less")
+            return 7
+
+    monkeypatch.setattr(websocket_client, "random", MicroPythonRandom)
+
+    assert websocket_client._random_bytes(16) == bytes([7] * 16)
+    assert MicroPythonRandom.calls == [8] * 16
 
 
 def test_firmware_protocol_event_shape() -> None:
