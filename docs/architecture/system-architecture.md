@@ -11,6 +11,15 @@ Dashboard <-> FastAPI Host <-> WebSocket <-> ESP32 Firmware
                     CPython Simulator
 ```
 
+控制层级：
+
+```text
+L3 Host/LLM 语义意图层：决定 goal、文本、表情意图和技能请求。
+L2 行为/技能层：把语义 intent 转成安全技能和兼容 actions。
+L1 固件运动协调层：tick/cancel 动作，负责运动中断和姿态保护。
+L0 固件反射安全层：急停、低电、跌倒、IMU fault，本地最高优先级。
+```
+
 ## 宿主机
 
 宿主机代码位于 `src/naobot/`，运行在 Python 3.11 环境。
@@ -20,7 +29,7 @@ Dashboard <-> FastAPI Host <-> WebSocket <-> ESP32 Firmware
 - 提供 FastAPI Dashboard 和 WebSocket 服务。
 - 接收机器人事件并维护状态。
 - 调用 OpenAI-compatible LLM；未配置或失败时使用规则 fallback。
-- 执行动作白名单和 `PolicyGuard`。
+- 生成语义 intent，并执行动作、技能和表情参数的 `PolicyGuard`。
 - 管理 Soul、Memory、Routine。
 - 提供 CLI 和 CPython 模拟器。
 
@@ -34,8 +43,8 @@ Dashboard <-> FastAPI Host <-> WebSocket <-> ESP32 Firmware
 
 - 连接 WiFi 和宿主机 WebSocket。
 - 采集触摸、姿态、电池等事件。
-- 接收并执行宿主机下发的白名单动作。
-- 执行本地安全守卫、失联降级、低电和跌倒保护。
+- 接收宿主机下发的语义 intent 或兼容 actions。
+- 执行本地反射安全、可中断运动调度、失联降级、低电和跌倒保护。
 
 固件不做 LLM、长期记忆、Dashboard、Blockly 或通用编程能力。
 

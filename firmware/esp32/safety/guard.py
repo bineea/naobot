@@ -21,6 +21,7 @@ class SafetyGuard:
             return False
         return name in (
             "set_face",
+            "set_expression",
             "blink",
             "wave",
             "small_step_forward",

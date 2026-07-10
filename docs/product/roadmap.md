@@ -18,6 +18,13 @@
 - 增加可解释的 routine 推荐和确认流程。
 - 优化 Dashboard 的状态可视化与诊断日志。
 
+## Phase 1A-1D：分层自治控制
+
+- Phase 1A：反射安全层，固件本地处理跌倒、低电、急停和 IMU fault。
+- Phase 1B：可中断运动控制，运动动作支持 tick/cancel 和安全抢占。
+- Phase 1C：参数化表情，Host 输出 expression，固件 renderer 负责限幅绘制。
+- Phase 1D：Host 语义行为层，LLM 输出 goal + expression + skills，并保留 actions 兼容。
+
 ## Phase 3：多 agent 工程化
 
 - 使用 `docs/agents/` 模板让架构、开发、测试、评审 agent 并行协作。

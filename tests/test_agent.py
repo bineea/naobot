@@ -35,3 +35,25 @@ async def test_low_battery_event_does_not_emit_movement(tmp_path) -> None:
     assert response.type == MessageType.INTENT
     names = [action["name"] for action in response.payload["actions"]]
     assert "wave" not in names
+
+
+def test_heartbeat_updates_control_state(tmp_path) -> None:
+    agent = NaobotAgent(Settings(runtime_dir=tmp_path), llm=RuleBasedLLMClient())
+    heartbeat = Envelope(
+        type=MessageType.HEARTBEAT,
+        payload={
+            "battery_pct": 70,
+            "posture": "upright",
+            "control_authority": "reflex",
+            "reflex_state": "fall_detected",
+            "motion_state": "cancelled",
+            "last_reflex": "brace_and_sit",
+        },
+    )
+
+    agent.update_state_from_envelope(heartbeat)
+
+    assert agent.state.control_authority == "reflex"
+    assert agent.state.reflex_state == "fall_detected"
+    assert agent.state.motion_state == "cancelled"
+    assert agent.state.last_reflex == "brace_and_sit"

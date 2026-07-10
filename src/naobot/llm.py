@@ -5,7 +5,7 @@ from typing import Any
 
 import httpx
 
-from .models import Action, Envelope, LLMDecision, SoulConfig
+from .models import Action, Envelope, ExpressionIntent, LLMDecision, SkillIntent, SoulConfig
 from .settings import Settings
 
 
@@ -30,6 +30,9 @@ class RuleBasedLLMClient(LLMClient):
         if name == "touch_head":
             return LLMDecision(
                 text=f"我在呢，{soul.user_call}。",
+                goal="回应用户摸头并友好打招呼",
+                expression=ExpressionIntent(emotion="happy", valence=0.8, arousal=0.4, eye_open=0.75),
+                skills=[SkillIntent(name="wave", args={"level": 1})],
                 actions=[
                     Action(name="set_face", args={"face": "happy"}),
                     Action(name="wave", args={"level": 1}),
@@ -38,6 +41,9 @@ class RuleBasedLLMClient(LLMClient):
         if name == "battery_low":
             return LLMDecision(
                 text=f"{soul.user_call}，我电量有点低，先别让我跑了。",
+                goal="提醒用户低电并进入省电状态",
+                expression=ExpressionIntent(emotion="sleepy", valence=-0.2, arousal=0.1, eye_open=0.35),
+                skills=[SkillIntent(name="chirp", args={"tone": "low_battery"})],
                 actions=[
                     Action(name="set_face", args={"face": "sleepy"}),
                     Action(name="chirp", args={"tone": "low_battery"}),
@@ -46,6 +52,9 @@ class RuleBasedLLMClient(LLMClient):
         if name == "fall_detected":
             return LLMDecision(
                 text="我好像摔倒了，先进入安全模式。",
+                goal="解释本地安全反射并等待用户处理",
+                expression=ExpressionIntent(emotion="alert", valence=-0.5, arousal=0.9, eye_open=1.0),
+                skills=[SkillIntent(name="chirp", args={"tone": "alert"})],
                 actions=[
                     Action(name="set_face", args={"face": "alert"}),
                     Action(name="chirp", args={"tone": "alert"}),
@@ -53,6 +62,8 @@ class RuleBasedLLMClient(LLMClient):
             )
         return LLMDecision(
             text=f"{soul.name} 收到事件 {name}。",
+            goal="轻量确认收到事件",
+            expression=ExpressionIntent(emotion="curious", valence=0.2, arousal=0.4, eye_open=0.85),
             actions=[Action(name="blink")],
         )
 
@@ -83,8 +94,9 @@ class OpenAICompatibleLLMClient(LLMClient):
                     "role": "system",
                     "content": (
                         "你是 KT2 宿主机 Agent。只能输出 JSON，不允许裸舵机角度。"
-                        "动作必须来自白名单：set_face, blink, wave, small_step_forward, "
-                        "turn_left, turn_right, gentle_nudge, sit, chirp, sleep, stop。"
+                        "优先输出 goal、expression、skills，并同时给出兼容 actions。"
+                        "技能和动作必须来自白名单：set_expression, set_face, blink, wave, "
+                        "small_step_forward, turn_left, turn_right, gentle_nudge, sit, chirp, sleep, stop。"
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -109,6 +121,17 @@ class OpenAICompatibleLLMClient(LLMClient):
                 "confirmed_memories": memories,
                 "output_schema": {
                     "text": "string",
+                    "goal": "string",
+                    "expression": {
+                        "emotion": "idle|happy|sad|dizzy|sleepy|alert|curious|confused|proud|shy",
+                        "valence": -1.0,
+                        "arousal": 0.0,
+                        "eye_open": 0.0,
+                        "pupil_offset_x": 0.0,
+                        "blink_rate": 0.0,
+                        "duration_ms": 1200,
+                    },
+                    "skills": [{"name": "string", "args": {}}],
                     "actions": [{"name": "string", "args": {}}],
                     "memory_suggestion": {"type": "none|suggest", "text": "string"},
                 },

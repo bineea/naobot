@@ -19,6 +19,7 @@ from config import (
     WIFI_SSID,
     WS_RECONNECT_DELAY_MS,
 )
+from control.motion_controller import MotionController
 from hardware.buzzer import Buzzer
 from hardware.display import Display
 from hardware.imu import IMU
@@ -28,6 +29,7 @@ from hardware.touch import TouchInputs
 from interaction.event_adapter import EventAdapter
 from interaction.local_fallback import LocalFallback
 from motion.action_player import ActionPlayer
+from reflex.reflex_controller import ReflexController
 from safety.guard import SafetyGuard
 
 
@@ -69,16 +71,20 @@ class FirmwareProtocol:
             "payload": payload or {},
         }
 
-    def event(self, name, power, imu):
-        return self.envelope(
-            "event",
-            {
-                "name": name,
-                "source": "esp32",
-                "battery_pct": power.battery_pct,
-                "posture": imu.read_posture(),
-            },
-        )
+    def robot_payload(self, power, imu, reflex=None, motion=None):
+        payload = {"battery_pct": power.battery_pct, "posture": imu.read_posture()}
+        if reflex:
+            motion_state = motion.motion_state if motion else "idle"
+            payload.update(reflex.status(motion_state))
+        return payload
+
+    def event(self, name, power, imu, reflex=None, motion=None):
+        payload = self.robot_payload(power, imu, reflex, motion)
+        payload.update({"name": name, "source": "esp32"})
+        if name == "fall_detected" and reflex:
+            payload["reflex_taken"] = reflex.last_reflex
+            payload["recovered"] = reflex.state == "recovered"
+        return self.envelope("event", payload)
 
     def ack(self, intent_id, status="accepted"):
         return self.envelope("ack", {"intent_id": intent_id, "status": status})
@@ -89,24 +95,52 @@ class FirmwareProtocol:
             payload["intent_id"] = intent_id
         return self.envelope("error", payload, priority=8)
 
-    def heartbeat(self, power, imu):
+    def status(self, power, imu, reflex=None, motion=None):
+        return self.envelope("status", self.robot_payload(power, imu, reflex, motion))
+
+    def heartbeat(self, power, imu, reflex=None, motion=None):
         return self.envelope(
             "heartbeat",
-            {"battery_pct": power.battery_pct, "posture": imu.read_posture()},
+            self.robot_payload(power, imu, reflex, motion),
             priority=1,
         )
 
 
-def execute_intent(message, actions, safety, protocol, ws):
+def _semantic_actions(payload):
+    action_items = []
+    if payload.get("expression"):
+        action_items.append({"name": "set_expression", "args": payload.get("expression")})
+    skills = payload.get("skills", [])
+    actions = payload.get("actions", [])
+    if skills is None:
+        skills = []
+    if actions is None:
+        actions = []
+    if not isinstance(skills, list) or not isinstance(actions, list):
+        return None
+    for skill in skills:
+        if not isinstance(skill, dict):
+            return None
+        action_items.append({"name": skill.get("name"), "args": skill.get("args", {})})
+    action_items.extend(actions)
+    return action_items
+
+
+def execute_intent(message, actions, safety, protocol, ws, motion=None, reflex=None):
     intent_id = message.get("id")
     payload = message.get("payload", {})
-    action_list = payload.get("actions")
+    action_list = _semantic_actions(payload)
     if not isinstance(action_list, list):
-        ws.send_json(protocol.error("INVALID_INTENT", "payload.actions must be a list", intent_id))
+        ws.send_json(protocol.error("INVALID_INTENT", "payload actions/skills must be a list", intent_id))
         return
 
     if any(isinstance(action, dict) and action.get("name") == "stop" for action in action_list):
-        actions.stop()
+        if reflex:
+            reflex.request_emergency_stop()
+        if motion:
+            motion.cancel("stop")
+        else:
+            actions.stop()
         ws.send_json(protocol.ack(intent_id))
         return
 
@@ -115,23 +149,29 @@ def execute_intent(message, actions, safety, protocol, ws):
             ws.send_json(protocol.error("POLICY_DENIED", "firmware rejected unsafe action", intent_id))
             return
 
-    for action in action_list:
-        result = actions.execute(action)
-        if not result.accepted:
-            ws.send_json(protocol.error("EXECUTION_FAILED", result.reason, intent_id))
+    if motion:
+        accepted, reason = motion.submit_intent(message)
+        if not accepted:
+            ws.send_json(protocol.error("EXECUTION_FAILED", reason, intent_id))
             return
+    else:
+        for action in action_list:
+            result = actions.execute(action)
+            if not result.accepted:
+                ws.send_json(protocol.error("EXECUTION_FAILED", result.reason, intent_id))
+                return
     ws.send_json(protocol.ack(intent_id))
 
 
-def handle_agent_message(message, actions, safety, protocol, ws):
+def handle_agent_message(message, actions, safety, protocol, ws, motion=None, reflex=None):
     if not isinstance(message, dict):
         return
     msg_type = message.get("type")
     if msg_type == "intent":
-        execute_intent(message, actions, safety, protocol, ws)
+        execute_intent(message, actions, safety, protocol, ws, motion, reflex)
 
 
-async def network_loop(display, power, imu, actions, safety, protocol, state):
+async def network_loop(display, power, imu, actions, safety, protocol, state, motion, reflex):
     while True:
         if not connect_wifi(WIFI_SSID, WIFI_PASSWORD, WIFI_CONNECT_TIMEOUT_MS):
             display.show_status("wifi offline")
@@ -146,16 +186,16 @@ async def network_loop(display, power, imu, actions, safety, protocol, state):
 
         state["ws"] = ws
         display.show_status("agent online")
-        ws.send_json(protocol.envelope("status", {"battery_pct": power.battery_pct, "posture": imu.read_posture()}))
+        ws.send_json(protocol.status(power, imu, reflex, motion))
         last_heartbeat = now_ms()
 
         while ws.connected:
             try:
                 message = ws.recv_json()
                 if message:
-                    handle_agent_message(message, actions, safety, protocol, ws)
+                    handle_agent_message(message, actions, safety, protocol, ws, motion, reflex)
                 if ticks_diff(now_ms(), last_heartbeat) >= HEARTBEAT_INTERVAL_MS:
-                    ws.send_json(protocol.heartbeat(power, imu))
+                    ws.send_json(protocol.heartbeat(power, imu, reflex, motion))
                     last_heartbeat = now_ms()
             except Exception as exc:
                 print("network loop error:", exc)
@@ -176,6 +216,8 @@ async def main():
     buzzer = Buzzer()
     actions = ActionPlayer(servos, display, buzzer)
     safety = SafetyGuard(power, imu)
+    reflex = ReflexController(power, imu, actions, display, buzzer)
+    motion = MotionController(actions, safety, reflex, now_ms)
     fallback = LocalFallback(display, actions)
     adapter = EventAdapter(touch, imu, power)
     protocol = FirmwareProtocol(SESSION_ID)
@@ -183,9 +225,13 @@ async def main():
 
     display.set_face("idle")
     print("naobot firmware booted; agent:", AGENT_WS_URL)
-    asyncio.create_task(network_loop(display, power, imu, actions, safety, protocol, network_state))
+    asyncio.create_task(network_loop(display, power, imu, actions, safety, protocol, network_state, motion, reflex))
 
     while True:
+        if reflex.check():
+            motion.cancel("reflex")
+            reflex.run()
+        motion.tick()
         event = adapter.poll()
         if event:
             if not safety.can_emit_event(event):
@@ -193,7 +239,7 @@ async def main():
                 display.set_face("alert")
             else:
                 ws = network_state.get("ws")
-                envelope = protocol.event(event, power, imu)
+                envelope = protocol.event(event, power, imu, reflex, motion)
                 if not ws or not ws.connected or not ws.send_json(envelope):
                     fallback.handle(event)
         await sleep_ms(50)

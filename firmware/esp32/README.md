@@ -11,7 +11,9 @@
 - `unknown` 或 `fallen` 姿态会触发安全故障，禁止运动动作。
 - `main.py` 会尝试连接 WiFi 和 Host WebSocket；当前只支持明文 `ws://`，不支持 `wss://`。
 - 网络不可用时，固件继续使用本地 fallback，不阻塞安全循环。
-- `motion/action_player.py` 已实现 Host 白名单动作：`set_face`、`blink`、`wave`、`small_step_forward`、`turn_left`、`turn_right`、`gentle_nudge`、`sit`、`chirp`、`sleep`、`stop`。
+- `reflex/` 提供本地反射安全层，低电、跌倒、IMU fault 和急停优先于 Host intent。
+- `control/motion_controller.py` 提供可中断运动调度，运动 skill 可被 stop、低电或姿态异常抢占。
+- `motion/action_player.py` 已实现 Host 白名单动作：`set_face`、`set_expression`、`blink`、`wave`、`small_step_forward`、`turn_left`、`turn_right`、`gentle_nudge`、`sit`、`chirp`、`sleep`、`stop`。
 - 当前动作假设四个 180 度关节舵机按 `lf/rf/lr/rr` 表示左前、右前、左后、右后；动作序列以明显可见和可调参为目标。
 - `demo/` 目录只用于硬件 bring-up 验证，不参与主固件运行链路。
 
@@ -35,6 +37,8 @@ mpremote connect COM3 fs mkdir :motion
 mpremote connect COM3 fs mkdir :safety
 mpremote connect COM3 fs mkdir :interaction
 mpremote connect COM3 fs mkdir :comm
+mpremote connect COM3 fs mkdir :control
+mpremote connect COM3 fs mkdir :reflex
 mpremote connect COM3 fs cp firmware/esp32/config.py :
 mpremote connect COM3 fs cp firmware/esp32/main.py :
 mpremote connect COM3 fs cp -r firmware/esp32/hardware :
@@ -42,6 +46,8 @@ mpremote connect COM3 fs cp -r firmware/esp32/motion :
 mpremote connect COM3 fs cp -r firmware/esp32/safety :
 mpremote connect COM3 fs cp -r firmware/esp32/interaction :
 mpremote connect COM3 fs cp -r firmware/esp32/comm :
+mpremote connect COM3 fs cp -r firmware/esp32/control :
+mpremote connect COM3 fs cp -r firmware/esp32/reflex :
 mpremote connect COM3 soft-reset
 ```
 
@@ -53,6 +59,7 @@ mpremote connect COM3 soft-reset
 - 低电量、姿态异常、跌倒后拒绝运动动作。
 - MPU6050 缺失或读取失败按 `unknown` 姿态处理，禁止运动动作。
 - Host 下发的 intent 仍需通过固件 `SafetyGuard`，固件不会盲信网络指令。
+- 固件本地反射层拥有最高控制权，Host/LLM intent 不能覆盖急停、低电、跌倒或 IMU fault。
 - 固件动作执行失败时返回 `error`，不会对未执行动作回假 `ack`。
 - `stop` 是最高优先级动作。
 - 不支持 LLM 下发裸舵机角度。

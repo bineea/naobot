@@ -60,6 +60,20 @@ class FailingActions(FakeActions):
         return ActionResult(False, "测试执行失败")
 
 
+class FakeMotion:
+    def __init__(self, accepted=True):
+        self.accepted = accepted
+        self.submitted = []
+        self.cancelled = False
+
+    def submit_intent(self, message):
+        self.submitted.append(message)
+        return self.accepted, "" if self.accepted else "调度失败"
+
+    def cancel(self, reason="cancelled"):
+        self.cancelled = True
+
+
 def test_parse_ws_url_with_port_and_path() -> None:
     assert parse_ws_url("ws://192.168.1.2:8765/ws/kt2") == ("192.168.1.2", 8765, "/ws/kt2")
     assert parse_ws_url("ws://host.local") == ("host.local", 80, "/")
@@ -181,4 +195,42 @@ def test_execute_intent_stop_bypasses_policy() -> None:
     firmware_main.execute_intent(message, actions, FakeSafety(allowed=False), protocol, ws)
 
     assert actions.stopped is True
+    assert ws.sent[-1]["type"] == "ack"
+
+
+def test_execute_intent_accepts_semantic_payload_with_motion_controller() -> None:
+    actions = FakeActions()
+    motion = FakeMotion()
+    ws = FakeWs()
+    protocol = firmware_main.FirmwareProtocol("kt2-test")
+    message = {
+        "id": "intent-5",
+        "type": "intent",
+        "payload": {
+            "expression": {"emotion": "happy", "eye_open": 0.8},
+            "skills": [{"name": "wave", "args": {"level": 1}}],
+            "actions": [{"name": "blink", "args": {}}],
+        },
+    }
+
+    firmware_main.execute_intent(message, actions, FakeSafety(), protocol, ws, motion=motion)
+
+    assert motion.submitted == [message]
+    assert ws.sent[-1]["type"] == "ack"
+
+
+def test_execute_intent_stop_cancels_motion_controller() -> None:
+    actions = FakeActions()
+    motion = FakeMotion()
+    ws = FakeWs()
+    protocol = firmware_main.FirmwareProtocol("kt2-test")
+    message = {
+        "id": "intent-6",
+        "type": "intent",
+        "payload": {"skills": [{"name": "stop", "args": {}}]},
+    }
+
+    firmware_main.execute_intent(message, actions, FakeSafety(allowed=False), protocol, ws, motion=motion)
+
+    assert motion.cancelled is True
     assert ws.sent[-1]["type"] == "ack"

@@ -18,6 +18,62 @@ class ActionResult:
         self.reason = reason
 
 
+class PoseSkill:
+    def __init__(self, servos, name, frames, delay_ms=160):
+        self.servos = servos
+        self.name = name
+        self.frames = list(frames)
+        self.delay_ms = delay_ms
+        self.index = 0
+        self.last_tick_ms = 0
+        self.running = False
+
+    def start(self, now_ms):
+        self.index = 0
+        self.last_tick_ms = now_ms - self.delay_ms
+        self.running = True
+
+    def tick(self, now_ms):
+        if not self.running:
+            return True
+        if now_ms - self.last_tick_ms < self.delay_ms:
+            return False
+        if self.index >= len(self.frames):
+            self.running = False
+            return True
+        self.servos.pose(self.frames[self.index])
+        self.index += 1
+        self.last_tick_ms = now_ms
+        if self.index >= len(self.frames):
+            self.running = False
+            return True
+        return False
+
+    def cancel(self):
+        self.running = False
+        self.servos.stop()
+
+
+class ImmediateSkill:
+    def __init__(self, actions, action):
+        self.actions = actions
+        self.action = action
+        self.name = action.get("name")
+        self.running = False
+        self.result = None
+
+    def start(self, now_ms):
+        self.running = True
+        self.result = self.actions.execute(self.action)
+        self.running = False
+
+    def tick(self, now_ms):
+        return True
+
+    def cancel(self):
+        self.running = False
+
+
 class ActionPlayer:
     def __init__(self, servos, display, buzzer=None):
         self.servos = servos
@@ -30,6 +86,8 @@ class ActionPlayer:
         try:
             if name == "set_face":
                 return self._set_face(args)
+            if name == "set_expression":
+                return self._set_expression(args)
             if name == "blink":
                 self.display.blink()
                 return ActionResult(True)
@@ -57,8 +115,47 @@ class ActionPlayer:
             return ActionResult(False, str(exc))
         return ActionResult(False, f"未实现动作: {name}")
 
+    def build_skill(self, name, args=None):
+        args = args or {}
+        action = {"name": name, "args": args}
+        if name == "wave":
+            level = clamp_int(args.get("level", 1), 1, 2)
+            high = 130 if level == 2 else 118
+            low = 64 if level == 2 else 74
+            cycles = 3 if level == 2 else 2
+            frames = []
+            for _ in range(cycles):
+                frames.append({"lf": 90, "rf": high, "lr": 90, "rr": 90})
+                frames.append({"lf": 90, "rf": low, "lr": 90, "rr": 90})
+            frames.append(NEUTRAL)
+            return PoseSkill(self.servos, name, frames, 140)
+        if name == "small_step_forward":
+            steps = clamp_int(args.get("steps", 1), 1, 3)
+            frames = []
+            for _ in range(steps):
+                frames.extend((FORWARD_A, NEUTRAL, FORWARD_B, NEUTRAL))
+            return PoseSkill(self.servos, name, frames, 170)
+        if name == "turn_left" or name == "turn_right":
+            steps = clamp_int(args.get("steps", 1), 1, 3)
+            first = TURN_LEFT_A if name == "turn_left" else TURN_RIGHT_A
+            second = TURN_LEFT_B if name == "turn_left" else TURN_RIGHT_B
+            frames = []
+            for _ in range(steps):
+                frames.extend((first, NEUTRAL, second, NEUTRAL))
+            return PoseSkill(self.servos, name, frames, 170)
+        if name == "gentle_nudge":
+            return PoseSkill(self.servos, name, (NUDGE_A, NUDGE_B, NEUTRAL), 130)
+        return ImmediateSkill(self, action)
+
     def _set_face(self, args):
         self.display.set_face(args.get("face", "idle"))
+        return ActionResult(True)
+
+    def _set_expression(self, args):
+        if hasattr(self.display, "set_expression"):
+            self.display.set_expression(args)
+        else:
+            self.display.set_face(args.get("emotion", "idle"))
         return ActionResult(True)
 
     def _wave(self, args):

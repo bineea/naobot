@@ -12,6 +12,18 @@ except ImportError:
 from config import I2C_FREQ, I2C_ID, I2C_SCL, I2C_SDA, OLED_ADDR, OLED_HEIGHT, OLED_WIDTH
 
 FACE_NAMES = ("idle", "happy", "sleepy", "alert", "dizzy", "sad")
+EXPRESSION_EMOTIONS = {
+    "idle": "idle",
+    "happy": "happy",
+    "sad": "sad",
+    "dizzy": "dizzy",
+    "sleepy": "sleepy",
+    "alert": "alert",
+    "curious": "idle",
+    "confused": "dizzy",
+    "proud": "happy",
+    "shy": "happy",
+}
 EYE_CENTERS = ((42, 28), (86, 28))
 
 
@@ -67,6 +79,19 @@ class Display:
         self.face = face
         self._animate(face)
 
+    def set_expression(self, params):
+        params = params or {}
+        emotion = str(params.get("emotion", "idle"))
+        face = EXPRESSION_EMOTIONS.get(emotion, "idle")
+        self.face = face
+        eye_open = clamp_float(params.get("eye_open", 0.8), 0.0, 1.0)
+        offset = int(clamp_float(params.get("pupil_offset_x", 0.0), -1.0, 1.0) * 8)
+        arousal = clamp_float(params.get("arousal", 0.3), 0.0, 1.0)
+        upper_lid = int((1.0 - eye_open) * 18)
+        lower_lid = int((1.0 - eye_open) * 8)
+        pupil_size = 10 if arousal > 0.75 else 11
+        self._safe_render_expression(face, offset, upper_lid, lower_lid, pupil_size)
+
     def blink(self):
         current = self.face
         self._safe_render_frame("blink")
@@ -110,6 +135,30 @@ class Display:
             self.available = False
             print("display fallback:", exc)
             print("display eye:", frame, status or "")
+
+    def _safe_render_expression(self, face, pupil_x, upper_lid, lower_lid, pupil_size):
+        if not self.oled:
+            print("display expression:", face)
+            return
+        try:
+            self.oled.fill(0)
+            if face == "sleepy":
+                self._draw_sleepy_lines()
+            elif face == "dizzy":
+                self._draw_dizzy_pair()
+            else:
+                self._draw_pair(
+                    pupil_x=pupil_x,
+                    upper_lid=upper_lid,
+                    lower_lid=lower_lid,
+                    pupil_size=pupil_size,
+                )
+            self.oled.show()
+        except Exception as exc:
+            self.oled = None
+            self.available = False
+            print("display fallback:", exc)
+            print("display expression:", face)
 
     def _draw_status(self, status):
         text = str(status)[:16]
@@ -259,3 +308,15 @@ class Display:
             self.oled.pixel(cx + offset, y, 1)
             if -radius + 3 < offset < radius - 3:
                 self.oled.pixel(cx + offset, y + 1, 1)
+
+
+def clamp_float(value, minimum, maximum):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        value = minimum
+    if value < minimum:
+        return minimum
+    if value > maximum:
+        return maximum
+    return value

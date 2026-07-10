@@ -43,6 +43,10 @@
           <div class="panel"><strong>模式</strong><p id="mode">-</p></div>
           <div class="panel"><strong>电量</strong><p id="battery">-</p></div>
           <div class="panel"><strong>LLM</strong><p id="llm">-</p></div>
+          <div class="panel"><strong>控制权</strong><p id="authority">-</p></div>
+          <div class="panel"><strong>反射状态</strong><p id="reflex">-</p></div>
+          <div class="panel"><strong>运动状态</strong><p id="motion">-</p></div>
+          <div class="panel"><strong>最近反射</strong><p id="lastReflex">-</p></div>
         </div>
       </section>
       <section id="actions">
@@ -101,6 +105,10 @@
       state = await (await fetch('/api/status')).json();
       document.getElementById('mode').textContent = state.robot.mode;
       document.getElementById('battery').textContent = state.robot.battery_pct + '%';
+      document.getElementById('authority').textContent = state.robot.control_authority || '-';
+      document.getElementById('reflex').textContent = state.robot.reflex_state || '-';
+      document.getElementById('motion').textContent = state.robot.motion_state || '-';
+      document.getElementById('lastReflex').textContent = state.robot.last_reflex || '-';
       document.getElementById('llm').innerHTML = state.llm_configured ? '<span class="badge">OpenAI-compatible</span>' : '<span class="badge">规则模拟</span>';
       document.getElementById('soulName').value = state.soul.name;
       document.getElementById('userCall').value = state.soul.user_call;

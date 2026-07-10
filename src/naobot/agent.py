@@ -29,15 +29,23 @@ class NaobotAgent:
             self.state.last_event = payload.get("name")
             self.state.battery_pct = int(payload.get("battery_pct", self.state.battery_pct))
             self.state.posture = payload.get("posture", self.state.posture)
+            self._update_control_state(payload)
             if payload.get("name") == "battery_low":
                 self.state.mode = RobotMode.LOW_BATTERY
             elif payload.get("name") == "fall_detected":
                 self.state.mode = RobotMode.FAULT
-        elif envelope.type == MessageType.STATUS:
+        elif envelope.type in {MessageType.STATUS, MessageType.HEARTBEAT}:
             self.state.battery_pct = int(payload.get("battery_pct", self.state.battery_pct))
             self.state.posture = payload.get("posture", self.state.posture)
+            self._update_control_state(payload)
             if payload.get("mode"):
                 self.state.mode = RobotMode(payload["mode"])
+
+    def _update_control_state(self, payload: dict) -> None:
+        self.state.control_authority = payload.get("control_authority", self.state.control_authority)
+        self.state.reflex_state = payload.get("reflex_state", self.state.reflex_state)
+        self.state.motion_state = payload.get("motion_state", self.state.motion_state)
+        self.state.last_reflex = payload.get("last_reflex", self.state.last_reflex)
 
     async def handle_robot_message(self, envelope: Envelope) -> Envelope | None:
         self.log("robot_rx", envelope.model_dump())
@@ -68,6 +76,9 @@ class NaobotAgent:
             priority=4,
             deadline_ms=4000,
             payload={
+                "goal": decision.goal,
+                "expression": decision.expression.model_dump() if decision.expression else None,
+                "skills": [skill.model_dump() for skill in decision.skills],
                 "actions": [action.model_dump() for action in decision.actions],
                 "text": decision.text,
             },

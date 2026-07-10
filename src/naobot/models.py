@@ -40,6 +40,29 @@ class Action(BaseModel):
     args: dict[str, Any] = Field(default_factory=dict)
 
 
+class ExpressionIntent(BaseModel):
+    emotion: str = "idle"
+    valence: float = 0.0
+    arousal: float = 0.3
+    eye_open: float = 0.8
+    pupil_offset_x: float = 0.0
+    blink_rate: float = 0.2
+    duration_ms: int = 1200
+
+
+class SkillIntent(BaseModel):
+    name: str
+    args: dict[str, Any] = Field(default_factory=dict)
+
+
+class SemanticIntentPayload(BaseModel):
+    text: str = ""
+    goal: str = ""
+    expression: ExpressionIntent | None = None
+    skills: list[SkillIntent] = Field(default_factory=list)
+    actions: list[Action] = Field(default_factory=list)
+
+
 class Envelope(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 
@@ -72,6 +95,10 @@ class RobotState(BaseModel):
     posture: str = "upright"
     agent_connected: bool = False
     last_event: str | None = None
+    control_authority: str = "idle"
+    reflex_state: str = "none"
+    motion_state: str = "idle"
+    last_reflex: str | None = None
 
     @field_validator("battery_pct")
     @classmethod
@@ -83,6 +110,9 @@ class RobotState(BaseModel):
 
 class LLMDecision(BaseModel):
     text: str = ""
+    goal: str = ""
+    expression: ExpressionIntent | None = None
+    skills: list[SkillIntent] = Field(default_factory=list)
     actions: list[Action] = Field(default_factory=list)
     memory_suggestion: dict[str, Any] = Field(default_factory=lambda: {"type": "none"})
 

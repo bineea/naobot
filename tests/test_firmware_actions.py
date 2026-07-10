@@ -25,10 +25,14 @@ class FakeServos:
 class FakeDisplay:
     def __init__(self):
         self.faces = []
+        self.expressions = []
         self.blinks = 0
 
     def set_face(self, face):
         self.faces.append(face)
+
+    def set_expression(self, params):
+        self.expressions.append(dict(params))
 
     def blink(self):
         self.blinks += 1
@@ -54,6 +58,7 @@ def test_all_host_actions_are_implemented() -> None:
     player, servos, display, buzzer = make_player()
     actions = [
         {"name": "set_face", "args": {"face": "happy"}},
+        {"name": "set_expression", "args": {"emotion": "curious", "eye_open": 0.8}},
         {"name": "blink", "args": {}},
         {"name": "wave", "args": {"level": 1}},
         {"name": "small_step_forward", "args": {"steps": 1}},
@@ -70,6 +75,7 @@ def test_all_host_actions_are_implemented() -> None:
 
     assert all(result.accepted for result in results)
     assert "happy" in display.faces
+    assert display.expressions == [{"emotion": "curious", "eye_open": 0.8}]
     assert display.blinks == 1
     assert ("pose", {"lf": 78, "rf": 102, "lr": 78, "rr": 102}) in servos.calls
     assert "happy" in buzzer.tones

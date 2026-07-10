@@ -34,7 +34,12 @@
 
 ## intent
 
-宿主机下发可执行意图。`payload.actions` 必须只包含安全白名单动作。
+宿主机下发可执行意图。兼容旧版 `payload.actions`，并支持新版语义字段：
+
+- `goal`：高层目标描述，用于日志和可解释性。
+- `expression`：参数化表情意图，由固件 renderer 限幅后绘制。
+- `skills`：可请求的技能动作，仍需 Host `PolicyGuard` 和固件安全层双重校验。
+- `actions`：兼容旧固件和 Dashboard 的白名单动作列表。
 
 示例：
 
@@ -44,6 +49,19 @@
   "priority": 4,
   "payload": {
     "text": "我在呢，老板。",
+    "goal": "开心地打招呼",
+    "expression": {
+      "emotion": "happy",
+      "valence": 0.8,
+      "arousal": 0.4,
+      "eye_open": 0.75,
+      "pupil_offset_x": 0.0,
+      "blink_rate": 0.2,
+      "duration_ms": 1200
+    },
+    "skills": [
+      {"name": "wave", "args": {"level": 1}}
+    ],
     "actions": [
       {"name": "set_face", "args": {"face": "happy"}},
       {"name": "wave", "args": {"level": 1}}
@@ -70,7 +88,14 @@
 
 `status` 用于上报机器人当前状态，`heartbeat` 用于保持连接和检测失联。
 
+固件状态应包含身体自治字段：
+
+- `control_authority`：`idle/host/skill/cerebellum/reflex/emergency`
+- `reflex_state`：`none/fall_detected/recovering/recovered/low_battery/emergency_stop/fault`
+- `motion_state`：当前运动调度状态。
+- `last_reflex`：最近一次本地反射动作。
+
 ## 禁止字段
 
-外部协议不得出现裸硬件控制字段，包括但不限于 `raw`、`servo`、`angle`、`pwm`、`servo_id`。如需新增动作，必须先更新安全策略、测试和固件执行器。
+外部协议不得出现裸硬件控制字段，包括但不限于 `raw`、`servo`、`angle`、`pwm`、`servo_id`、`current`、`torque`、`grip_force`、`pixels`、`framebuffer`。如需新增动作，必须先更新安全策略、测试和固件执行器。
 
