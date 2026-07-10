@@ -41,6 +41,10 @@
         <h2>状态</h2>
         <div class="grid">
           <div class="panel"><strong>模式</strong><p id="mode">-</p></div>
+          <div class="panel"><strong>链路</strong><p id="link">-</p></div>
+          <div class="panel"><strong>设备在线</strong><p id="robotOnline">-</p></div>
+          <div class="panel"><strong>心跳年龄</strong><p id="heartbeatAge">-</p></div>
+          <div class="panel"><strong>最后心跳</strong><p id="lastHeartbeat">-</p></div>
           <div class="panel"><strong>电量</strong><p id="battery">-</p></div>
           <div class="panel"><strong>LLM</strong><p id="llm">-</p></div>
           <div class="panel"><strong>控制权</strong><p id="authority">-</p></div>
@@ -104,6 +108,10 @@
     async function refresh() {
       state = await (await fetch('/api/status')).json();
       document.getElementById('mode').textContent = state.robot.mode;
+      document.getElementById('link').textContent = state.robot.link_state || '-';
+      document.getElementById('robotOnline').textContent = state.robot.agent_connected ? 'online' : 'offline';
+      document.getElementById('heartbeatAge').textContent = state.robot.heartbeat_age_ms == null ? '-' : state.robot.heartbeat_age_ms + ' ms';
+      document.getElementById('lastHeartbeat').textContent = state.robot.last_heartbeat_ms || '-';
       document.getElementById('battery').textContent = state.robot.battery_pct + '%';
       document.getElementById('authority').textContent = state.robot.control_authority || '-';
       document.getElementById('reflex').textContent = state.robot.reflex_state || '-';

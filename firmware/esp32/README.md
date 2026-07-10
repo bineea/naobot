@@ -29,6 +29,8 @@ AGENT_WS_URL = "ws://192.168.1.100:8765/ws/kt2"
 
 ESP32 和宿主机需要在同一局域网。先在宿主机运行 `naobot serve`，再启动固件。
 
+固件默认每 2 秒发送一次 `heartbeat`。如果 7 秒内没有收到 Host 的任意消息或 Host heartbeat，固件会标记 `agent offline`，取消当前 Host skill，并继续保留本地 fallback 和反射安全。
+
 ## 上传
 
 ```powershell
@@ -60,6 +62,7 @@ mpremote connect COM3 soft-reset
 - MPU6050 缺失或读取失败按 `unknown` 姿态处理，禁止运动动作。
 - Host 下发的 intent 仍需通过固件 `SafetyGuard`，固件不会盲信网络指令。
 - 固件本地反射层拥有最高控制权，Host/LLM intent 不能覆盖急停、低电、跌倒或 IMU fault。
+- Host 心跳超时不会关闭本地反射安全；固件会进入本地自治并取消当前 Host 运动。
 - 固件动作执行失败时返回 `error`，不会对未执行动作回假 `ack`。
 - `stop` 是最高优先级动作。
 - 不支持 LLM 下发裸舵机角度。

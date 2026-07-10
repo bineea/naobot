@@ -72,3 +72,12 @@ def test_stop_api_sends_intent_to_connected_robot(tmp_path) -> None:
         intent = websocket.receive_json()
         assert intent["type"] == "intent"
         assert intent["payload"]["actions"][0]["name"] == "stop"
+
+
+def test_robot_websocket_receives_host_heartbeat(tmp_path) -> None:
+    client = make_client(tmp_path)
+    with client.websocket_connect("/ws/kt2") as websocket:
+        heartbeat = websocket.receive_json()
+        assert heartbeat["type"] == "heartbeat"
+        assert heartbeat["payload"]["source"] == "host"
+        assert "host_ts_ms" in heartbeat["payload"]

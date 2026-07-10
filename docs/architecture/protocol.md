@@ -86,14 +86,19 @@
 
 ## status / heartbeat
 
-`status` 用于上报机器人当前状态，`heartbeat` 用于保持连接和检测失联。
+`status` 用于上报机器人当前状态，`heartbeat` 用于保持连接和检测失联。Host 和固件都可以发送 `heartbeat`，通过 `payload.source` 区分。
 
 固件状态应包含身体自治字段：
 
+- `source`：固件心跳为 `firmware`，Host 心跳为 `host`。
+- `uptime_ms`：固件启动后的毫秒计时。
 - `control_authority`：`idle/host/skill/cerebellum/reflex/emergency`
 - `reflex_state`：`none/fall_detected/recovering/recovered/low_battery/emergency_stop/fault`
 - `motion_state`：当前运动调度状态。
 - `last_reflex`：最近一次本地反射动作。
+- `local_loop_ms`：固件主循环最近一次耗时。
+
+Host 心跳 payload 包含 `source=host`、`host_ts_ms`、`agent_mode` 和 `last_intent_id`。固件收到 Host 心跳只刷新大脑在线时间，不执行动作、不回 ack。
 
 ## 禁止字段
 

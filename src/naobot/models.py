@@ -99,6 +99,11 @@ class RobotState(BaseModel):
     reflex_state: str = "none"
     motion_state: str = "idle"
     last_reflex: str | None = None
+    link_state: Literal["disconnected", "connected", "stale"] = "disconnected"
+    last_robot_seen_ms: int | None = None
+    last_heartbeat_ms: int | None = None
+    heartbeat_age_ms: int | None = None
+    heartbeat_seq: int = 0
 
     @field_validator("battery_pct")
     @classmethod

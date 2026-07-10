@@ -13,6 +13,7 @@ class Settings:
     llm_base_url: str | None = None
     llm_api_key: str | None = None
     llm_model: str | None = None
+    robot_heartbeat_timeout_ms: int = 7000
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -23,6 +24,7 @@ class Settings:
             llm_base_url=os.getenv("NAOBOT_LLM_BASE_URL"),
             llm_api_key=os.getenv("NAOBOT_LLM_API_KEY"),
             llm_model=os.getenv("NAOBOT_LLM_MODEL"),
+            robot_heartbeat_timeout_ms=int(os.getenv("NAOBOT_ROBOT_HEARTBEAT_TIMEOUT_MS", "7000")),
         )
 
     @property

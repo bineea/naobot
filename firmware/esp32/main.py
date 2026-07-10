@@ -12,7 +12,8 @@ from comm.websocket_client import WebSocketClient
 from comm.wifi_config import connect_wifi
 from config import (
     AGENT_WS_URL,
-    HEARTBEAT_INTERVAL_MS,
+    BRAIN_HEARTBEAT_TIMEOUT_MS,
+    FIRMWARE_HEARTBEAT_INTERVAL_MS,
     SESSION_ID,
     WIFI_CONNECT_TIMEOUT_MS,
     WIFI_PASSWORD,
@@ -71,15 +72,22 @@ class FirmwareProtocol:
             "payload": payload or {},
         }
 
-    def robot_payload(self, power, imu, reflex=None, motion=None):
-        payload = {"battery_pct": power.battery_pct, "posture": imu.read_posture()}
+    def robot_payload(self, power, imu, reflex=None, motion=None, state=None):
+        payload = {
+            "source": "firmware",
+            "uptime_ms": now_ms(),
+            "battery_pct": power.battery_pct,
+            "posture": imu.read_posture(),
+            "local_loop_ms": (state or {}).get("local_loop_ms", 0),
+            "agent_online": (state or {}).get("agent_online", False),
+        }
         if reflex:
             motion_state = motion.motion_state if motion else "idle"
             payload.update(reflex.status(motion_state))
         return payload
 
-    def event(self, name, power, imu, reflex=None, motion=None):
-        payload = self.robot_payload(power, imu, reflex, motion)
+    def event(self, name, power, imu, reflex=None, motion=None, state=None):
+        payload = self.robot_payload(power, imu, reflex, motion, state)
         payload.update({"name": name, "source": "esp32"})
         if name == "fall_detected" and reflex:
             payload["reflex_taken"] = reflex.last_reflex
@@ -95,13 +103,13 @@ class FirmwareProtocol:
             payload["intent_id"] = intent_id
         return self.envelope("error", payload, priority=8)
 
-    def status(self, power, imu, reflex=None, motion=None):
-        return self.envelope("status", self.robot_payload(power, imu, reflex, motion))
+    def status(self, power, imu, reflex=None, motion=None, state=None):
+        return self.envelope("status", self.robot_payload(power, imu, reflex, motion, state))
 
-    def heartbeat(self, power, imu, reflex=None, motion=None):
+    def heartbeat(self, power, imu, reflex=None, motion=None, state=None):
         return self.envelope(
             "heartbeat",
-            self.robot_payload(power, imu, reflex, motion),
+            self.robot_payload(power, imu, reflex, motion, state),
             priority=1,
         )
 
@@ -163,12 +171,33 @@ def execute_intent(message, actions, safety, protocol, ws, motion=None, reflex=N
     ws.send_json(protocol.ack(intent_id))
 
 
-def handle_agent_message(message, actions, safety, protocol, ws, motion=None, reflex=None):
+def handle_agent_message(message, actions, safety, protocol, ws, motion=None, reflex=None, state=None, display=None):
     if not isinstance(message, dict):
         return
+    if state is not None:
+        state["last_brain_seen_ms"] = now_ms()
+        if not state.get("agent_online"):
+            state["agent_online"] = True
+            if display:
+                display.show_status("agent online")
     msg_type = message.get("type")
+    if msg_type == "heartbeat":
+        return
     if msg_type == "intent":
         execute_intent(message, actions, safety, protocol, ws, motion, reflex)
+
+
+def check_brain_timeout(state, display, motion):
+    last_seen = state.get("last_brain_seen_ms")
+    if last_seen is None:
+        return
+    if ticks_diff(now_ms(), last_seen) <= BRAIN_HEARTBEAT_TIMEOUT_MS:
+        return
+    if state.get("agent_online"):
+        state["agent_online"] = False
+        display.show_status("agent offline")
+        if motion:
+            motion.cancel("brain_timeout")
 
 
 async def network_loop(display, power, imu, actions, safety, protocol, state, motion, reflex):
@@ -185,17 +214,22 @@ async def network_loop(display, power, imu, actions, safety, protocol, state, mo
             continue
 
         state["ws"] = ws
+        state["agent_online"] = True
+        state["last_brain_seen_ms"] = now_ms()
         display.show_status("agent online")
-        ws.send_json(protocol.status(power, imu, reflex, motion))
+        ws.send_json(protocol.status(power, imu, reflex, motion, state))
         last_heartbeat = now_ms()
 
         while ws.connected:
             try:
                 message = ws.recv_json()
                 if message:
-                    handle_agent_message(message, actions, safety, protocol, ws, motion, reflex)
-                if ticks_diff(now_ms(), last_heartbeat) >= HEARTBEAT_INTERVAL_MS:
-                    ws.send_json(protocol.heartbeat(power, imu, reflex, motion))
+                    handle_agent_message(message, actions, safety, protocol, ws, motion, reflex, state, display)
+                check_brain_timeout(state, display, motion)
+                if ticks_diff(now_ms(), last_heartbeat) >= FIRMWARE_HEARTBEAT_INTERVAL_MS:
+                    if not ws.send_json(protocol.heartbeat(power, imu, reflex, motion, state)):
+                        ws.close()
+                        break
                     last_heartbeat = now_ms()
             except Exception as exc:
                 print("network loop error:", exc)
@@ -203,6 +237,7 @@ async def network_loop(display, power, imu, actions, safety, protocol, state, mo
             await sleep_ms(100)
 
         state["ws"] = None
+        state["agent_online"] = False
         display.show_status("agent offline")
         await sleep_ms(WS_RECONNECT_DELAY_MS)
 
@@ -221,13 +256,14 @@ async def main():
     fallback = LocalFallback(display, actions)
     adapter = EventAdapter(touch, imu, power)
     protocol = FirmwareProtocol(SESSION_ID)
-    network_state = {"ws": None}
+    network_state = {"ws": None, "agent_online": False, "last_brain_seen_ms": None, "local_loop_ms": 0}
 
     display.set_face("idle")
     print("naobot firmware booted; agent:", AGENT_WS_URL)
     asyncio.create_task(network_loop(display, power, imu, actions, safety, protocol, network_state, motion, reflex))
 
     while True:
+        loop_start = now_ms()
         if reflex.check():
             motion.cancel("reflex")
             reflex.run()
@@ -239,9 +275,10 @@ async def main():
                 display.set_face("alert")
             else:
                 ws = network_state.get("ws")
-                envelope = protocol.event(event, power, imu, reflex, motion)
+                envelope = protocol.event(event, power, imu, reflex, motion, network_state)
                 if not ws or not ws.connected or not ws.send_json(envelope):
                     fallback.handle(event)
+        network_state["local_loop_ms"] = ticks_diff(now_ms(), loop_start)
         await sleep_ms(50)
 
 

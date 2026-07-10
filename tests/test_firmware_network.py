@@ -48,10 +48,14 @@ class FakeSafety:
 class FakeWs:
     def __init__(self):
         self.sent = []
+        self.closed = False
 
     def send_json(self, payload):
         self.sent.append(payload)
         return True
+
+    def close(self):
+        self.closed = True
 
 
 class FailingActions(FakeActions):
@@ -72,6 +76,25 @@ class FakeMotion:
 
     def cancel(self, reason="cancelled"):
         self.cancelled = True
+        self.cancel_reason = reason
+
+
+class FakeReflex:
+    def status(self, motion_state="idle"):
+        return {
+            "control_authority": "skill",
+            "reflex_state": "none",
+            "motion_state": motion_state,
+            "last_reflex": None,
+        }
+
+
+class FakeDisplay:
+    def __init__(self):
+        self.statuses = []
+
+    def show_status(self, status):
+        self.statuses.append(status)
 
 
 def test_parse_ws_url_with_port_and_path() -> None:
@@ -129,6 +152,34 @@ def test_firmware_protocol_event_shape() -> None:
     assert event["payload"]["name"] == "touch_head"
     assert event["payload"]["battery_pct"] == 77
     assert event["payload"]["posture"] == "upright"
+
+
+def test_firmware_protocol_heartbeat_includes_link_health_payload() -> None:
+    class Power:
+        battery_pct = 77
+
+    class Imu:
+        def read_posture(self):
+            return "upright"
+
+    class Motion:
+        motion_state = "wave"
+
+    protocol = firmware_main.FirmwareProtocol("kt2-test")
+    heartbeat = protocol.heartbeat(
+        Power(),
+        Imu(),
+        FakeReflex(),
+        Motion(),
+        {"agent_online": True, "local_loop_ms": 4},
+    )
+
+    assert heartbeat["type"] == "heartbeat"
+    assert heartbeat["payload"]["source"] == "firmware"
+    assert heartbeat["payload"]["agent_online"] is True
+    assert heartbeat["payload"]["local_loop_ms"] == 4
+    assert heartbeat["payload"]["control_authority"] == "skill"
+    assert heartbeat["payload"]["motion_state"] == "wave"
 
 
 def test_execute_intent_runs_safe_actions_and_acks() -> None:
@@ -234,3 +285,42 @@ def test_execute_intent_stop_cancels_motion_controller() -> None:
 
     assert motion.cancelled is True
     assert ws.sent[-1]["type"] == "ack"
+
+
+def test_host_heartbeat_updates_brain_seen_without_action(monkeypatch) -> None:
+    actions = FakeActions()
+    ws = FakeWs()
+    protocol = firmware_main.FirmwareProtocol("kt2-test")
+    state = {"agent_online": False, "last_brain_seen_ms": None}
+    display = FakeDisplay()
+    monkeypatch.setattr(firmware_main, "now_ms", lambda: 1234)
+
+    firmware_main.handle_agent_message(
+        {"type": "heartbeat", "payload": {"source": "host"}},
+        actions,
+        FakeSafety(),
+        protocol,
+        ws,
+        state=state,
+        display=display,
+    )
+
+    assert state["last_brain_seen_ms"] == 1234
+    assert state["agent_online"] is True
+    assert actions.executed == []
+    assert ws.sent == []
+    assert display.statuses == ["agent online"]
+
+
+def test_brain_timeout_cancels_motion_and_marks_offline(monkeypatch) -> None:
+    state = {"agent_online": True, "last_brain_seen_ms": 1000}
+    display = FakeDisplay()
+    motion = FakeMotion()
+    monkeypatch.setattr(firmware_main, "now_ms", lambda: 9001)
+
+    firmware_main.check_brain_timeout(state, display, motion)
+
+    assert state["agent_online"] is False
+    assert display.statuses == ["agent offline"]
+    assert motion.cancelled is True
+    assert motion.cancel_reason == "brain_timeout"

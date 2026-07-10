@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -47,15 +48,18 @@ class RobotHub:
         if self.websocket is websocket:
             self.websocket = None
 
-    async def send_intent(self, intent: Envelope) -> bool:
+    async def send_envelope(self, envelope: Envelope) -> bool:
         if self.websocket is None:
             return False
         try:
-            await self.websocket.send_json(intent.model_dump())
+            await self.websocket.send_json(envelope.model_dump())
         except RuntimeError:
             self.websocket = None
             return False
         return True
+
+    async def send_intent(self, intent: Envelope) -> bool:
+        return await self.send_envelope(intent)
 
 
 def create_app(settings: Settings | None = None, agent: NaobotAgent | None = None) -> FastAPI:
@@ -193,11 +197,21 @@ def create_app(settings: Settings | None = None, agent: NaobotAgent | None = Non
         await websocket.accept()
         robot_hub.connect(websocket)
         agent.state.agent_connected = True
+        agent.state.link_state = "connected"
+        agent.state.last_robot_seen_ms = now_ms()
         agent.log("robot_connected", {})
         await hub.broadcast({"kind": "robot_connected", "payload": agent.status()})
         try:
             while True:
-                raw = await websocket.receive_text()
+                try:
+                    raw = await asyncio.wait_for(websocket.receive_text(), timeout=2.0)
+                except TimeoutError:
+                    heartbeat = agent.host_heartbeat()
+                    if not await robot_hub.send_envelope(heartbeat):
+                        raise WebSocketDisconnect from None
+                    agent.refresh_link_state()
+                    await hub.broadcast({"kind": "heartbeat_tick", "payload": agent.status()})
+                    continue
                 try:
                     envelope = Envelope.model_validate(json.loads(raw))
                 except (json.JSONDecodeError, ValidationError) as exc:
@@ -216,6 +230,8 @@ def create_app(settings: Settings | None = None, agent: NaobotAgent | None = Non
         except WebSocketDisconnect:
             robot_hub.disconnect(websocket)
             agent.state.agent_connected = False
+            agent.state.link_state = "disconnected"
+            agent.state.last_robot_seen_ms = None
             agent.log("robot_disconnected", {})
             await hub.broadcast({"kind": "robot_disconnected", "payload": agent.status()})
 
