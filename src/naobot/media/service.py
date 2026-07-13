@@ -162,7 +162,11 @@ class EnrollmentManager:
         create_embedding = getattr(self.identity, "create_embedding", None)
         if create_embedding is None:
             return self._set_result("rejected", reason="identity provider 不支持 embedding")
-        embedding = create_embedding(frames)
+        try:
+            embedding = await asyncio.to_thread(create_embedding, frames)
+        except (MediaBackendError, ValueError) as exc:
+            self._pending = None
+            return self._set_result("rejected", reason=str(exc))
         person_id = new_id("person")
         await self.persistence.enroll_person_atomic(
             person_id=person_id,
@@ -441,6 +445,7 @@ class MediaService:
                 await asyncio.gather(worker, return_exceptions=True)
             if self._worker is worker:
                 self._worker = None
+            await self._destroy_tracked_guest_runtime()
             self.hub.disconnect(websocket)
             self._connections = max(0, self._connections - 1)
             self.pipeline.update_connection(self._connections > 0)
@@ -640,6 +645,12 @@ class MediaService:
             await self.runtime_registry.destroy_guest_runtime(expired_session_id)
         self._tracked_session_id = current_session_id
 
+    async def _destroy_tracked_guest_runtime(self) -> None:
+        session_id = self._tracked_session_id
+        self._tracked_session_id = None
+        if session_id is not None and session_id.lower().startswith(("visitor", "guest")):
+            await self.runtime_registry.destroy_guest_runtime(session_id)
+
     async def _emit_touch_intent(self, *, session_id: str) -> None:
         event = Envelope(
             type=MessageType.EVENT,
@@ -715,6 +726,9 @@ class MediaService:
                         threshold=settings.identity_match_threshold
                     ),
                     match_interval_ms=settings.identity_match_interval_ms,
+                    enrollment_similarity_threshold=(
+                        settings.identity_enrollment_similarity_threshold
+                    ),
                 )
                 identity_health = ProviderHealth("identity", True, "local")
             except RuntimeError:

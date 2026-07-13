@@ -31,7 +31,7 @@ media-local = [
   "faster-whisper",
   "openwakeword",
   "opencv-contrib-python-headless",
-  "mediapipe",
+  "mediapipe==0.10.21",
   "sherpa-onnx",
   "onnxruntime",
 ]

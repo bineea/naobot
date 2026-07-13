@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
@@ -9,6 +10,8 @@ from naobot.settings import Settings
 from ..media.backends import (
     ASRProvider,
     IdentityProvider,
+    MotionEstimator,
+    OpenCVMotionEstimator,
     TTSProvider,
     VisionProvider,
     WakeWordProvider,
@@ -41,6 +44,7 @@ class InteractionOrchestrator:
         asr: ASRProvider,
         vision: VisionProvider,
         tts: TTSProvider,
+        motion_estimator: MotionEstimator | None = None,
     ) -> None:
         self.settings = settings
         self.pipeline = pipeline
@@ -50,9 +54,9 @@ class InteractionOrchestrator:
         self.asr = asr
         self.vision = vision
         self.tts = tts
+        self.motion_estimator = motion_estimator or OpenCVMotionEstimator()
         self.last_temporal_summary: dict[str, object] | None = None
         self._last_temporal_summary_at_ms: int | None = None
-        self._last_temporal_payload: bytes | None = None
         self._sync_stats(now_ms=0)
 
     async def observe_audio(self, audio_frames: Sequence[MediaFrame], *, now_ms: int) -> None:
@@ -78,8 +82,8 @@ class InteractionOrchestrator:
         self.pipeline.update_connection(True)
         for frame in video_frames:
             self.pipeline.push_video_frame(frame)
-        identity = self.identity.identify(video_frames)
-        self._update_temporal_summary(video_frames, identity.vision_summary, now_ms=now_ms)
+        identity = await asyncio.to_thread(self.identity.identify, video_frames)
+        await self._update_temporal_summary(video_frames, identity.vision_summary, now_ms=now_ms)
         snapshot = self.session.snapshot(now_ms=now_ms)
         if not snapshot.active:
             if identity.eye_contact_ms >= self.session.eye_contact_activation_ms:
@@ -128,7 +132,7 @@ class InteractionOrchestrator:
 
         asr_result = await self.asr.transcribe(audio_frames)
         vision_result = await self.vision.summarize(video_frames)
-        identity_result = self.identity.identify(video_frames)
+        identity_result = await asyncio.to_thread(self.identity.identify, video_frames)
         self.session.mark_activity(now_ms=now_ms)
         self.pipeline.set_last_transcript(asr_result.transcript)
         self._sync_stats(now_ms=now_ms)
@@ -196,7 +200,7 @@ class InteractionOrchestrator:
         self.pipeline.set_listening(snapshot.listening)
         self.pipeline.set_speaking(snapshot.speaking)
 
-    def _update_temporal_summary(
+    async def _update_temporal_summary(
         self,
         video_frames: Sequence[MediaFrame],
         scene_summary: str,
@@ -212,25 +216,11 @@ class InteractionOrchestrator:
         ):
             return
         payload = video_frames[-1].payload
+        motion = await asyncio.to_thread(self.motion_estimator.estimate, payload)
         self.last_temporal_summary = {
             "timestamp_ms": now_ms,
-            "motion_score": self._motion_score(self._last_temporal_payload, payload),
+            "motion_score": motion.score,
+            "method": motion.method,
             "scene_summary": scene_summary or "未检测到稳定场景",
         }
         self._last_temporal_summary_at_ms = now_ms
-        self._last_temporal_payload = payload
-
-    @staticmethod
-    def _motion_score(previous: bytes | None, current: bytes) -> float:
-        if previous is None or not previous or not current:
-            return 0.0
-        sample_count = min(len(previous), len(current), 2_048)
-        if sample_count <= 0:
-            return 0.0
-        previous_step = max(1, len(previous) // sample_count)
-        current_step = max(1, len(current) // sample_count)
-        differences = (
-            abs(previous[index * previous_step] - current[index * current_step])
-            for index in range(sample_count)
-        )
-        return round(sum(differences) / (sample_count * 255.0), 4)

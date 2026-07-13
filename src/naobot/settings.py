@@ -38,6 +38,7 @@ class Settings:
     temporal_summary_interval_ms: int = 1000
     identity_match_threshold: float = 0.78
     identity_match_interval_ms: int = 1000
+    identity_enrollment_similarity_threshold: float = 0.8
     asr_endpoint: str | None = None
     asr_model: str | None = None
     asr_api_key: str | None = None
@@ -109,6 +110,9 @@ class Settings:
             ),
             identity_match_interval_ms=int(
                 os.getenv("NAOBOT_IDENTITY_MATCH_INTERVAL_MS", "1000")
+            ),
+            identity_enrollment_similarity_threshold=float(
+                os.getenv("NAOBOT_IDENTITY_ENROLLMENT_SIMILARITY_THRESHOLD", "0.8")
             ),
             asr_endpoint=os.getenv("NAOBOT_ASR_ENDPOINT"),
             asr_model=os.getenv("NAOBOT_ASR_MODEL"),

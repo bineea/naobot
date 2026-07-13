@@ -430,6 +430,44 @@ async def test_create_agent_receives_state_and_context_config_and_persists_runti
 
 
 @pytest.mark.asyncio
+async def test_visitor_envelope_session_id_uses_guest_runtime_cache(tmp_path) -> None:
+    captures = []
+    settings = Settings(
+        runtime_dir=tmp_path,
+        llm_base_url="http://example.test/v1",
+        llm_model="test",
+    )
+    registry = RuntimeRegistry(settings)
+
+    def factory(_system_prompt: str, **kwargs):
+        captures.append(kwargs)
+        return FakeStreamingAgent(
+            '{"text":"你好","goal":"回应访客","confidence":1.0,"skills":[]}',
+            state=kwargs.get("state"),
+        )
+
+    runtime = AgentScopeBrainRuntime(
+        settings,
+        agent_factory=factory,
+        runtime_registry=registry,
+    )
+
+    await runtime.decide(
+        Envelope(
+            type=MessageType.EVENT,
+            session_id="visitor-real-1",
+            payload={"name": "user_utterance", "transcript": "你好", "person_id": None},
+        ),
+        SoulConfig(),
+        [],
+    )
+
+    assert captures[0]["person_id"] == "visitor-real-1"
+    assert captures[0]["is_guest"] is True
+    assert registry.loaded_count() == 1
+
+
+@pytest.mark.asyncio
 async def test_same_person_decisions_share_lifecycle_lock_and_preserve_history(tmp_path) -> None:
     first_started = asyncio.Event()
     second_started = asyncio.Event()

@@ -35,6 +35,12 @@ class VisionResult:
 
 
 @dataclass(slots=True)
+class MotionEstimate:
+    score: float
+    method: str
+
+
+@dataclass(slots=True)
 class TTSResult:
     audio: bytes
     media_type: str = "audio/pcm"
@@ -61,6 +67,10 @@ class ASRProvider(Protocol):
 
 class VisionProvider(Protocol):
     async def summarize(self, video_frames: Sequence[MediaFrame]) -> VisionResult: ...
+
+
+class MotionEstimator(Protocol):
+    def estimate(self, jpeg_payload: bytes) -> MotionEstimate: ...
 
 
 class TTSProvider(Protocol):
@@ -475,7 +485,7 @@ class CompositeWakeWordDetector:
 
 class CosineIdentityMatcher:
     def __init__(self, *, threshold: float = 0.78) -> None:
-        if not -1.0 <= threshold <= 1.0:
+        if not math.isfinite(threshold) or not -1.0 <= threshold <= 1.0:
             raise ValueError("threshold must be between -1 and 1")
         self.threshold = float(threshold)
         self._embeddings: tuple[tuple[str, tuple[float, ...]], ...] = ()
@@ -484,13 +494,13 @@ class CosineIdentityMatcher:
         resolved: list[tuple[str, tuple[float, ...]]] = []
         for item in embeddings:
             person_id = str(item.get("person_id") or "")
-            vector = tuple(float(value) for value in item.get("embedding", ()))
+            vector = tuple(self._finite_vector(item.get("embedding", ())))
             if person_id and vector:
                 resolved.append((person_id, vector))
         self._embeddings = tuple(resolved)
 
     def __call__(self, embedding: Sequence[float]) -> tuple[str, float] | None:
-        candidate = tuple(float(value) for value in embedding)
+        candidate = tuple(self._finite_vector(embedding))
         best: tuple[str, float] | None = None
         for person_id, enrolled in self._embeddings:
             score = self._cosine(candidate, enrolled)
@@ -512,6 +522,13 @@ class CosineIdentityMatcher:
         return math.fsum(a * b for a, b in zip(left, right, strict=True)) / (
             left_norm * right_norm
         )
+
+    @staticmethod
+    def _finite_vector(values: Sequence[Any]) -> list[float]:
+        vector = [float(value) for value in values]
+        if any(not math.isfinite(value) for value in vector):
+            raise ValueError("identity embedding values must be finite")
+        return vector
 
 
 class OnnxFaceEmbedder:
@@ -547,6 +564,8 @@ class OnnxFaceEmbedder:
         tensor = ((rgb.astype(np.float32) - 127.5) / 128.0).transpose(2, 0, 1)[None, ...]
         output = session.run(None, {model_input.name: tensor})[0]
         vector = np.asarray(output, dtype=np.float32).reshape(-1)
+        if not bool(np.isfinite(vector).all()):
+            raise MediaBackendError("ONNX identity model 返回了 non-finite embedding。")
         norm = float(np.linalg.norm(vector))
         if norm <= 0.0:
             raise MediaBackendError("ONNX identity model 返回了零向量。")
@@ -567,6 +586,49 @@ class OnnxFaceEmbedder:
         except (ImportError, OSError, RuntimeError) as exc:
             raise MediaBackendError(f"本地 ONNX identity model 加载失败：{exc}") from exc
         return self._session
+
+
+class OpenCVMotionEstimator:
+    """将 JPEG 解码为低分辨率灰度特征，并对相邻特征计算 MAD。"""
+
+    def __init__(self, *, thumbnail_size: tuple[int, int] = (32, 24)) -> None:
+        width, height = thumbnail_size
+        if width <= 0 or height <= 0:
+            raise ValueError("thumbnail_size must be positive")
+        self.thumbnail_size = (width, height)
+        self._previous_feature: Any | None = None
+
+    @property
+    def retained_feature_shape(self) -> tuple[int, ...] | None:
+        shape = getattr(self._previous_feature, "shape", None)
+        return tuple(shape) if shape is not None else None
+
+    def estimate(self, jpeg_payload: bytes) -> MotionEstimate:
+        try:
+            np = _load_numpy()
+            cv2 = importlib.import_module("cv2")
+        except (ImportError, RuntimeError):
+            self._previous_feature = None
+            return MotionEstimate(score=0.0, method="unavailable")
+        encoded = np.frombuffer(jpeg_payload, dtype=np.uint8)
+        image = cv2.imdecode(encoded, cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            self._previous_feature = None
+            return MotionEstimate(score=0.0, method="unavailable")
+        feature = cv2.resize(
+            image,
+            self.thumbnail_size,
+            interpolation=cv2.INTER_AREA,
+        )
+        score = 0.0
+        if self._previous_feature is not None:
+            difference = cv2.absdiff(self._previous_feature, feature)
+            score = float(np.mean(difference)) / 255.0
+        self._previous_feature = feature.copy()
+        return MotionEstimate(
+            score=round(min(max(score, 0.0), 1.0), 4),
+            method="opencv_gray_mad",
+        )
 
 
 class FasterWhisperASR:
@@ -662,6 +724,7 @@ class OpenCVMediaPipeIdentityFacade:
         identity_matcher: Callable[[Any], tuple[str | None, float] | None] | None = None,
         eye_contact_estimator: Callable[[Any], bool] | None = None,
         match_interval_ms: int = 1_000,
+        enrollment_similarity_threshold: float = 0.8,
     ) -> None:
         self._jpeg_decoder = jpeg_decoder
         self._face_detector = face_detector
@@ -669,8 +732,14 @@ class OpenCVMediaPipeIdentityFacade:
         self._identity_matcher = identity_matcher
         self._eye_contact_estimator = eye_contact_estimator
         self.match_interval_ms = max(0, match_interval_ms)
+        if (
+            not math.isfinite(enrollment_similarity_threshold)
+            or not -1.0 <= enrollment_similarity_threshold <= 1.0
+        ):
+            raise ValueError("enrollment_similarity_threshold must be between -1 and 1")
+        self.enrollment_similarity_threshold = float(enrollment_similarity_threshold)
         self._last_match_at_ms: int | None = None
-        self._last_person_id: str | None = None
+        self._default_detector: Any | None = None
         if self._jpeg_decoder is None or self._face_detector is None:
             _require_optional_dependency("mediapipe", "mediapipe")
             _require_optional_dependency("cv2", "opencv-contrib-python-headless")
@@ -682,7 +751,7 @@ class OpenCVMediaPipeIdentityFacade:
         detector = self._face_detector or self._default_face_detector
         newest_timestamp_ms = video_frames[-1].timestamp_ms
         should_match = self._should_match(newest_timestamp_ms)
-        best_person_id = None if should_match else self._last_person_id
+        best_person_id: str | None = None
         best_score = float("-inf")
         eye_contact = False
         max_faces = 0
@@ -707,13 +776,11 @@ class OpenCVMediaPipeIdentityFacade:
                 match = self._identity_matcher(embedding)
                 should_match = False
                 self._last_match_at_ms = newest_timestamp_ms
-                self._last_person_id = None
                 if match is None:
                     continue
                 person_id, score = match
                 if person_id is not None and score > best_score:
                     best_person_id = person_id
-                    self._last_person_id = person_id
                     best_score = score
 
         if max_faces == 0:
@@ -743,10 +810,18 @@ class OpenCVMediaPipeIdentityFacade:
             faces = list(detector(image) or [])
             if len(faces) != 1:
                 raise MediaBackendError("五帧注册要求每帧恰好检测到一张人脸。")
-            vector = [float(value) for value in self._embedder(self._embedding_input(image, faces[0]))]
+            try:
+                vector = CosineIdentityMatcher._finite_vector(
+                    self._embedder(self._embedding_input(image, faces[0]))
+                )
+            except ValueError as exc:
+                raise MediaBackendError(str(exc)) from exc
             if vectors and len(vector) != len(vectors[0]):
                 raise MediaBackendError("identity embedding 维度不一致。")
-            vectors.append(vector)
+            vector_norm = math.sqrt(math.fsum(value * value for value in vector))
+            if vector_norm == 0.0:
+                raise MediaBackendError("identity embedding 为零向量。")
+            vectors.append([value / vector_norm for value in vector])
         average = [
             math.fsum(vector[index] for vector in vectors) / len(vectors)
             for index in range(len(vectors[0]))
@@ -754,14 +829,27 @@ class OpenCVMediaPipeIdentityFacade:
         norm = math.sqrt(math.fsum(value * value for value in average))
         if norm == 0.0:
             raise MediaBackendError("identity embedding 为零向量。")
-        return [value / norm for value in average]
+        center = [value / norm for value in average]
+        similarities = [
+            CosineIdentityMatcher._cosine(vector, center) for vector in vectors
+        ]
+        similarities.extend(
+            CosineIdentityMatcher._cosine(left, right)
+            for index, left in enumerate(vectors)
+            for right in vectors[index + 1 :]
+        )
+        if any(
+            score is None or score < self.enrollment_similarity_threshold
+            for score in similarities
+        ):
+            raise MediaBackendError("五帧注册未通过同一人一致性校验。")
+        return center
 
     def refresh_embeddings(self, embeddings: Sequence[Mapping[str, Any]]) -> None:
         replace_embeddings = getattr(self._identity_matcher, "replace_embeddings", None)
         if callable(replace_embeddings):
             replace_embeddings(embeddings)
         self._last_match_at_ms = None
-        self._last_person_id = None
 
     def _should_match(self, timestamp_ms: int) -> bool:
         return (
@@ -796,16 +884,16 @@ class OpenCVMediaPipeIdentityFacade:
             raise MediaBackendError("JPEG 解码失败。")
         return image
 
-    @staticmethod
-    def _default_face_detector(image: Any) -> Sequence[Any]:
+    def _default_face_detector(self, image: Any) -> Sequence[Any]:
         cv2 = importlib.import_module("cv2")
         mediapipe = importlib.import_module("mediapipe")
-        detector = mediapipe.solutions.face_detection.FaceDetection(
-            model_selection=0,
-            min_detection_confidence=0.5,
-        )
+        if self._default_detector is None:
+            self._default_detector = mediapipe.solutions.face_detection.FaceDetection(
+                model_selection=0,
+                min_detection_confidence=0.5,
+            )
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        result = detector.process(rgb)
+        result = self._default_detector.process(rgb)
         return list(result.detections or [])
 
 

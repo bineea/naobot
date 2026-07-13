@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from types import SimpleNamespace
 
 import pytest
 from agentscope.state import AgentState
@@ -9,6 +11,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from naobot.agent import NaobotAgent
+from naobot.brain import AgentScopeBrainRuntime
 from naobot.interaction.session import InteractionSession
 from naobot.llm import RuleBasedLLMClient
 from naobot.media.backends import (
@@ -153,6 +156,34 @@ class CountingAgent:
             session_id=event.session_id,
             payload={"text": ""},
         )
+
+
+class GuestRuntimeStreamingAgent:
+    def __init__(self, state=None) -> None:
+        self.state = state or AgentState()
+
+    async def reply_stream(self, _inputs):
+        yield SimpleNamespace(
+            type="TEXT_BLOCK_DELTA",
+            delta='{"text":"你好","goal":"回应访客","confidence":1.0,"skills":[]}',
+        )
+
+
+async def create_real_guest_runtime(settings, registry, visitor_id):
+    brain = AgentScopeBrainRuntime(
+        settings,
+        agent_factory=lambda _prompt, **kwargs: GuestRuntimeStreamingAgent(kwargs.get("state")),
+        runtime_registry=registry,
+    )
+    agent = NaobotAgent(settings, llm=brain)
+    await agent.create_intent(
+        Envelope(
+            type=MessageType.EVENT,
+            session_id=visitor_id,
+            payload={"name": "user_utterance", "transcript": "你好", "person_id": None},
+        )
+    )
+    return agent
 
 
 def make_media_client(tmp_path, *, settings: Settings | None = None):
@@ -561,15 +592,10 @@ async def test_expired_visitor_session_destroys_guest_runtime(tmp_path) -> None:
     session.activate_from_touch(now_ms=1_000, person_id=None)
     visitor_id = session.snapshot(now_ms=1_000).session_id
     assert visitor_id is not None
-    await registry.save_state(
-        visitor_id,
-        "primary",
-        AgentState(session_id="guest-runtime"),
-        is_guest=True,
-    )
+    agent = await create_real_guest_runtime(settings, registry, visitor_id)
     service = MediaService(
         settings=settings,
-        agent=CountingAgent(),
+        agent=agent,
         session=session,
         wake_word=QuietWakeWord(),
         identity=PassiveIdentity(),
@@ -585,4 +611,60 @@ async def test_expired_visitor_session_destroys_guest_runtime(tmp_path) -> None:
     await service._handle_frame(MediaFrame.jpeg(b"jpeg", timestamp_ms=10, sequence=1))
 
     assert service.session.snapshot(now_ms=1_011).active is False
+    assert registry.loaded_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_media_websocket_disconnect_destroys_real_guest_runtime(tmp_path) -> None:
+    class DisconnectingWebSocket:
+        def __init__(self) -> None:
+            self.messages = [
+                {
+                    "text": json.dumps(
+                        {"device_id": "device-1", "token": "", "boot_id": "boot-1"}
+                    )
+                },
+                {"type": "websocket.disconnect", "code": 1000},
+            ]
+
+        async def accept(self):
+            return None
+
+        async def receive(self):
+            return self.messages.pop(0)
+
+        async def send_json(self, _payload):
+            return None
+
+        async def close(self, code):
+            return None
+
+    clock = StepClock(1_000)
+    settings = Settings(
+        runtime_dir=tmp_path,
+        llm_base_url="http://example.test/v1",
+        llm_model="test",
+    )
+    registry = RuntimeRegistry(settings)
+    session = InteractionSession()
+    session.activate_from_touch(now_ms=1_000, person_id=None)
+    visitor_id = session.snapshot(now_ms=1_000).session_id
+    assert visitor_id is not None
+    agent = await create_real_guest_runtime(settings, registry, visitor_id)
+    service = MediaService(
+        settings=settings,
+        agent=agent,
+        session=session,
+        wake_word=QuietWakeWord(),
+        identity=PassiveIdentity(),
+        asr=FakeASR(),
+        vision=CountingVision(),
+        tts=FakeTTS(),
+        runtime_registry=registry,
+        clock=clock,
+    )
+    assert registry.loaded_count() == 1
+
+    await service.handle_websocket(DisconnectingWebSocket())  # type: ignore[arg-type]
+
     assert registry.loaded_count() == 0

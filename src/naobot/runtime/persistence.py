@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,6 +22,13 @@ def _utc_now() -> str:
 
 def _media_digest(payload: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _validate_embedding(embedding: list[float]) -> list[float]:
+    vector = [float(value) for value in embedding]
+    if not vector or any(not math.isfinite(value) for value in vector):
+        raise ValueError("identity embedding must contain finite values")
+    return vector
 
 
 def _media_text_summary(
@@ -445,6 +453,7 @@ class RuntimePersistence:
     ) -> None:
         if len(samples) != 5:
             raise ValueError("enrollment requires exactly 5 samples")
+        embedding = _validate_embedding(embedding)
         fernet = self._fernet()
         await self.initialize()
         now = _utc_now()
@@ -530,6 +539,7 @@ class FaceDataRepository:
         *,
         model_name: str,
     ) -> None:
+        embedding = _validate_embedding(embedding)
         fernet = self._fernet()
         await self.persistence.initialize()
         await self.persistence.upsert_person(person_id, metadata=None)
@@ -578,7 +588,7 @@ class FaceDataRepository:
         if row is None:
             return None
         payload = json.loads(fernet.decrypt(row[0]).decode("utf-8"))
-        return list(payload["embedding"])
+        return _validate_embedding(list(payload["embedding"]))
 
     async def list_embeddings(self, *, model_name: str | None = None) -> list[dict[str, Any]]:
         fernet = self._fernet()
@@ -605,7 +615,7 @@ class FaceDataRepository:
             embeddings.append(
                 {
                     "person_id": person_id,
-                    "embedding": [float(value) for value in payload["embedding"]],
+                    "embedding": _validate_embedding(list(payload["embedding"])),
                 }
             )
             seen.add(person_id)

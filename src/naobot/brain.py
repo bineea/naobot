@@ -153,12 +153,13 @@ class AgentScopeBrainRuntime(LLMClient):
         deadline: float,
     ) -> LLMDecision:
         prompt = self._build_prompt(event, brain_input, soul, memories, route)
+        runtime_person_id, is_guest = self._runtime_identity(brain_input)
         output = await self._run_agent(
             PRIMARY_SYSTEM_PROMPT,
             prompt,
             agent_role="primary",
-            person_id=brain_input.person_id,
-            is_guest=self._is_guest(brain_input.person_id),
+            person_id=runtime_person_id,
+            is_guest=is_guest,
             deadline=deadline,
             media_blocks=media_blocks,
         )
@@ -177,14 +178,14 @@ class AgentScopeBrainRuntime(LLMClient):
         deadline: float,
     ) -> LLMDecision:
         prompt = self._build_prompt(event, brain_input, soul, memories, route)
-        is_guest = self._is_guest(brain_input.person_id)
+        runtime_person_id, is_guest = self._runtime_identity(brain_input)
         recommendations = await asyncio.gather(
             *(
                 self._run_agent(
                     system_prompt,
                     prompt,
                     agent_role=role,
-                    person_id=brain_input.person_id,
+                    person_id=runtime_person_id,
                     is_guest=is_guest,
                     deadline=deadline,
                     media_blocks=media_blocks,
@@ -206,7 +207,7 @@ class AgentScopeBrainRuntime(LLMClient):
             EDITOR_SYSTEM_PROMPT,
             editor_prompt,
             agent_role="editor",
-            person_id=brain_input.person_id,
+            person_id=runtime_person_id,
             is_guest=is_guest,
             deadline=deadline,
             media_blocks=None,
@@ -268,6 +269,7 @@ class AgentScopeBrainRuntime(LLMClient):
                 system_prompt,
                 agent_role=agent_role,
                 person_id=person_id,
+                is_guest=is_guest,
                 state=state,
                 context_config=context_config,
             )
@@ -495,6 +497,15 @@ class AgentScopeBrainRuntime(LLMClient):
             return True
         lowered = person_id.lower()
         return lowered.startswith("guest") or lowered.startswith("visitor")
+
+    @classmethod
+    def _runtime_identity(cls, brain_input: BrainInput) -> tuple[str | None, bool]:
+        if brain_input.person_id:
+            return brain_input.person_id, cls._is_guest(brain_input.person_id)
+        session_id = str(brain_input.event.get("session_id") or "")
+        if cls._is_guest(session_id) and session_id:
+            return session_id, True
+        return None, True
 
     @staticmethod
     def _reply_deadline(timeout_seconds: float) -> float:

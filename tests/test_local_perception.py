@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import struct
+import threading
 
 import pytest
 
@@ -10,6 +11,7 @@ from naobot.media.backends import (
     ASRResult,
     IdentityResult,
     LocalPhraseWakeWordDetector,
+    MotionEstimate,
     PCM16VoiceActivityDetector,
     TTSResult,
     VisionResult,
@@ -152,6 +154,13 @@ async def test_local_temporal_summary_runs_at_one_hz_in_ram_before_activation() 
     identity = TemporalIdentity()
     asr = SpyASR()
     vision = SpyVision()
+    motion_calls = []
+
+    class FakeMotionEstimator:
+        def estimate(self, payload):
+            motion_calls.append(payload)
+            return MotionEstimate(score=0.25 if len(motion_calls) > 1 else 0.0, method="fake_mad")
+
     orchestrator = InteractionOrchestrator(
         settings=Settings(temporal_summary_interval_ms=1_000),
         pipeline=MediaPipeline(),
@@ -161,6 +170,7 @@ async def test_local_temporal_summary_runs_at_one_hz_in_ram_before_activation() 
         asr=asr,
         vision=vision,
         tts=SpyTTS(),
+        motion_estimator=FakeMotionEstimator(),
     )
 
     await orchestrator.observe_video(
@@ -182,9 +192,49 @@ async def test_local_temporal_summary_runs_at_one_hz_in_ram_before_activation() 
     assert summary is not None
     assert summary["timestamp_ms"] == 1_000
     assert summary["scene_summary"] == "检测到单人"
-    assert 0.0 <= summary["motion_score"] <= 1.0
+    assert summary["motion_score"] == 0.25
+    assert summary["method"] == "fake_mad"
+    assert motion_calls == [b"frame-a", b"frame-c"]
+    assert not hasattr(orchestrator, "_last_temporal_payload")
     assert asr.calls == 0
     assert vision.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_host_offloads_identity_and_motion_inference_from_event_loop() -> None:
+    loop_thread = threading.get_ident()
+    identity_threads = []
+    motion_threads = []
+
+    class ThreadIdentity:
+        def identify(self, _frames):
+            identity_threads.append(threading.get_ident())
+            return IdentityResult(vision_summary="未检测到人脸")
+
+    class ThreadMotion:
+        def estimate(self, _payload):
+            motion_threads.append(threading.get_ident())
+            return MotionEstimate(score=0.0, method="thread")
+
+    orchestrator = InteractionOrchestrator(
+        settings=Settings(),
+        pipeline=MediaPipeline(),
+        session=InteractionSession(),
+        wake_word=QuietWakeWord(),
+        identity=ThreadIdentity(),
+        asr=SpyASR(),
+        vision=SpyVision(),
+        tts=SpyTTS(),
+        motion_estimator=ThreadMotion(),
+    )
+
+    await orchestrator.observe_video(
+        [MediaFrame.jpeg(b"jpeg", timestamp_ms=1, sequence=1)],
+        now_ms=1,
+    )
+
+    assert identity_threads and identity_threads[0] != loop_thread
+    assert motion_threads and motion_threads[0] != loop_thread
 
 
 @pytest.mark.asyncio

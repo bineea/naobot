@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import struct
+import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -9,12 +11,15 @@ from agentscope.message import DataBlock
 
 from naobot.media.backends import (
     ASRResult,
+    CosineIdentityMatcher,
     FasterWhisperASR,
     MediaBackendError,
+    OnnxFaceEmbedder,
     OpenAICompatibleASR,
     OpenAICompatibleTTS,
     OpenAICompatibleVisionProvider,
     OpenCVMediaPipeIdentityFacade,
+    OpenCVMotionEstimator,
     OpenWakeWordDetector,
     SherpaOnnxTTS,
     TTSResult,
@@ -327,6 +332,161 @@ def test_local_identity_facade_is_callable_with_injected_components() -> None:
 
     assert result.person_id == "person-7"
     assert result.eye_contact_ms == 1_500
+
+
+def test_fake_decoder_detector_and_onnx_session_run_full_identity_path(monkeypatch) -> None:
+    import numpy as np
+
+    real_import = __import__("importlib").import_module
+
+    class FakeCV2:
+        COLOR_BGR2RGB = 1
+
+        @staticmethod
+        def resize(image, size):
+            assert size == (2, 2)
+            return image
+
+        @staticmethod
+        def cvtColor(image, _code):
+            return image
+
+    class FakeInput:
+        name = "input"
+        shape = [1, 3, 2, 2]
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def get_inputs(self):
+            return [FakeInput()]
+
+        def run(self, _outputs, feed):
+            self.calls.append(feed["input"])
+            return [np.asarray([[1.0, 0.0]], dtype=np.float32)]
+
+    def fake_import(name: str, package: str | None = None):
+        if name == "cv2":
+            return FakeCV2
+        return real_import(name, package)
+
+    monkeypatch.setattr("naobot.media.backends.importlib.import_module", fake_import)
+    session = FakeSession()
+    detector_calls = []
+    matcher = CosineIdentityMatcher(threshold=0.8)
+    matcher.replace_embeddings([{"person_id": "person-full", "embedding": [1.0, 0.0]}])
+    facade = OpenCVMediaPipeIdentityFacade(
+        jpeg_decoder=lambda payload: np.full((2, 2, 3), payload[0], dtype=np.uint8),
+        face_detector=lambda image: detector_calls.append(image) or [{"embedding_input": image}],
+        embedder=OnnxFaceEmbedder("fake.onnx", session=session),
+        identity_matcher=matcher,
+        match_interval_ms=0,
+    )
+
+    result = facade.identify([MediaFrame.jpeg(b"\x7f", timestamp_ms=1, sequence=1)])
+
+    assert result.person_id == "person-full"
+    assert len(detector_calls) == 1
+    assert len(session.calls) == 1
+
+
+def test_default_mediapipe_detector_instance_is_cached(monkeypatch) -> None:
+    factory_calls = []
+
+    class Detector:
+        def process(self, _image):
+            return SimpleNamespace(detections=[{"face": 1}])
+
+    class FakeCV2:
+        COLOR_BGR2RGB = 1
+
+        @staticmethod
+        def cvtColor(image, _code):
+            return image
+
+    fake_mediapipe = SimpleNamespace(
+        solutions=SimpleNamespace(
+            face_detection=SimpleNamespace(
+                FaceDetection=lambda **_kwargs: factory_calls.append(1) or Detector()
+            )
+        )
+    )
+    real_import = __import__("importlib").import_module
+
+    def fake_import(name: str, package: str | None = None):
+        if name == "cv2":
+            return FakeCV2
+        if name == "mediapipe":
+            return fake_mediapipe
+        return real_import(name, package)
+
+    monkeypatch.setattr("naobot.media.backends.find_spec", lambda _name: object())
+    monkeypatch.setattr("naobot.media.backends.importlib.import_module", fake_import)
+    facade = OpenCVMediaPipeIdentityFacade(jpeg_decoder=lambda payload: payload)
+
+    facade.identify([MediaFrame.jpeg(b"one", timestamp_ms=1, sequence=1)])
+    facade.identify([MediaFrame.jpeg(b"two", timestamp_ms=2, sequence=2)])
+
+    assert factory_calls == [1]
+
+
+def test_opencv_motion_estimator_uses_gray_thumbnail_mad(monkeypatch) -> None:
+    import numpy as np
+
+    class FakeCV2:
+        IMREAD_GRAYSCALE = 0
+        INTER_AREA = 1
+
+        @staticmethod
+        def imdecode(encoded, _mode):
+            return np.full((4, 4), int(encoded[0]), dtype=np.uint8)
+
+        @staticmethod
+        def resize(image, size, interpolation):
+            assert interpolation == FakeCV2.INTER_AREA
+            return np.full((size[1], size[0]), int(image[0, 0]), dtype=np.uint8)
+
+        @staticmethod
+        def absdiff(left, right):
+            return np.abs(left.astype(np.int16) - right.astype(np.int16)).astype(np.uint8)
+
+    real_import = __import__("importlib").import_module
+    monkeypatch.setattr(
+        "naobot.media.backends.importlib.import_module",
+        lambda name, package=None: FakeCV2 if name == "cv2" else real_import(name, package),
+    )
+    estimator = OpenCVMotionEstimator(thumbnail_size=(32, 24))
+
+    first = estimator.estimate(b"\x00jpeg-a")
+    second = estimator.estimate(b"\xffjpeg-b")
+
+    assert first.method == "opencv_gray_mad"
+    assert first.score == 0.0
+    assert second.score == pytest.approx(1.0)
+    assert estimator.retained_feature_shape == (24, 32)
+
+
+def test_opencv_motion_estimator_marks_missing_dependency_unavailable(monkeypatch) -> None:
+    real_import = __import__("importlib").import_module
+
+    def missing_cv2(name: str, package: str | None = None):
+        if name == "cv2":
+            raise ImportError("cv2")
+        return real_import(name, package)
+
+    monkeypatch.setattr("naobot.media.backends.importlib.import_module", missing_cv2)
+
+    result = OpenCVMotionEstimator().estimate(b"jpeg")
+
+    assert result.method == "unavailable"
+    assert result.score == 0.0
+
+
+def test_media_local_pins_legacy_mediapipe_solutions_version() -> None:
+    config = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+
+    assert "mediapipe==0.10.21" in config["project"]["optional-dependencies"]["media-local"]
 
 
 def test_identity_model_path_is_lazily_assembled_or_clearly_degraded(
