@@ -1,0 +1,150 @@
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+from naobot.models import Envelope, MessageType
+from naobot.settings import Settings
+
+from ..media.backends import (
+    ASRProvider,
+    IdentityProvider,
+    TTSProvider,
+    VisionProvider,
+    WakeWordProvider,
+    build_vision_input_blocks,
+    coerce_wake_word_result,
+)
+from ..media.pipeline import MediaPipeline
+from ..media.protocol import MediaFrame
+from .session import InteractionSession
+
+
+class InteractionOrchestrator:
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        pipeline: MediaPipeline,
+        session: InteractionSession,
+        wake_word: WakeWordProvider,
+        identity: IdentityProvider,
+        asr: ASRProvider,
+        vision: VisionProvider,
+        tts: TTSProvider,
+    ) -> None:
+        self.settings = settings
+        self.pipeline = pipeline
+        self.session = session
+        self.wake_word = wake_word
+        self.identity = identity
+        self.asr = asr
+        self.vision = vision
+        self.tts = tts
+        self._sync_stats(now_ms=0)
+
+    async def observe_audio(self, audio_frames: Sequence[MediaFrame], *, now_ms: int) -> None:
+        self.pipeline.update_connection(True)
+        for frame in audio_frames:
+            self.pipeline.push_audio_chunk(frame, is_speech=True)
+        wake = coerce_wake_word_result(self.wake_word.detect(audio_frames))
+        snapshot = self.session.snapshot(now_ms=now_ms)
+        if wake.triggered:
+            self.session.activate_from_wake_word(
+                now_ms=now_ms,
+                person_id=snapshot.person_id,
+            )
+        elif not snapshot.active and wake.greeting_detected:
+            self.session.activate_from_greeting(now_ms=now_ms, person_id=None)
+        else:
+            self.session.mark_activity(now_ms=now_ms)
+        self._sync_stats(now_ms=now_ms)
+
+    async def observe_video(self, video_frames: Sequence[MediaFrame], *, now_ms: int) -> None:
+        self.pipeline.update_connection(True)
+        for frame in video_frames:
+            self.pipeline.push_video_frame(frame)
+        identity = self.identity.identify(video_frames)
+        snapshot = self.session.snapshot(now_ms=now_ms)
+        if not snapshot.active:
+            if identity.eye_contact_ms >= self.session.eye_contact_activation_ms:
+                self.session.activate_from_eye_contact(
+                    now_ms=now_ms,
+                    eye_contact_ms=identity.eye_contact_ms,
+                    person_id=identity.person_id,
+                )
+            elif identity.greeting_detected:
+                self.session.activate_from_greeting(now_ms=now_ms, person_id=identity.person_id)
+        else:
+            self.session.mark_activity(now_ms=now_ms)
+        self._sync_stats(now_ms=now_ms)
+
+    def observe_touch(self, *, now_ms: int, person_id: str | None = None) -> None:
+        self.session.activate_from_touch(now_ms=now_ms, person_id=person_id)
+        self._sync_stats(now_ms=now_ms)
+
+    async def complete_utterance(
+        self,
+        *,
+        audio_frames: Sequence[MediaFrame],
+        video_frames: Sequence[MediaFrame],
+        now_ms: int,
+    ) -> Envelope | None:
+        self.pipeline.update_connection(True)
+        for frame in audio_frames:
+            self.pipeline.push_audio_chunk(frame, is_speech=True)
+        for frame in video_frames:
+            self.pipeline.push_video_frame(frame)
+
+        snapshot = self.session.snapshot(now_ms=now_ms)
+        if not snapshot.active or not snapshot.listening:
+            self._sync_stats(now_ms=now_ms)
+            return None
+
+        asr_result = await self.asr.transcribe(audio_frames)
+        vision_result = await self.vision.summarize(video_frames)
+        self.session.mark_activity(now_ms=now_ms)
+        self.pipeline.set_last_transcript(asr_result.transcript)
+        self._sync_stats(now_ms=now_ms)
+
+        media_refs = [
+            f"media://jpeg/{index + 1}/{frame.sequence}-{frame.timestamp_ms}"
+            for index, frame in enumerate(video_frames[:3])
+        ]
+        build_vision_input_blocks([frame.payload for frame in video_frames[:3]])
+
+        session_id = snapshot.session_id or "visitor-session"
+        return Envelope(
+            type=MessageType.EVENT,
+            session_id=session_id,
+            payload={
+                "name": "user_utterance",
+                "transcript": asr_result.transcript,
+                "person_id": snapshot.person_id,
+                "vision_summary": vision_result.summary,
+                "media_refs": media_refs,
+                "session_trigger": snapshot.session_trigger,
+            },
+        )
+
+    async def speak_text(self, text: str, *, now_ms: int):
+        snapshot = self.session.snapshot(now_ms=now_ms)
+        if not snapshot.active:
+            self._sync_stats(now_ms=now_ms)
+            return None
+        self.session.start_tts(now_ms=now_ms)
+        self._sync_stats(now_ms=now_ms)
+        return await self.tts.synthesize(text)
+
+    def finish_tts(self, *, now_ms: int) -> None:
+        self.session.end_tts(now_ms=now_ms)
+        self._sync_stats(now_ms=now_ms)
+
+    def _sync_stats(self, *, now_ms: int) -> None:
+        snapshot = self.session.snapshot(now_ms=now_ms)
+        self.pipeline.update_session(
+            snapshot.session_id,
+            person_id=snapshot.person_id,
+            trigger=snapshot.session_trigger,
+        )
+        self.pipeline.set_listening(snapshot.listening)
+        self.pipeline.set_speaking(snapshot.speaking)

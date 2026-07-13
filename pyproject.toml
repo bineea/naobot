@@ -26,6 +26,16 @@ dependencies = [
 [project.scripts]
 naobot = "naobot.cli:main"
 
+[project.optional-dependencies]
+media-local = [
+  "faster-whisper",
+  "openwakeword",
+  "opencv-contrib-python-headless",
+  "mediapipe",
+  "sherpa-onnx",
+  "onnxruntime",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
