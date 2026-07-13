@@ -20,7 +20,7 @@ class RuntimeSession:
 
     async def save(self, state: AgentState) -> int:
         return await asyncio.shield(
-            self._registry._save_locked(
+            self._registry._save(
                 self.person_id,
                 self.agent_role,
                 state,
@@ -37,15 +37,24 @@ class RuntimeRegistry:
     ) -> None:
         self.settings = settings
         self.persistence = persistence or RuntimePersistence(settings)
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._person_locks: dict[str, asyncio.Lock] = {}
+        self._role_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._cache: dict[tuple[str, str], AgentState] = {}
         self._guest_cache: dict[tuple[str, str], AgentState] = {}
 
-    def _lock_for(self, person_id: str) -> asyncio.Lock:
-        lock = self._locks.get(person_id)
+    def _person_lock_for(self, person_id: str) -> asyncio.Lock:
+        lock = self._person_locks.get(person_id)
         if lock is None:
             lock = asyncio.Lock()
-            self._locks[person_id] = lock
+            self._person_locks[person_id] = lock
+        return lock
+
+    def _role_lock_for(self, person_id: str, agent_role: str) -> asyncio.Lock:
+        key = (person_id, agent_role)
+        lock = self._role_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._role_locks[key] = lock
         return lock
 
     def _cache_for(self, is_guest: bool) -> dict[tuple[str, str], AgentState]:
@@ -92,6 +101,22 @@ class RuntimeRegistry:
         cache[key] = AgentState.model_validate(scrubbed_payload)
         return version
 
+    async def _save(
+        self,
+        person_id: str,
+        agent_role: str,
+        state: AgentState,
+        *,
+        is_guest: bool,
+    ) -> int:
+        async with self._person_lock_for(person_id):
+            return await self._save_locked(
+                person_id,
+                agent_role,
+                state,
+                is_guest=is_guest,
+            )
+
     @asynccontextmanager
     async def person_runtime(
         self,
@@ -101,10 +126,11 @@ class RuntimeRegistry:
         is_guest: bool = False,
     ):
         await asyncio.shield(self.persistence.initialize())
-        async with self._lock_for(person_id):
-            state = await asyncio.shield(
-                self._load_locked(person_id, agent_role, is_guest=is_guest)
-            )
+        async with self._role_lock_for(person_id, agent_role):
+            async with self._person_lock_for(person_id):
+                state = await asyncio.shield(
+                    self._load_locked(person_id, agent_role, is_guest=is_guest)
+                )
             yield RuntimeSession(
                 person_id=person_id,
                 agent_role=agent_role,
@@ -121,10 +147,11 @@ class RuntimeRegistry:
         is_guest: bool = False,
     ) -> AgentState:
         await asyncio.shield(self.persistence.initialize())
-        async with self._lock_for(person_id):
-            return await asyncio.shield(
-                self._load_locked(person_id, agent_role, is_guest=is_guest)
-            )
+        async with self._role_lock_for(person_id, agent_role):
+            async with self._person_lock_for(person_id):
+                return await asyncio.shield(
+                    self._load_locked(person_id, agent_role, is_guest=is_guest)
+                )
 
     async def save_state(
         self,
@@ -135,14 +162,14 @@ class RuntimeRegistry:
         is_guest: bool = False,
     ) -> int:
         await asyncio.shield(self.persistence.initialize())
-        async with self._lock_for(person_id):
+        async with self._role_lock_for(person_id, agent_role):
             return await asyncio.shield(
-                self._save_locked(person_id, agent_role, state, is_guest=is_guest)
+                self._save(person_id, agent_role, state, is_guest=is_guest)
             )
 
     async def reset_person_runtime(self, person_id: str) -> None:
         await asyncio.shield(self.persistence.initialize())
-        async with self._lock_for(person_id):
+        async with self._person_lock_for(person_id):
             self._cache = {
                 key: value for key, value in self._cache.items() if key[0] != person_id
             }
@@ -153,7 +180,7 @@ class RuntimeRegistry:
 
     async def destroy_guest_runtime(self, person_id: str) -> None:
         await asyncio.shield(self.persistence.initialize())
-        async with self._lock_for(person_id):
+        async with self._person_lock_for(person_id):
             self._guest_cache = {
                 key: value for key, value in self._guest_cache.items() if key[0] != person_id
             }

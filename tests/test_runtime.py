@@ -1,3 +1,4 @@
+import asyncio
 import sqlite3
 
 import pytest
@@ -24,6 +25,162 @@ class FailingSavePersistence(RuntimePersistence):
         if self.fail_save:
             raise RuntimeError("save exploded")
         return await super().save_agent_runtime(person_id, agent_role, state)
+
+
+def create_v1_runtime_database(db_path, *, robot_id: str) -> None:
+    now = "2026-07-13T00:00:00+00:00"
+    state_json = AgentState(
+        session_id="legacy-session",
+        summary="legacy-summary",
+    ).model_dump_json(exclude_none=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            CREATE TABLE people (
+                person_id TEXT PRIMARY KEY,
+                display_name TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE face_embeddings (
+                robot_id TEXT NOT NULL,
+                person_id TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                embedding_ciphertext BLOB NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (robot_id, person_id, model_name),
+                FOREIGN KEY (person_id) REFERENCES people(person_id) ON DELETE CASCADE
+            );
+            CREATE TABLE face_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                robot_id TEXT NOT NULL,
+                person_id TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                sample_ciphertext BLOB NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (person_id) REFERENCES people(person_id) ON DELETE CASCADE
+            );
+            CREATE TABLE conversation_sessions (
+                session_id TEXT PRIMARY KEY,
+                robot_id TEXT NOT NULL,
+                person_id TEXT NOT NULL,
+                is_guest INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (person_id) REFERENCES people(person_id) ON DELETE CASCADE
+            );
+            CREATE TABLE agent_runtimes (
+                robot_id TEXT NOT NULL,
+                person_id TEXT NOT NULL,
+                agent_role TEXT NOT NULL,
+                state_json TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (robot_id, person_id, agent_role),
+                FOREIGN KEY (person_id) REFERENCES people(person_id) ON DELETE CASCADE
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?)",
+            (now,),
+        )
+        conn.execute(
+            """
+            INSERT INTO people(person_id, display_name, metadata_json, created_at, updated_at)
+            VALUES ('legacy-person', '旧用户', '{"source":"v1"}', ?, ?)
+            """,
+            (now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO conversation_sessions(
+                session_id, robot_id, person_id, is_guest, status, created_at, updated_at
+            ) VALUES ('legacy-session', ?, 'legacy-person', 0, 'active', ?, ?)
+            """,
+            (robot_id, now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO agent_runtimes(
+                robot_id, person_id, agent_role, state_json, version, updated_at
+            ) VALUES (?, 'legacy-person', 'primary', ?, 3, ?)
+            """,
+            (robot_id, state_json, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO face_embeddings(
+                robot_id, person_id, model_name, embedding_ciphertext, version, updated_at
+            ) VALUES (?, 'legacy-person', 'face-v1', X'0102', 2, ?)
+            """,
+            (robot_id, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO face_samples(
+                robot_id, person_id, media_type, sha256, sample_ciphertext, created_at
+            ) VALUES (?, 'legacy-person', 'image/jpeg', 'legacy-sha', X'0304', ?)
+            """,
+            (robot_id, now),
+        )
+
+
+@pytest.mark.asyncio
+async def test_same_person_different_roles_can_enter_runtime_contexts_in_parallel(tmp_path) -> None:
+    registry = RuntimeRegistry(Settings(runtime_dir=tmp_path, robot_id="robot-test"))
+    primary_entered = asyncio.Event()
+    specialist_entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold_runtime(role: str, entered: asyncio.Event) -> None:
+        async with registry.person_runtime("person-parallel", role):
+            entered.set()
+            await release.wait()
+
+    primary_task = asyncio.create_task(hold_runtime("primary", primary_entered))
+    await asyncio.wait_for(primary_entered.wait(), timeout=0.5)
+    specialist_task = asyncio.create_task(hold_runtime("safety-specialist", specialist_entered))
+
+    await asyncio.wait_for(specialist_entered.wait(), timeout=0.5)
+    release.set()
+    await asyncio.gather(primary_task, specialist_task)
+
+
+@pytest.mark.asyncio
+async def test_same_person_same_role_runtime_contexts_remain_serialized(tmp_path) -> None:
+    registry = RuntimeRegistry(Settings(runtime_dir=tmp_path, robot_id="robot-test"))
+    first_entered = asyncio.Event()
+    second_entered = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def hold_first() -> None:
+        async with registry.person_runtime("person-serial", "primary"):
+            first_entered.set()
+            await release_first.wait()
+
+    async def enter_second() -> None:
+        async with registry.person_runtime("person-serial", "primary"):
+            second_entered.set()
+
+    first_task = asyncio.create_task(hold_first())
+    await asyncio.wait_for(first_entered.wait(), timeout=0.5)
+    second_task = asyncio.create_task(enter_second())
+
+    await asyncio.sleep(0.05)
+    assert second_entered.is_set() is False
+
+    release_first.set()
+    await asyncio.gather(first_task, second_task)
+    assert second_entered.is_set() is True
 
 
 @pytest.mark.asyncio
@@ -219,6 +376,126 @@ async def test_upsert_person_metadata_is_preserved_when_runtime_saves_without_me
     ).fetchone()[0]
 
     assert metadata_json == '{"nickname": "小王"}'
+
+
+@pytest.mark.asyncio
+async def test_people_list_get_and_update_are_isolated_by_robot(tmp_path) -> None:
+    persistence_a = RuntimePersistence(Settings(runtime_dir=tmp_path, robot_id="robot-a"))
+    persistence_b = RuntimePersistence(Settings(runtime_dir=tmp_path, robot_id="robot-b"))
+
+    await persistence_a.upsert_person(
+        "shared-person",
+        display_name="A 用户",
+        metadata={"owner": "a"},
+    )
+    await persistence_b.upsert_person(
+        "shared-person",
+        display_name="B 用户",
+        metadata={"owner": "b"},
+    )
+
+    assert [person["display_name"] for person in await persistence_a.list_people()] == ["A 用户"]
+    assert [person["display_name"] for person in await persistence_b.list_people()] == ["B 用户"]
+    assert (await persistence_a.get_person("shared-person"))["metadata"] == {"owner": "a"}
+    assert (await persistence_b.get_person("shared-person"))["metadata"] == {"owner": "b"}
+
+    await persistence_a.upsert_person(
+        "shared-person",
+        display_name="A 已更新",
+        metadata={"owner": "a-updated"},
+    )
+
+    assert (await persistence_a.get_person("shared-person"))["display_name"] == "A 已更新"
+    assert (await persistence_b.get_person("shared-person"))["display_name"] == "B 用户"
+    assert (await persistence_b.get_person("shared-person"))["metadata"] == {"owner": "b"}
+
+
+@pytest.mark.asyncio
+async def test_delete_person_preserves_other_robot_data(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("NAOBOT_DATA_KEY", Fernet.generate_key().decode("utf-8"))
+    settings_a = Settings(runtime_dir=tmp_path, robot_id="robot-a")
+    settings_b = Settings(runtime_dir=tmp_path, robot_id="robot-b")
+    persistence_a = RuntimePersistence(settings_a)
+    persistence_b = RuntimePersistence(settings_b)
+    repo_b = FaceDataRepository(settings_b, persistence=persistence_b)
+
+    await persistence_a.upsert_person("shared-person", display_name="A 用户")
+    await persistence_b.upsert_person("shared-person", display_name="B 用户")
+    await persistence_a.save_agent_runtime(
+        "shared-person",
+        "primary",
+        AgentState(session_id="shared-session", summary="robot-a"),
+    )
+    await persistence_b.save_agent_runtime(
+        "shared-person",
+        "primary",
+        AgentState(session_id="shared-session", summary="robot-b"),
+    )
+    await repo_b.upsert_embedding("shared-person", [0.2, 0.8], model_name="face-v1")
+
+    await persistence_a.delete_person("shared-person")
+
+    assert await persistence_a.get_person("shared-person") is None
+    assert (await persistence_b.get_person("shared-person"))["display_name"] == "B 用户"
+    assert (await persistence_b.load_agent_runtime("shared-person", "primary")).summary == "robot-b"
+    assert await repo_b.get_embedding("shared-person", model_name="face-v1") == [0.2, 0.8]
+    assert [session["session_id"] for session in await persistence_b.list_sessions()] == [
+        "shared-session"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_v1_schema_migrates_to_v2_without_losing_data_and_is_idempotent(tmp_path) -> None:
+    db_path = tmp_path / "naobot.db"
+    create_v1_runtime_database(db_path, robot_id="robot-current")
+    settings = Settings(runtime_dir=tmp_path, robot_id="robot-current")
+
+    await RuntimePersistence(settings).initialize()
+    await RuntimePersistence(settings).initialize()
+
+    persistence = RuntimePersistence(settings)
+    person = await persistence.get_person("legacy-person")
+    runtime = await persistence.load_agent_runtime("legacy-person", "primary")
+    with sqlite3.connect(db_path) as conn:
+        versions = [row[0] for row in conn.execute("SELECT version FROM schema_migrations")]
+        people_pk = {
+            row[1]: row[5]
+            for row in conn.execute("PRAGMA table_info(people)")
+            if row[5]
+        }
+        session_pk = {
+            row[1]: row[5]
+            for row in conn.execute("PRAGMA table_info(conversation_sessions)")
+            if row[5]
+        }
+        counts = {
+            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "people",
+                "face_embeddings",
+                "face_samples",
+                "conversation_sessions",
+                "agent_runtimes",
+            )
+        }
+        foreign_key_violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+
+    assert versions == [1, 2]
+    assert people_pk == {"robot_id": 1, "person_id": 2}
+    assert session_pk == {"robot_id": 1, "session_id": 2}
+    assert counts == {
+        "people": 1,
+        "face_embeddings": 1,
+        "face_samples": 1,
+        "conversation_sessions": 1,
+        "agent_runtimes": 1,
+    }
+    assert foreign_key_violations == []
+    assert person is not None
+    assert person["display_name"] == "旧用户"
+    assert person["metadata"] == {"source": "v1"}
+    assert runtime is not None
+    assert runtime.summary == "legacy-summary"
 
 
 @pytest.mark.asyncio

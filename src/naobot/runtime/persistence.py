@@ -120,6 +120,158 @@ class RuntimePersistence:
             raise RuntimeError("NAOBOT_DATA_KEY 未配置，拒绝写入敏感人脸数据。")
         return Fernet(key.encode("utf-8"))
 
+    async def _create_v2_schema(self, db: aiosqlite.Connection) -> None:
+        statements = (
+            """
+            CREATE TABLE IF NOT EXISTS people (
+                robot_id TEXT NOT NULL,
+                person_id TEXT NOT NULL,
+                display_name TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (robot_id, person_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS face_embeddings (
+                robot_id TEXT NOT NULL,
+                person_id TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                embedding_ciphertext BLOB NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (robot_id, person_id, model_name),
+                FOREIGN KEY (robot_id, person_id)
+                    REFERENCES people(robot_id, person_id) ON DELETE CASCADE
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS face_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                robot_id TEXT NOT NULL,
+                person_id TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                sample_ciphertext BLOB NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (robot_id, person_id)
+                    REFERENCES people(robot_id, person_id) ON DELETE CASCADE
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS conversation_sessions (
+                robot_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                person_id TEXT NOT NULL,
+                is_guest INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (robot_id, session_id),
+                FOREIGN KEY (robot_id, person_id)
+                    REFERENCES people(robot_id, person_id) ON DELETE CASCADE
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS agent_runtimes (
+                robot_id TEXT NOT NULL,
+                person_id TEXT NOT NULL,
+                agent_role TEXT NOT NULL,
+                state_json TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (robot_id, person_id, agent_role),
+                FOREIGN KEY (robot_id, person_id)
+                    REFERENCES people(robot_id, person_id) ON DELETE CASCADE
+            )
+            """,
+        )
+        for statement in statements:
+            await db.execute(statement)
+
+    async def _migrate_v1_to_v2(self, db: aiosqlite.Connection) -> None:
+        legacy_tables = (
+            "face_embeddings",
+            "face_samples",
+            "conversation_sessions",
+            "agent_runtimes",
+            "people",
+        )
+        for table in legacy_tables:
+            await db.execute(f"ALTER TABLE {table} RENAME TO {table}_v1")
+
+        await self._create_v2_schema(db)
+        await db.execute(
+            """
+            INSERT INTO people(
+                robot_id, person_id, display_name, metadata_json, created_at, updated_at
+            )
+            SELECT ?, person_id, display_name, metadata_json, created_at, updated_at
+            FROM people_v1
+            """,
+            (self.settings.robot_id,),
+        )
+
+        for table in legacy_tables[:-1]:
+            await db.execute(
+                f"""
+                INSERT OR IGNORE INTO people(
+                    robot_id, person_id, display_name, metadata_json, created_at, updated_at
+                )
+                SELECT DISTINCT
+                    legacy.robot_id,
+                    person.person_id,
+                    person.display_name,
+                    person.metadata_json,
+                    person.created_at,
+                    person.updated_at
+                FROM {table}_v1 AS legacy
+                JOIN people_v1 AS person ON person.person_id = legacy.person_id
+                """
+            )
+
+        await db.execute(
+            """
+            INSERT INTO face_embeddings(
+                robot_id, person_id, model_name, embedding_ciphertext, version, updated_at
+            )
+            SELECT robot_id, person_id, model_name, embedding_ciphertext, version, updated_at
+            FROM face_embeddings_v1
+            """
+        )
+        await db.execute(
+            """
+            INSERT INTO face_samples(
+                id, robot_id, person_id, media_type, sha256, sample_ciphertext, created_at
+            )
+            SELECT id, robot_id, person_id, media_type, sha256, sample_ciphertext, created_at
+            FROM face_samples_v1
+            """
+        )
+        await db.execute(
+            """
+            INSERT INTO conversation_sessions(
+                robot_id, session_id, person_id, is_guest, status, created_at, updated_at
+            )
+            SELECT robot_id, session_id, person_id, is_guest, status, created_at, updated_at
+            FROM conversation_sessions_v1
+            """
+        )
+        await db.execute(
+            """
+            INSERT INTO agent_runtimes(
+                robot_id, person_id, agent_role, state_json, version, updated_at
+            )
+            SELECT robot_id, person_id, agent_role, state_json, version, updated_at
+            FROM agent_runtimes_v1
+            """
+        )
+
+        for table in legacy_tables[:-1]:
+            await db.execute(f"DROP TABLE {table}_v1")
+        await db.execute("DROP TABLE people_v1")
+
     async def initialize(self) -> None:
         if self._initialized:
             return
@@ -133,72 +285,52 @@ class RuntimePersistence:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute("PRAGMA journal_mode=WAL")
-                await db.execute("PRAGMA foreign_keys=ON")
-                await db.executescript(
-                    """
-                    CREATE TABLE IF NOT EXISTS schema_migrations (
-                        version INTEGER PRIMARY KEY,
-                        applied_at TEXT NOT NULL
-                    );
-
-                    CREATE TABLE IF NOT EXISTS people (
-                        person_id TEXT PRIMARY KEY,
-                        display_name TEXT,
-                        metadata_json TEXT NOT NULL DEFAULT '{}',
-                        created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
-                    );
-
-                    CREATE TABLE IF NOT EXISTS face_embeddings (
-                        robot_id TEXT NOT NULL,
-                        person_id TEXT NOT NULL,
-                        model_name TEXT NOT NULL,
-                        embedding_ciphertext BLOB NOT NULL,
-                        version INTEGER NOT NULL DEFAULT 1,
-                        updated_at TEXT NOT NULL,
-                        PRIMARY KEY (robot_id, person_id, model_name),
-                        FOREIGN KEY (person_id) REFERENCES people(person_id) ON DELETE CASCADE
-                    );
-
-                    CREATE TABLE IF NOT EXISTS face_samples (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        robot_id TEXT NOT NULL,
-                        person_id TEXT NOT NULL,
-                        media_type TEXT NOT NULL,
-                        sha256 TEXT NOT NULL,
-                        sample_ciphertext BLOB NOT NULL,
-                        created_at TEXT NOT NULL,
-                        FOREIGN KEY (person_id) REFERENCES people(person_id) ON DELETE CASCADE
-                    );
-
-                    CREATE TABLE IF NOT EXISTS conversation_sessions (
-                        session_id TEXT PRIMARY KEY,
-                        robot_id TEXT NOT NULL,
-                        person_id TEXT NOT NULL,
-                        is_guest INTEGER NOT NULL DEFAULT 0,
-                        status TEXT NOT NULL DEFAULT 'active',
-                        created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL,
-                        FOREIGN KEY (person_id) REFERENCES people(person_id) ON DELETE CASCADE
-                    );
-
-                    CREATE TABLE IF NOT EXISTS agent_runtimes (
-                        robot_id TEXT NOT NULL,
-                        person_id TEXT NOT NULL,
-                        agent_role TEXT NOT NULL,
-                        state_json TEXT NOT NULL,
-                        version INTEGER NOT NULL DEFAULT 1,
-                        updated_at TEXT NOT NULL,
-                        PRIMARY KEY (robot_id, person_id, agent_role),
-                        FOREIGN KEY (person_id) REFERENCES people(person_id) ON DELETE CASCADE
-                    );
-                    """
-                )
-                await db.execute(
-                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (1, _utc_now()),
-                )
-                await db.commit()
+                await db.execute("PRAGMA foreign_keys=OFF")
+                await db.execute("BEGIN IMMEDIATE")
+                try:
+                    await db.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS schema_migrations (
+                            version INTEGER PRIMARY KEY,
+                            applied_at TEXT NOT NULL
+                        )
+                        """
+                    )
+                    async with db.execute("PRAGMA table_info(people)") as cursor:
+                        people_columns = {row[1] for row in await cursor.fetchall()}
+                    if people_columns and "robot_id" not in people_columns:
+                        await self._migrate_v1_to_v2(db)
+                    else:
+                        await self._create_v2_schema(db)
+                    now = _utc_now()
+                    await db.execute(
+                        """
+                        INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+                        VALUES (?, ?)
+                        """,
+                        (1, now),
+                    )
+                    await db.execute(
+                        """
+                        INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+                        VALUES (?, ?)
+                        """,
+                        (2, now),
+                    )
+                    async with db.execute("PRAGMA foreign_key_check") as cursor:
+                        violations = await cursor.fetchall()
+                    if violations:
+                        raise RuntimeError(f"SQLite 外键校验失败: {violations}")
+                    await db.commit()
+                except Exception:
+                    await db.rollback()
+                    raise
+                finally:
+                    await db.execute("PRAGMA foreign_keys=ON")
+                async with db.execute("PRAGMA foreign_keys") as cursor:
+                    foreign_keys = await cursor.fetchone()
+                if foreign_keys != (1,):
+                    raise RuntimeError("SQLite foreign_keys 未能恢复为 ON")
             self._initialized = True
 
     async def upsert_person(
@@ -214,13 +346,16 @@ class RuntimePersistence:
             if metadata is None:
                 await db.execute(
                     """
-                    INSERT INTO people(person_id, display_name, metadata_json, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(person_id) DO UPDATE SET
+                    INSERT INTO people(
+                        robot_id, person_id, display_name, metadata_json, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(robot_id, person_id) DO UPDATE SET
                         display_name = COALESCE(excluded.display_name, people.display_name),
                         updated_at = excluded.updated_at
                     """,
                     (
+                        self.settings.robot_id,
                         person_id,
                         display_name,
                         "{}",
@@ -231,14 +366,17 @@ class RuntimePersistence:
             else:
                 await db.execute(
                     """
-                    INSERT INTO people(person_id, display_name, metadata_json, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(person_id) DO UPDATE SET
+                    INSERT INTO people(
+                        robot_id, person_id, display_name, metadata_json, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(robot_id, person_id) DO UPDATE SET
                         display_name = COALESCE(excluded.display_name, people.display_name),
                         metadata_json = excluded.metadata_json,
                         updated_at = excluded.updated_at
                     """,
                     (
+                        self.settings.robot_id,
                         person_id,
                         display_name,
                         json.dumps(metadata, ensure_ascii=False),
@@ -262,18 +400,18 @@ class RuntimePersistence:
             await db.execute(
                 """
                 INSERT INTO conversation_sessions(
-                    session_id, robot_id, person_id, is_guest, status, created_at, updated_at
+                    robot_id, session_id, person_id, is_guest, status, created_at, updated_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(session_id) DO UPDATE SET
+                ON CONFLICT(robot_id, session_id) DO UPDATE SET
                     person_id = excluded.person_id,
                     is_guest = excluded.is_guest,
                     status = excluded.status,
                     updated_at = excluded.updated_at
                 """,
                 (
-                    session_id,
                     self.settings.robot_id,
+                    session_id,
                     person_id,
                     int(is_guest),
                     status,
@@ -351,8 +489,10 @@ class RuntimePersistence:
                 """
                 SELECT person_id, display_name, metadata_json, created_at, updated_at
                 FROM people
+                WHERE robot_id = ?
                 ORDER BY updated_at DESC, person_id ASC
-                """
+                """,
+                (self.settings.robot_id,),
             ) as cursor:
                 rows = await cursor.fetchall()
         return [
@@ -373,9 +513,9 @@ class RuntimePersistence:
                 """
                 SELECT person_id, display_name, metadata_json, created_at, updated_at
                 FROM people
-                WHERE person_id = ?
+                WHERE robot_id = ? AND person_id = ?
                 """,
-                (person_id,),
+                (self.settings.robot_id, person_id),
             ) as cursor:
                 row = await cursor.fetchone()
         if row is None:
@@ -435,7 +575,10 @@ class RuntimePersistence:
                     "DELETE FROM agent_runtimes WHERE robot_id = ? AND person_id = ?",
                     (self.settings.robot_id, person_id),
                 )
-                await db.execute("DELETE FROM people WHERE person_id = ?", (person_id,))
+                await db.execute(
+                    "DELETE FROM people WHERE robot_id = ? AND person_id = ?",
+                    (self.settings.robot_id, person_id),
+                )
                 await db.commit()
             except Exception:
                 await db.rollback()
@@ -466,14 +609,17 @@ class RuntimePersistence:
             try:
                 await db.execute(
                     """
-                    INSERT INTO people(person_id, display_name, metadata_json, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(person_id) DO UPDATE SET
+                    INSERT INTO people(
+                        robot_id, person_id, display_name, metadata_json, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(robot_id, person_id) DO UPDATE SET
                         display_name = COALESCE(excluded.display_name, people.display_name),
                         metadata_json = excluded.metadata_json,
                         updated_at = excluded.updated_at
                     """,
                     (
+                        self.settings.robot_id,
                         person_id,
                         display_name,
                         json.dumps(metadata or {}, ensure_ascii=False),
