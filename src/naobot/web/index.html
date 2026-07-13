@@ -5,166 +5,1112 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>naobot Dashboard</title>
   <style>
-    body { margin: 0; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f6f7f8; color: #1f2933; }
-    main { max-width: 1080px; margin: 0 auto; padding: 20px; }
-    h1, h2 { margin: 0 0 12px; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
-    .panel { background: #fff; border: 1px solid #d8dee4; border-radius: 6px; padding: 14px; }
-    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-    button, input { border: 1px solid #c7ced6; background: #fff; padding: 8px 12px; border-radius: 4px; }
-    button { cursor: pointer; }
-    button.danger { color: #b42318; border-color: #f5c2c0; }
-    pre { background: #0f1720; color: #d7f7d0; border-radius: 6px; padding: 10px; display: block; overflow: auto; }
-    ul { list-style: none; padding: 0; margin: 0; }
-    li + li { margin-top: 10px; }
-    .meta { color: #52606d; font-size: 14px; }
+    :root {
+      color-scheme: light;
+      --canvas: #eef1f3;
+      --surface: #ffffff;
+      --surface-muted: #f7f8f9;
+      --ink: #17212b;
+      --muted: #5e6b76;
+      --line: #d7dde2;
+      --line-strong: #bcc6ce;
+      --header: #18232c;
+      --header-muted: #adbac5;
+      --accent: #0b6f73;
+      --accent-soft: #dcefee;
+      --warning: #9a5b13;
+      --warning-soft: #fff1d8;
+      --danger: #b42318;
+      --danger-dark: #8f1c14;
+      --danger-soft: #fde8e6;
+      --success: #28794c;
+      --success-soft: #e2f2e8;
+      --focus: #167bba;
+      --radius: 6px;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      background: var(--canvas);
+      color: var(--ink);
+      font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    button, input { font: inherit; }
+
+    button:focus-visible,
+    input:focus-visible {
+      outline: 3px solid color-mix(in srgb, var(--focus) 28%, transparent);
+      outline-offset: 2px;
+    }
+
+    button:disabled { cursor: wait; opacity: 0.62; }
+
+    .app-header {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      display: grid;
+      grid-template-columns: minmax(180px, auto) minmax(0, 1fr) auto;
+      align-items: center;
+      min-height: 58px;
+      padding: 9px 18px;
+      gap: 16px;
+      background: var(--header);
+      color: #fff;
+      border-bottom: 1px solid #0d151b;
+    }
+
+    .brand {
+      display: flex;
+      align-items: baseline;
+      gap: 9px;
+      min-width: 0;
+      font-family: Bahnschrift, "Segoe UI", sans-serif;
+    }
+
+    .brand strong { font-size: 18px; font-weight: 650; }
+    .brand span { color: var(--header-muted); font-size: 12px; }
+
+    .operation-status {
+      min-width: 0;
+      color: var(--header-muted);
+      overflow-wrap: anywhere;
+      text-align: right;
+    }
+
+    .operation-status[data-state="success"] { color: #9fddb7; }
+    .operation-status[data-state="warning"] { color: #f2c978; }
+    .operation-status[data-state="error"] { color: #ffaaa3; }
+
+    .stop-button {
+      min-height: 38px;
+      padding: 8px 16px;
+      border: 1px solid #e57168;
+      border-radius: 4px;
+      background: var(--danger);
+      color: #fff;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .stop-button:hover { background: var(--danger-dark); }
+
+    .app-shell {
+      display: grid;
+      grid-template-columns: 176px minmax(0, 1fr);
+      min-height: calc(100vh - 58px);
+    }
+
+    .sidebar {
+      position: sticky;
+      top: 58px;
+      align-self: start;
+      height: calc(100vh - 58px);
+      padding: 14px 10px;
+      overflow-y: auto;
+      background: var(--surface-muted);
+      border-right: 1px solid var(--line);
+    }
+
+    .nav-button {
+      display: block;
+      width: 100%;
+      min-height: 38px;
+      margin: 0 0 4px;
+      padding: 8px 11px;
+      border: 1px solid transparent;
+      border-radius: 4px;
+      background: transparent;
+      color: var(--muted);
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .nav-button:hover { background: #e7ebee; color: var(--ink); }
+
+    .nav-button[aria-selected="true"] {
+      background: var(--surface);
+      border-color: var(--line-strong);
+      color: var(--accent);
+      font-weight: 650;
+      box-shadow: inset 3px 0 0 var(--accent);
+    }
+
+    .workspace {
+      width: 100%;
+      max-width: 1320px;
+      min-width: 0;
+      padding: 22px 24px 40px;
+      margin: 0 auto;
+    }
+
+    .page { display: none; }
+    .page.active { display: block; }
+
+    .page-header {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 16px;
+      min-height: 38px;
+      margin-bottom: 16px;
+      border-bottom: 1px solid var(--line-strong);
+    }
+
+    h1, h2, h3, p { margin-top: 0; }
+    h1 { margin-bottom: 9px; font-size: 23px; line-height: 1.2; font-weight: 650; }
+    h2 { margin-bottom: 12px; font-size: 16px; font-weight: 650; }
+    h3 { margin-bottom: 4px; font-size: 14px; font-weight: 650; }
+
+    .group { margin-bottom: 22px; }
+
+    .group-title {
+      display: flex;
+      align-items: center;
+      min-height: 28px;
+      margin-bottom: 8px;
+      color: var(--muted);
+      font-family: Bahnschrift, "Segoe UI", sans-serif;
+      font-size: 12px;
+      font-weight: 650;
+      text-transform: uppercase;
+    }
+
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
+      gap: 8px;
+    }
+
+    .metric {
+      min-width: 0;
+      min-height: 82px;
+      padding: 11px 12px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+    }
+
+    .metric-label {
+      margin-bottom: 7px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .metric-value {
+      margin: 0;
+      color: var(--ink);
+      font-family: Bahnschrift, Consolas, monospace;
+      font-size: 15px;
+      font-weight: 600;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+    }
+
+    .metric.wide { grid-column: span 2; }
+
+    .panel {
+      padding: 16px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+    }
+
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 12px;
+    }
+
+    .field { min-width: 0; }
+
+    label {
+      display: block;
+      margin-bottom: 5px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    input {
+      width: 100%;
+      min-height: 38px;
+      padding: 8px 10px;
+      border: 1px solid var(--line-strong);
+      border-radius: 4px;
+      background: #fff;
+      color: var(--ink);
+    }
+
+    input::placeholder { color: #89949d; }
+
+    .button-row,
+    .action-grid {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .action-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
+    }
+
+    .button {
+      min-height: 36px;
+      padding: 7px 11px;
+      border: 1px solid var(--line-strong);
+      border-radius: 4px;
+      background: var(--surface);
+      color: var(--ink);
+      cursor: pointer;
+    }
+
+    .button:hover { border-color: #8d9aa4; background: var(--surface-muted); }
+
+    .button.primary {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #fff;
+    }
+
+    .button.primary:hover { background: #085b5e; }
+
+    .button.danger {
+      border-color: #e8aaa5;
+      color: var(--danger);
+      background: #fff;
+    }
+
+    .button.danger:hover { background: var(--danger-soft); }
+
+    .button.full { width: 100%; min-height: 44px; }
+
+    .section-status {
+      min-height: 21px;
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+
+    .section-status.error { color: var(--danger); }
+    .section-status.success { color: var(--success); }
+
+    .record-list {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .record {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+      padding: 12px 13px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+    }
+
+    .record-main { min-width: 0; }
+    .record-title { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+    .record-meta { margin-top: 4px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+
+    .pill {
+      display: inline-block;
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 11px;
+      font-weight: 650;
+    }
+
+    .pill.pending { background: var(--warning-soft); color: var(--warning); }
+
+    .split-grid {
+      display: grid;
+      grid-template-columns: minmax(260px, 0.85fr) minmax(320px, 1.15fr);
+      gap: 12px;
+      align-items: start;
+    }
+
+    .diagnostic-table { border-top: 1px solid var(--line); }
+
+    .diagnostic-row {
+      display: grid;
+      grid-template-columns: minmax(110px, 0.4fr) minmax(0, 1fr);
+      gap: 12px;
+      padding: 9px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .diagnostic-key { color: var(--muted); overflow-wrap: anywhere; }
+    .diagnostic-value { font-family: Consolas, monospace; overflow-wrap: anywhere; white-space: pre-wrap; }
+
+    pre {
+      min-height: 180px;
+      max-height: 480px;
+      margin: 0;
+      padding: 12px;
+      overflow: auto;
+      border: 1px solid #273844;
+      border-radius: var(--radius);
+      background: #111b22;
+      color: #c8e6d2;
+      font-family: Consolas, "Cascadia Mono", monospace;
+      font-size: 12px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    @media (max-width: 760px) {
+      .app-header {
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 8px;
+        padding: 8px 12px;
+      }
+
+      .brand span { display: none; }
+      .operation-status { grid-column: 1 / -1; grid-row: 2; text-align: left; font-size: 12px; }
+
+      .app-shell { display: block; }
+
+      .sidebar {
+        top: 79px;
+        z-index: 15;
+        display: flex;
+        width: 100%;
+        height: auto;
+        padding: 7px 10px;
+        overflow-x: auto;
+        overflow-y: hidden;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .nav-button {
+        flex: 0 0 auto;
+        width: auto;
+        min-width: 78px;
+        margin: 0 4px 0 0;
+        text-align: center;
+      }
+
+      .nav-button[aria-selected="true"] {
+        box-shadow: inset 0 -3px 0 var(--accent);
+      }
+
+      .workspace { padding: 18px 14px 32px; }
+      .metric.wide { grid-column: auto; }
+      .split-grid { grid-template-columns: 1fr; }
+      .record { grid-template-columns: 1fr; }
+      .record .button-row { justify-content: flex-start; }
+    }
+
+    @media (max-width: 430px) {
+      .metric-grid { grid-template-columns: 1fr 1fr; }
+      .metric { min-height: 76px; padding: 10px; }
+      .metric-value { font-size: 14px; }
+      .action-grid { grid-template-columns: 1fr 1fr; }
+      .diagnostic-row { grid-template-columns: 1fr; gap: 3px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; }
+    }
   </style>
 </head>
 <body>
-  <main>
-    <h1>naobot Dashboard</h1>
-    <div class="panel" style="margin-bottom: 16px;">
-      <div class="row">
-        <label for="manageToken">管理 Token</label>
-        <input id="manageToken" type="password" autocomplete="off" />
-        <button id="saveTokenButton" type="button">保存</button>
-      </div>
-    </div>
-    <div class="grid">
-      <section class="panel">
-        <h2>媒体健康</h2>
-        <div id="mediaHealth">-</div>
+  <header class="app-header">
+    <div class="brand"><strong>naobot</strong><span>Robot operations</span></div>
+    <div id="operationStatus" class="operation-status" data-state="loading" role="status" aria-live="polite">正在连接 Dashboard...</div>
+    <button id="stopButton" class="stop-button" type="button">急停</button>
+  </header>
+
+  <main class="app-shell">
+    <nav class="sidebar" aria-label="Dashboard 页面" role="tablist">
+      <button class="nav-button" type="button" role="tab" aria-selected="true" aria-controls="home" data-page="home">Home</button>
+      <button class="nav-button" type="button" role="tab" aria-selected="false" aria-controls="actions" data-page="actions">Actions</button>
+      <button class="nav-button" type="button" role="tab" aria-selected="false" aria-controls="agent" data-page="agent">Agent</button>
+      <button class="nav-button" type="button" role="tab" aria-selected="false" aria-controls="soul" data-page="soul">Soul</button>
+      <button class="nav-button" type="button" role="tab" aria-selected="false" aria-controls="memory" data-page="memory">Memory</button>
+      <button class="nav-button" type="button" role="tab" aria-selected="false" aria-controls="routines" data-page="routines">Routines</button>
+      <button class="nav-button" type="button" role="tab" aria-selected="false" aria-controls="people" data-page="people">People</button>
+      <button class="nav-button" type="button" role="tab" aria-selected="false" aria-controls="diagnostics" data-page="diagnostics">Diagnostics</button>
+    </nav>
+
+    <div class="workspace">
+      <section id="home" class="page active" role="tabpanel">
+        <div class="page-header"><h1>Home</h1></div>
+
+        <div class="group">
+          <div class="group-title">Robot link</div>
+          <div class="metric-grid">
+            <div class="metric"><div class="metric-label">Mode</div><p id="mode" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">Link</div><p id="link" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">Robot</div><p id="robotOnline" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">Heartbeat age</div><p id="heartbeatAge" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">Last heartbeat</div><p id="lastHeartbeat" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">Battery</div><p id="battery" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">LLM</div><p id="llm" class="metric-value">-</p></div>
+          </div>
+        </div>
+
+        <div class="group">
+          <div class="group-title">Brain route</div>
+          <div class="metric-grid">
+            <div class="metric"><div class="metric-label">Runtime</div><p id="brainRuntime" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">Brain mode</div><p id="brainMode" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">Route mode</div><p id="routeMode" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">Team</div><p id="brainTeam" class="metric-value">-</p></div>
+            <div class="metric wide"><div class="metric-label">Route reasons</div><p id="routeReasons" class="metric-value">-</p></div>
+          </div>
+        </div>
+
+        <div class="group">
+          <div class="group-title">Session and runtime</div>
+          <div class="metric-grid">
+            <div class="metric"><div class="metric-label">Current person</div><p id="currentPerson" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">Current session</div><p id="currentSession" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">Session trigger</div><p id="sessionTrigger" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">Runtime loaded</div><p id="runtimeLoaded" class="metric-value">-</p></div>
+          </div>
+        </div>
+
+        <div class="group">
+          <div class="group-title">Control</div>
+          <div class="metric-grid">
+            <div class="metric"><div class="metric-label">Authority</div><p id="authority" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">Reflex</div><p id="reflex" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">Motion</div><p id="motion" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">Last reflex</div><p id="lastReflex" class="metric-value">-</p></div>
+          </div>
+        </div>
+
+        <div class="group">
+          <div class="group-title">Host media</div>
+          <div class="metric-grid">
+            <div class="metric"><div class="metric-label">Connections</div><p id="hostMediaConnections" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">FPS</div><p id="hostMediaFps" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">Audio queue</div><p id="hostAudioQueue" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">Dropped</div><p id="hostMediaDropped" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">Listening</div><p id="hostListening" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">Speaking</div><p id="hostSpeaking" class="metric-value">-</p></div>
+            <div class="metric wide"><div class="metric-label">1 Hz summary</div><p id="temporalSummary" class="metric-value">-</p></div>
+          </div>
+        </div>
+
+        <div class="group">
+          <div class="group-title">Firmware media</div>
+          <div class="metric-grid">
+            <div class="metric"><div class="metric-label">Camera FPS</div><p id="cameraFps" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">Audio state</div><p id="audioState" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">Media queue</div><p id="firmwareMediaQueue" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">Media dropped</div><p id="firmwareMediaDropped" class="metric-value">-</p></div>
+            <div class="metric"><div class="metric-label">PSRAM free</div><p id="psramFree" class="metric-value">-</p></div>
+          </div>
+        </div>
       </section>
-      <section class="panel">
-        <h2>当前身份</h2>
-        <div id="currentPerson">-</div>
-        <div class="meta" id="sessionTrigger">-</div>
+
+      <section id="actions" class="page" role="tabpanel" hidden>
+        <div class="page-header"><h1>Actions</h1></div>
+        <div class="action-grid">
+          <button class="button primary full" type="button" data-action="blink">眨眼</button>
+          <button class="button primary full" type="button" data-action="happy">开心脸</button>
+          <button class="button primary full" type="button" data-action="wave">挥手</button>
+          <button class="button primary full" type="button" data-action="sit">趴下</button>
+          <button class="button primary full" type="button" data-action="chirp">轻提示音</button>
+        </div>
       </section>
-      <section class="panel">
-        <h2>注册状态</h2>
-        <div id="enrollmentState">-</div>
-        <div class="row" style="margin-top: 10px;">
-          <button id="cancelEnrollmentButton" type="button">取消注册</button>
+
+      <section id="agent" class="page" role="tabpanel" hidden>
+        <div class="page-header"><h1>Agent</h1></div>
+        <div class="action-grid">
+          <button class="button full" type="button" data-debug-event="touch_head">模拟摸头</button>
+          <button class="button full" type="button" data-debug-event="battery_low">模拟低电</button>
+          <button class="button danger full" type="button" data-debug-event="fall_detected">模拟摔倒</button>
+        </div>
+      </section>
+
+      <section id="soul" class="page" role="tabpanel" hidden>
+        <div class="page-header"><h1>Soul</h1></div>
+        <div class="panel">
+          <div class="form-grid">
+            <div class="field"><label for="soulName">名字</label><input id="soulName" autocomplete="off" /></div>
+            <div class="field"><label for="userCall">称呼用户</label><input id="userCall" autocomplete="off" /></div>
+            <div class="field"><label for="liveliness">活泼度</label><input id="liveliness" type="number" min="0" max="100" /></div>
+          </div>
+          <div class="button-row" style="margin-top: 14px;">
+            <button id="saveSoulButton" class="button primary" type="button">保存 Soul</button>
+          </div>
+          <p id="soulStatus" class="section-status" role="status"></p>
+        </div>
+      </section>
+
+      <section id="memory" class="page" role="tabpanel" hidden>
+        <div class="page-header"><h1>Memory</h1></div>
+        <div class="panel">
+          <div class="field"><label for="memoryText">待确认记忆</label><input id="memoryText" autocomplete="off" placeholder="输入一条记忆" /></div>
+          <div class="button-row"><button id="suggestMemoryButton" class="button primary" type="button">新增待确认</button></div>
+          <p id="memoryStatus" class="section-status" role="status"></p>
+        </div>
+        <div id="memoryList" class="record-list"></div>
+      </section>
+
+      <section id="routines" class="page" role="tabpanel" hidden>
+        <div class="page-header"><h1>Routines</h1></div>
+        <p id="routineStatus" class="section-status" role="status"></p>
+        <div id="routineList" class="record-list"></div>
+      </section>
+
+      <section id="people" class="page" role="tabpanel" hidden>
+        <div class="page-header"><h1>People</h1></div>
+        <div class="split-grid">
+          <div class="panel">
+            <h2>管理凭证</h2>
+            <div class="field"><label for="manageToken">管理 Token</label><input id="manageToken" type="password" autocomplete="off" /></div>
+            <div class="button-row"><button id="saveTokenButton" class="button primary" type="button">保存 Token</button></div>
+          </div>
+          <div class="panel">
+            <h2>注册状态</h2>
+            <div id="enrollmentState" class="diagnostic-value">-</div>
+            <div class="button-row" style="margin-top: 14px;">
+              <button id="cancelEnrollmentButton" class="button danger" type="button">取消注册</button>
+            </div>
+          </div>
+        </div>
+        <p id="peopleStatus" class="section-status" role="status"></p>
+        <div id="peopleList" class="record-list"></div>
+      </section>
+
+      <section id="diagnostics" class="page" role="tabpanel" hidden>
+        <div class="page-header"><h1>Diagnostics</h1></div>
+        <div class="group">
+          <h2>Provider health</h2>
+          <div id="providerHealth" class="panel diagnostic-table"></div>
+        </div>
+        <div class="split-grid">
+          <div class="group"><h2>Logs</h2><pre id="logs">-</pre></div>
+          <div class="group"><h2>Complete status</h2><pre id="statusDump">-</pre></div>
         </div>
       </section>
     </div>
-
-    <section class="panel" style="margin-top: 16px;">
-      <h2>人物列表</h2>
-      <ul id="peopleList"></ul>
-    </section>
-
-    <section class="panel" style="margin-top: 16px;">
-      <h2>诊断</h2>
-      <pre id="statusDump">-</pre>
-    </section>
   </main>
 
   <script>
-    const MANAGE_TOKEN_KEY = 'naobot.manageToken';
-    const peopleList = document.getElementById('peopleList');
-    const tokenInput = document.getElementById('manageToken');
-    tokenInput.value = sessionStorage.getItem(MANAGE_TOKEN_KEY) || '';
+    'use strict';
 
-    function authHeaders() {
+    const MANAGE_TOKEN_KEY = 'naobot.manageToken';
+    const dashboardState = { status: null, refreshPromise: null };
+
+    function byId(id) {
+      return document.getElementById(id);
+    }
+
+    function clearElement(element) {
+      while (element.firstChild) {
+        element.removeChild(element.firstChild);
+      }
+    }
+
+    function setText(id, value) {
+      const normalized = value === null || value === undefined || value === '' ? '-' : String(value);
+      byId(id).textContent = normalized;
+    }
+
+    function setSectionStatus(id, message, stateName = '') {
+      const element = byId(id);
+      element.textContent = message;
+      element.className = stateName ? `section-status ${stateName}` : 'section-status';
+    }
+
+    function setOperationStatus(stateName, message) {
+      const element = byId('operationStatus');
+      element.dataset.state = stateName;
+      element.textContent = message;
+    }
+
+    function errorMessage(error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+
+    function formatTimestamp(value) {
+      if (value === null || value === undefined) {
+        return '-';
+      }
+      const date = new Date(Number(value));
+      return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+    }
+
+    function formatBytes(value) {
+      const bytes = Number(value);
+      if (!Number.isFinite(bytes) || bytes < 0) {
+        return '-';
+      }
+      if (bytes < 1024) {
+        return `${bytes} B`;
+      }
+      if (bytes < 1024 * 1024) {
+        return `${(bytes / 1024).toFixed(1)} KiB`;
+      }
+      return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+    }
+
+    function formatObject(value) {
+      if (value === null || value === undefined) {
+        return '-';
+      }
+      return typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+    }
+
+    function authHeaders(additional = {}) {
       const token = sessionStorage.getItem(MANAGE_TOKEN_KEY) || '';
-      return token ? { 'X-Naobot-Token': token } : {};
+      return token ? { ...additional, 'X-Naobot-Token': token } : { ...additional };
     }
 
     async function fetchJson(url, options = {}) {
       const response = await fetch(url, options);
       if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
+        let detail = '';
+        try {
+          const payload = await response.json();
+          detail = payload.detail?.message || payload.detail?.code || payload.detail || '';
+        } catch (_error) {
+          detail = '';
+        }
+        const suffix = detail ? `: ${String(detail)}` : '';
+        throw new Error(`HTTP ${response.status}${suffix}`);
+      }
+      if (response.status === 204) {
+        return null;
       }
       return await response.json();
     }
 
-    async function refresh() {
-      const status = await fetchJson('/api/status');
-      const media = status.media || {};
-      document.getElementById('mediaHealth').textContent =
-        `conn=${media.connections ?? 0} fps=${media.fps ?? 0} queue=${media.queue ?? 0} dropped=${media.dropped ?? 0} listening=${media.listening ? 'yes' : 'no'} speaking=${media.speaking ? 'yes' : 'no'}`;
-      document.getElementById('currentPerson').textContent = media.current_person || 'unknown';
-      document.getElementById('sessionTrigger').textContent = media.session_trigger || '-';
-      document.getElementById('enrollmentState').textContent = media.enrollment?.state || '-';
-      document.getElementById('statusDump').textContent = JSON.stringify(status, null, 2);
+    async function runButtonAction(button, pendingLabel, successMessage, action, refreshAfter = true) {
+      const originalLabel = button.textContent;
+      button.disabled = true;
+      button.textContent = pendingLabel;
+      setOperationStatus('loading', pendingLabel);
+      let succeeded = false;
+      try {
+        await action();
+        succeeded = true;
+        setOperationStatus('success', successMessage);
+      } catch (error) {
+        setOperationStatus('error', `操作失败: ${errorMessage(error)}`);
+      } finally {
+        button.disabled = false;
+        button.textContent = originalLabel;
+      }
+      if (succeeded && refreshAfter) {
+        await refreshAll();
+      }
+      return succeeded;
+    }
 
+    function activatePage(pageId) {
+      const target = byId(pageId);
+      if (!target || !target.classList.contains('page')) {
+        return;
+      }
+      document.querySelectorAll('.page').forEach((page) => {
+        const active = page.id === pageId;
+        page.classList.toggle('active', active);
+        page.hidden = !active;
+      });
+      document.querySelectorAll('.nav-button').forEach((button) => {
+        button.setAttribute('aria-selected', button.dataset.page === pageId ? 'true' : 'false');
+      });
+      history.replaceState(null, '', `#${pageId}`);
+    }
+
+    function renderStatus(status) {
+      dashboardState.status = status;
+      const robot = status.robot || {};
+      const brain = status.brain || {};
+      const route = brain.last_route || {};
+      const media = status.media || {};
+
+      setText('mode', robot.mode);
+      setText('link', robot.link_state);
+      setText('robotOnline', robot.agent_connected ? 'online' : 'offline');
+      setText('heartbeatAge', robot.heartbeat_age_ms == null ? '-' : `${robot.heartbeat_age_ms} ms`);
+      setText('lastHeartbeat', formatTimestamp(robot.last_heartbeat_ms));
+      setText('battery', robot.battery_pct == null ? '-' : `${robot.battery_pct}%`);
+      setText('llm', status.llm_configured ? 'OpenAI-compatible' : '未配置');
+
+      setText('brainRuntime', brain.runtime);
+      setText('brainMode', brain.mode);
+      setText('routeMode', route.mode);
+      setText('routeReasons', Array.isArray(route.reasons) && route.reasons.length ? route.reasons.join(', ') : '-');
+      setText('brainTeam', `${brain.team_used ? 'active' : 'idle'} / ${brain.team_enabled ? 'enabled' : 'disabled'}`);
+
+      setText('currentPerson', media.current_person || 'unknown');
+      setText('currentSession', media.current_session);
+      setText('sessionTrigger', media.session_trigger);
+      setText('runtimeLoaded', status.runtime_loaded_count);
+
+      setText('authority', robot.control_authority);
+      setText('reflex', robot.reflex_state);
+      setText('motion', robot.motion_state);
+      setText('lastReflex', robot.last_reflex);
+
+      setText('hostMediaConnections', media.connections ?? 0);
+      setText('hostMediaFps', media.fps ?? 0);
+      setText('hostAudioQueue', media.queue ?? 0);
+      setText('hostMediaDropped', media.dropped ?? 0);
+      setText('hostListening', media.listening ? 'yes' : 'no');
+      setText('hostSpeaking', media.speaking ? 'yes' : 'no');
+      setText('temporalSummary', formatObject(media.last_temporal_summary));
+
+      setText('cameraFps', robot.camera_fps ?? 0);
+      setText('audioState', robot.audio_state);
+      setText('firmwareMediaQueue', robot.media_queue ?? 0);
+      setText('firmwareMediaDropped', robot.media_dropped ?? 0);
+      setText('psramFree', formatBytes(robot.psram_free));
+
+      setText('enrollmentState', formatObject(media.enrollment));
+      setText('logs', formatObject(status.logs || []));
+      setText('statusDump', JSON.stringify(status, null, 2));
+      renderProviderHealth(media.provider_status || {});
+
+      const soul = status.soul || {};
+      byId('soulName').value = soul.name || '';
+      byId('userCall').value = soul.user_call || '';
+      byId('liveliness').value = soul.liveliness ?? '';
+      setSectionStatus('soulStatus', '');
+    }
+
+    function appendDiagnosticRow(container, key, value) {
+      const row = document.createElement('div');
+      row.className = 'diagnostic-row';
+      const keyElement = document.createElement('div');
+      keyElement.className = 'diagnostic-key';
+      keyElement.textContent = key;
+      const valueElement = document.createElement('div');
+      valueElement.className = 'diagnostic-value';
+      valueElement.textContent = formatObject(value);
+      row.appendChild(keyElement);
+      row.appendChild(valueElement);
+      container.appendChild(row);
+    }
+
+    function renderProviderHealth(providerStatus) {
+      const container = byId('providerHealth');
+      clearElement(container);
+      appendDiagnosticRow(container, 'overall', providerStatus.status || 'unknown');
+      const components = providerStatus.components || {};
+      const entries = Object.entries(components);
+      if (!entries.length) {
+        appendDiagnosticRow(container, 'components', 'none');
+        return;
+      }
+      entries.forEach(([name, health]) => appendDiagnosticRow(container, name, health));
+    }
+
+    function createButton(label, className, handler) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = className;
+      button.textContent = label;
+      button.addEventListener('click', handler);
+      return button;
+    }
+
+    function createRecord(titleText, metaText) {
+      const record = document.createElement('div');
+      record.className = 'record';
+      const main = document.createElement('div');
+      main.className = 'record-main';
+      const title = document.createElement('p');
+      title.className = 'record-title';
+      title.textContent = titleText;
+      const meta = document.createElement('div');
+      meta.className = 'record-meta';
+      meta.textContent = metaText;
+      main.appendChild(title);
+      main.appendChild(meta);
+      const actions = document.createElement('div');
+      actions.className = 'button-row';
+      record.appendChild(main);
+      record.appendChild(actions);
+      return { record, actions, main };
+    }
+
+    async function refreshStatus() {
+      try {
+        const status = await fetchJson('/api/status');
+        renderStatus(status);
+        setOperationStatus('success', 'Dashboard 已连接');
+      } catch (error) {
+        setOperationStatus('error', `状态加载失败: ${errorMessage(error)}`);
+      }
+    }
+
+    async function loadMemory() {
+      const list = byId('memoryList');
+      try {
+        const items = await fetchJson('/api/memory');
+        clearElement(list);
+        items.forEach((memory) => {
+          const statusLabel = memory.confirmed ? '已确认' : '待确认';
+          const { record, actions, main } = createRecord(memory.text || '-', `${statusLabel} / ${memory.id || '-'}`);
+          const pill = document.createElement('span');
+          pill.className = memory.confirmed ? 'pill' : 'pill pending';
+          pill.textContent = statusLabel;
+          main.insertBefore(pill, main.firstChild);
+          if (!memory.confirmed) {
+            actions.appendChild(createButton('确认', 'button primary', async (event) => {
+              const button = event.currentTarget;
+              const url = `/api/memory/${encodeURIComponent(String(memory.id))}/confirm`;
+              await runButtonAction(button, '确认中...', '记忆已确认', () => fetchJson(url, { method: 'POST' }));
+            }));
+          }
+          actions.appendChild(createButton('删除', 'button danger', async (event) => {
+            if (!window.confirm('确认删除这条记忆？')) {
+              return;
+            }
+            const button = event.currentTarget;
+            const url = `/api/memory/${encodeURIComponent(String(memory.id))}`;
+            await runButtonAction(button, '删除中...', '记忆已删除', () => fetchJson(url, { method: 'DELETE' }));
+          }));
+          list.appendChild(record);
+        });
+        setSectionStatus('memoryStatus', items.length ? `${items.length} 条记忆` : '暂无记忆');
+      } catch (error) {
+        setSectionStatus('memoryStatus', `加载失败: ${errorMessage(error)}`, 'error');
+        setOperationStatus('error', `Memory 加载失败: ${errorMessage(error)}`);
+      }
+    }
+
+    async function loadRoutines() {
+      const list = byId('routineList');
+      try {
+        const items = await fetchJson('/api/routines');
+        clearElement(list);
+        items.forEach((routine) => {
+          const statusLabel = routine.enabled ? '启用' : '待确认';
+          const { record, actions, main } = createRecord(routine.name || '-', `${statusLabel} / ${routine.id || '-'}`);
+          const pill = document.createElement('span');
+          pill.className = routine.enabled ? 'pill' : 'pill pending';
+          pill.textContent = statusLabel;
+          main.insertBefore(pill, main.firstChild);
+          if (!routine.enabled) {
+            actions.appendChild(createButton('确认', 'button primary', async (event) => {
+              const button = event.currentTarget;
+              const url = `/api/routines/${encodeURIComponent(String(routine.id))}/confirm`;
+              await runButtonAction(button, '确认中...', 'Routine 已确认', () => fetchJson(url, { method: 'POST' }));
+            }));
+          }
+          actions.appendChild(createButton('删除', 'button danger', async (event) => {
+            if (!window.confirm('确认删除这个 Routine？')) {
+              return;
+            }
+            const button = event.currentTarget;
+            const url = `/api/routines/${encodeURIComponent(String(routine.id))}`;
+            await runButtonAction(button, '删除中...', 'Routine 已删除', () => fetchJson(url, { method: 'DELETE' }));
+          }));
+          list.appendChild(record);
+        });
+        setSectionStatus('routineStatus', items.length ? `${items.length} 个 Routine` : '暂无 Routine');
+      } catch (error) {
+        setSectionStatus('routineStatus', `加载失败: ${errorMessage(error)}`, 'error');
+        setOperationStatus('error', `Routines 加载失败: ${errorMessage(error)}`);
+      }
+    }
+
+    function personUrl(personId, suffix = '') {
+      return `/api/people/${encodeURIComponent(String(personId))}${suffix}`;
+    }
+
+    async function loadPeople() {
+      const list = byId('peopleList');
       try {
         const people = await fetchJson('/api/people', { headers: authHeaders() });
-        renderPeople(people);
-      } catch (_error) {
-        renderPeople([]);
+        clearElement(list);
+        people.forEach((person) => {
+          const displayName = person.display_name || person.person_id || 'unknown';
+          const { record, actions } = createRecord(displayName, person.person_id || '-');
+          actions.appendChild(createButton('Reset Runtime', 'button', async (event) => {
+            const button = event.currentTarget;
+            const url = personUrl(person.person_id, '/runtime/reset');
+            await runButtonAction(button, 'Resetting...', 'Runtime 已重置', () => fetchJson(url, {
+              method: 'POST',
+              headers: authHeaders(),
+            }));
+          }));
+          actions.appendChild(createButton('Delete', 'button danger', async (event) => {
+            if (!window.confirm('确认删除这个人物及其运行时数据？')) {
+              return;
+            }
+            const button = event.currentTarget;
+            const url = personUrl(person.person_id);
+            await runButtonAction(button, 'Deleting...', '人物已删除', () => fetchJson(url, {
+              method: 'DELETE',
+              headers: authHeaders(),
+            }));
+          }));
+          list.appendChild(record);
+        });
+        setSectionStatus('peopleStatus', people.length ? `${people.length} 个人物` : '暂无人物');
+      } catch (error) {
+        setSectionStatus('peopleStatus', `加载失败: ${errorMessage(error)}`, 'error');
+        setOperationStatus('error', `People 加载失败: ${errorMessage(error)}`);
       }
     }
 
-    function renderPeople(people) {
-      while (peopleList.firstChild) {
-        peopleList.removeChild(peopleList.firstChild);
+    async function refreshAll() {
+      if (dashboardState.refreshPromise) {
+        return await dashboardState.refreshPromise;
       }
-      for (const person of people) {
-        const item = document.createElement('li');
-        item.className = 'panel';
-
-        const title = document.createElement('div');
-        const strong = document.createElement('strong');
-        strong.textContent = person.display_name || person.person_id;
-        title.appendChild(strong);
-
-        const meta = document.createElement('div');
-        meta.className = 'meta';
-        meta.textContent = person.person_id;
-
-        const actions = document.createElement('div');
-        actions.className = 'row';
-        actions.style.marginTop = '10px';
-
-        const resetButton = document.createElement('button');
-        resetButton.type = 'button';
-        resetButton.textContent = 'Reset Runtime';
-        resetButton.addEventListener('click', async () => {
-          await fetch(`/api/people/${person.person_id}/runtime/reset`, {
-            method: 'POST',
-            headers: authHeaders(),
-          });
-          await refresh();
-        });
-
-        const deleteButton = document.createElement('button');
-        deleteButton.type = 'button';
-        deleteButton.className = 'danger';
-        deleteButton.textContent = 'Delete';
-        deleteButton.addEventListener('click', async () => {
-          await fetch(`/api/people/${person.person_id}`, {
-            method: 'DELETE',
-            headers: authHeaders(),
-          });
-          await refresh();
-        });
-
-        actions.appendChild(resetButton);
-        actions.appendChild(deleteButton);
-        item.appendChild(title);
-        item.appendChild(meta);
-        item.appendChild(actions);
-        peopleList.appendChild(item);
-      }
+      dashboardState.refreshPromise = Promise.all([
+        refreshStatus(),
+        loadMemory(),
+        loadRoutines(),
+        loadPeople(),
+      ]).finally(() => {
+        dashboardState.refreshPromise = null;
+      });
+      return await dashboardState.refreshPromise;
     }
 
-    document.getElementById('saveTokenButton').addEventListener('click', () => {
-      sessionStorage.setItem(MANAGE_TOKEN_KEY, tokenInput.value);
+    async function sendAction(button, name, args) {
+      await runButtonAction(button, '发送中...', `动作 ${name} 已提交`, () => fetchJson('/api/actions/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, args }),
+      }));
+    }
+
+    async function sendDebugEvent(button, name) {
+      const timestamp = Date.now();
+      const payload = {
+        type: 'event',
+        id: `evt_web_${timestamp}`,
+        seq: 1,
+        ts_ms: timestamp,
+        session_id: 'dashboard',
+        priority: 3,
+        payload: { name, source: 'dashboard', battery_pct: 80, posture: 'upright' },
+      };
+      await runButtonAction(button, '发送中...', `事件 ${name} 已提交`, () => fetchJson('/api/debug/event', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }));
+    }
+
+    document.querySelectorAll('.nav-button').forEach((button) => {
+      button.addEventListener('click', () => activatePage(button.dataset.page));
     });
 
-    document.getElementById('cancelEnrollmentButton').addEventListener('click', async () => {
-      await fetch('/api/people/enrollment/cancel', {
+    const actionDefinitions = {
+      blink: ['blink', {}],
+      happy: ['set_face', { face: 'happy' }],
+      wave: ['wave', { level: 1 }],
+      sit: ['sit', {}],
+      chirp: ['chirp', { tone: 'soft' }],
+    };
+
+    document.querySelectorAll('[data-action]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const [name, args] = actionDefinitions[button.dataset.action];
+        await sendAction(button, name, args);
+      });
+    });
+
+    document.querySelectorAll('[data-debug-event]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        await sendDebugEvent(button, button.dataset.debugEvent);
+      });
+    });
+
+    byId('stopButton').addEventListener('click', async (event) => {
+      await runButtonAction(event.currentTarget, '停止中...', '急停指令已提交', () => fetchJson('/api/stop', { method: 'POST' }));
+    });
+
+    byId('saveSoulButton').addEventListener('click', async (event) => {
+      const currentSoul = dashboardState.status?.soul || {};
+      const soul = {
+        ...currentSoul,
+        name: byId('soulName').value,
+        user_call: byId('userCall').value,
+        liveliness: Number(byId('liveliness').value),
+      };
+      const saved = await runButtonAction(event.currentTarget, '保存中...', 'Soul 已保存', () => fetchJson('/api/soul', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(soul),
+      }));
+      setSectionStatus('soulStatus', saved ? '已保存' : '保存失败', saved ? 'success' : 'error');
+    });
+
+    byId('suggestMemoryButton').addEventListener('click', async (event) => {
+      const text = byId('memoryText').value.trim();
+      if (!text) {
+        setSectionStatus('memoryStatus', '请输入记忆内容', 'error');
+        return;
+      }
+      const saved = await runButtonAction(event.currentTarget, '新增中...', '待确认记忆已新增', () => fetchJson('/api/memory/suggest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      }));
+      if (saved) {
+        byId('memoryText').value = '';
+      }
+    });
+
+    const tokenInput = byId('manageToken');
+    tokenInput.value = sessionStorage.getItem(MANAGE_TOKEN_KEY) || '';
+
+    byId('saveTokenButton').addEventListener('click', async (event) => {
+      await runButtonAction(event.currentTarget, '保存中...', '管理 Token 已保存到当前会话', async () => {
+        sessionStorage.setItem(MANAGE_TOKEN_KEY, tokenInput.value);
+      });
+    });
+
+    byId('cancelEnrollmentButton').addEventListener('click', async (event) => {
+      await runButtonAction(event.currentTarget, '取消中...', '人物注册已取消', () => fetchJson('/api/people/enrollment/cancel', {
         method: 'POST',
         headers: authHeaders(),
-      });
-      await refresh();
+      }));
     });
 
-    const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/dashboard');
-    ws.onmessage = () => refresh();
-    refresh();
+    function connectDashboardSocket() {
+      const protocol = location.protocol === 'https:' ? 'wss://' : 'ws://';
+      let socket;
+      try {
+        socket = new WebSocket(`${protocol}${location.host}/ws/dashboard`);
+      } catch (error) {
+        setOperationStatus('error', `WebSocket 连接失败: ${errorMessage(error)}`);
+        return;
+      }
+      socket.onopen = () => setOperationStatus('success', 'Dashboard 已连接');
+      socket.onmessage = () => refreshAll();
+      socket.onerror = () => setOperationStatus('warning', 'Dashboard 实时通道异常，HTTP 状态仍可用');
+      socket.onclose = () => setOperationStatus('warning', 'Dashboard 实时通道已断开');
+    }
+
+    const initialPage = location.hash.slice(1);
+    if (initialPage) {
+      activatePage(initialPage);
+    }
+    connectDashboardSocket();
+    refreshAll();
   </script>
 </body>
 </html>

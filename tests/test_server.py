@@ -108,15 +108,115 @@ def test_health_and_status(tmp_path) -> None:
     assert status["media"]["session_trigger"] == "touch"
 
 
-def test_dashboard_contains_brain_runtime_observability(tmp_path) -> None:
+def test_dashboard_restores_full_workbench_navigation(tmp_path) -> None:
     client = make_client(tmp_path, media_service=FakeMediaService())
 
     html = client.get("/").text
 
-    assert 'id="mediaHealth"' in html
-    assert 'id="currentPerson"' in html
-    assert 'id="peopleList"' in html
+    for page in (
+        "home",
+        "actions",
+        "agent",
+        "soul",
+        "memory",
+        "routines",
+        "people",
+        "diagnostics",
+    ):
+        assert f'id="{page}"' in html
+        assert f'data-page="{page}"' in html
+
+    assert 'id="stopButton"' in html
+    assert "'/api/stop'" in html
+
+
+def test_dashboard_contains_complete_home_and_diagnostics_observability(tmp_path) -> None:
+    client = make_client(tmp_path, media_service=FakeMediaService())
+
+    html = client.get("/").text
+
+    for element_id in (
+        "mode",
+        "link",
+        "robotOnline",
+        "heartbeatAge",
+        "lastHeartbeat",
+        "battery",
+        "llm",
+        "brainRuntime",
+        "brainMode",
+        "routeMode",
+        "routeReasons",
+        "brainTeam",
+        "currentPerson",
+        "currentSession",
+        "sessionTrigger",
+        "runtimeLoaded",
+        "authority",
+        "reflex",
+        "motion",
+        "lastReflex",
+        "hostMediaFps",
+        "hostAudioQueue",
+        "hostMediaDropped",
+        "temporalSummary",
+        "cameraFps",
+        "audioState",
+        "firmwareMediaQueue",
+        "firmwareMediaDropped",
+        "psramFree",
+        "providerHealth",
+        "logs",
+        "statusDump",
+    ):
+        assert f'id="{element_id}"' in html
+
+
+def test_dashboard_preserves_management_controls(tmp_path) -> None:
+    client = make_client(tmp_path, media_service=FakeMediaService())
+
+    html = client.get("/").text
+
+    for endpoint in (
+        "/api/actions/test",
+        "/api/debug/event",
+        "/api/soul",
+        "/api/memory/suggest",
+        "/api/routines",
+        "/api/people",
+        "/api/people/enrollment/cancel",
+    ):
+        assert endpoint in html
+
+    for element_id in (
+        "soulName",
+        "userCall",
+        "liveliness",
+        "memoryText",
+        "memoryList",
+        "routineList",
+        "peopleList",
+        "cancelEnrollmentButton",
+    ):
+        assert f'id="{element_id}"' in html
+
+    assert "window.confirm" in html
+
+
+def test_dashboard_uses_safe_dom_and_recovers_buttons_after_api_failures(tmp_path) -> None:
+    client = make_client(tmp_path, media_service=FakeMediaService())
+
+    html = client.get("/").text
+
     assert "innerHTML" not in html
+    assert "outerHTML" not in html
+    assert "document.createElement" in html
+    assert ".textContent" in html
+    assert "encodeURIComponent" in html
+    assert "sessionStorage" in html
+    assert "finally" in html
+    assert ".disabled" in html
+    assert 'id="operationStatus"' in html
 
 
 def test_debug_event_touch_head(tmp_path) -> None:
