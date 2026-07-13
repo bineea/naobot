@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 import httpx
+from agentscope.message import DataBlock
 
 from .models import Envelope, ExpressionIntent, LLMDecision, SkillIntent, SoulConfig
 from .settings import Settings
@@ -15,6 +16,7 @@ class LLMClient:
         event: Envelope,
         soul: SoulConfig,
         memories: list[str],
+        media_blocks: list[DataBlock] | None = None,
     ) -> LLMDecision:
         raise NotImplementedError
 
@@ -25,6 +27,7 @@ class RuleBasedLLMClient(LLMClient):
         event: Envelope,
         soul: SoulConfig,
         memories: list[str],
+        media_blocks: list[DataBlock] | None = None,
     ) -> LLMDecision:
         name = event.payload.get("name", "unknown")
         if name == "touch_head":
@@ -64,6 +67,7 @@ class OpenAICompatibleLLMClient(LLMClient):
         event: Envelope,
         soul: SoulConfig,
         memories: list[str],
+        media_blocks: list[DataBlock] | None = None,
     ) -> LLMDecision:
         if not self.settings.llm_configured:
             return await RuleBasedLLMClient().decide(event, soul, memories)

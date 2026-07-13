@@ -157,3 +157,6 @@ class RuntimeRegistry:
             self._guest_cache = {
                 key: value for key, value in self._guest_cache.items() if key[0] != person_id
             }
+
+    def loaded_count(self) -> int:
+        return len(self._cache) + len(self._guest_cache)

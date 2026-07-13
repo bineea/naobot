@@ -31,6 +31,45 @@ class FirstCallGateLLM(RuleBasedLLMClient):
         return LLMDecision(goal=name, text=name)
 
 
+class FakeMediaService:
+    def __init__(self) -> None:
+        self.people = [{"person_id": "person-1", "display_name": "阿一"}]
+        self.reset_calls = []
+        self.delete_calls = []
+        self.cancelled = False
+
+    def status(self) -> dict:
+        return {
+            "connections": 1,
+            "fps": 9.5,
+            "queue": 2,
+            "dropped": 0,
+            "listening": True,
+            "speaking": False,
+            "current_person": "person-1",
+            "current_session": "person-1",
+            "session_trigger": "touch",
+            "enrollment": {"state": "idle"},
+            "provider_status": {"status": "degraded"},
+        }
+
+    async def list_people(self):
+        return self.people
+
+    async def reset_person_runtime(self, person_id: str):
+        self.reset_calls.append(person_id)
+
+    async def delete_person(self, person_id: str):
+        self.delete_calls.append(person_id)
+        self.people = [item for item in self.people if item["person_id"] != person_id]
+
+    async def cancel_enrollment(self):
+        self.cancelled = True
+
+    async def list_sessions(self):
+        return [{"session_id": "person-1", "person_id": "person-1"}]
+
+
 def receive_type(websocket, message_type: str, max_messages: int = 10):
     for _ in range(max_messages):
         message = websocket.receive_json()
@@ -39,28 +78,30 @@ def receive_type(websocket, message_type: str, max_messages: int = 10):
     raise AssertionError(f"未在 {max_messages} 条消息内收到 {message_type}")
 
 
-def make_client(tmp_path) -> TestClient:
+def make_client(tmp_path, *, media_service=None) -> TestClient:
     settings = Settings(runtime_dir=tmp_path)
     agent = NaobotAgent(settings, llm=RuleBasedLLMClient())
-    return TestClient(create_app(settings, agent))
+    return TestClient(create_app(settings, agent, media_service=media_service))
 
 
 def test_health_and_status(tmp_path) -> None:
-    client = make_client(tmp_path)
+    client = make_client(tmp_path, media_service=FakeMediaService())
     assert client.get("/health").json() == {"status": "ok"}
     status = client.get("/api/status").json()
     assert status["robot"]["battery_pct"] == 100
     assert status["llm_configured"] is False
+    assert status["media"]["current_person"] == "person-1"
+    assert status["media"]["session_trigger"] == "touch"
 
 
 def test_dashboard_contains_brain_runtime_observability(tmp_path) -> None:
-    client = make_client(tmp_path)
+    client = make_client(tmp_path, media_service=FakeMediaService())
 
     html = client.get("/").text
 
-    assert 'id="brainRuntime"' in html
-    assert 'id="brainMode"' in html
-    assert 'id="brainTeam"' in html
+    assert 'id="mediaHealth"' in html
+    assert 'id="currentPerson"' in html
+    assert 'id="peopleList"' in html
 
 
 def test_debug_event_touch_head(tmp_path) -> None:
@@ -187,3 +228,22 @@ def test_websocket_event_queue_rejects_low_priority_and_evicts_for_high_priority
     assert [intent["payload"]["goal"] for intent in intents] == ["active", "queued-high"]
     assert llm.event_names == ["active", "queued-high"]
     assert any(log["kind"] == "event_evicted" for log in agent.logs)
+
+
+def test_people_management_apis_delegate_to_media_service(tmp_path) -> None:
+    media_service = FakeMediaService()
+    client = make_client(tmp_path, media_service=media_service)
+
+    people = client.get("/api/people")
+    reset = client.post("/api/people/person-1/runtime/reset")
+    delete = client.delete("/api/people/person-1")
+    cancel = client.post("/api/people/enrollment/cancel")
+
+    assert people.status_code == 200
+    assert people.json()[0]["person_id"] == "person-1"
+    assert reset.status_code == 200
+    assert delete.status_code == 200
+    assert cancel.status_code == 200
+    assert media_service.reset_calls == ["person-1"]
+    assert media_service.delete_calls == ["person-1"]
+    assert media_service.cancelled is True

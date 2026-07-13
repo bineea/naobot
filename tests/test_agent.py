@@ -1,4 +1,5 @@
 import pytest
+from agentscope.message import Base64Source, DataBlock
 
 from naobot.agent import NaobotAgent
 from naobot.brain import AgentScopeBrainRuntime
@@ -24,6 +25,15 @@ class UntrustedActionsLLM(RuleBasedLLMClient):
             skills=[SkillIntent(name="wave", args={"level": 1})],
             actions=[Action(name="flip", args={"servo_id": 1, "angle": 180})],
         )
+
+
+class MediaAwareLLM(RuleBasedLLMClient):
+    def __init__(self) -> None:
+        self.last_media_blocks = None
+
+    async def decide(self, event, soul, memories, media_blocks=None):
+        self.last_media_blocks = media_blocks
+        return await super().decide(event, soul, memories)
 
 
 @pytest.mark.asyncio
@@ -151,3 +161,23 @@ async def test_behavior_layer_ignores_untrusted_llm_actions(tmp_path) -> None:
     names = [action["name"] for action in response.payload["actions"]]
     assert names == ["set_expression", "wave"]
     assert "servo_id" not in str(response.payload)
+
+
+@pytest.mark.asyncio
+async def test_agent_create_intent_passes_media_blocks_to_brain(tmp_path) -> None:
+    llm = MediaAwareLLM()
+    agent = NaobotAgent(Settings(runtime_dir=tmp_path), llm=llm)
+    event = Envelope(
+        type=MessageType.EVENT,
+        payload={"name": "user_utterance", "transcript": "看看我手里的东西"},
+    )
+    media_blocks = [
+        DataBlock(
+            name="frame-1.jpg",
+            source=Base64Source(data="aGVsbG8=", media_type="image/jpeg"),
+        )
+    ]
+
+    await agent.create_intent(event, media_blocks=media_blocks)
+
+    assert llm.last_media_blocks == media_blocks

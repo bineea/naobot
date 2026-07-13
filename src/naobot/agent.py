@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import inspect
+
+from agentscope.message import DataBlock
+
 from .behavior import BehaviorRuntime
 from .brain import AgentScopeBrainRuntime
 from .llm import LLMClient
 from .models import Envelope, MessageType, RobotMode, RobotState, new_id, now_ms
 from .policy import PolicyGuard
+from .runtime.registry import RuntimeRegistry
 from .settings import Settings
 from .storage import MemoryStore, RoutineStore, SoulStore
 
@@ -19,6 +24,7 @@ class NaobotAgent:
         self.memory = MemoryStore(settings.runtime_dir)
         self.routines = RoutineStore(settings.runtime_dir)
         self.brain = llm or AgentScopeBrainRuntime(settings)
+        self.runtime_registry = getattr(self.brain, "_runtime_registry", RuntimeRegistry(settings))
         self.llm = self.brain  # 兼容现有注入和测试入口。
         self.logs: list[dict] = []
         self.last_intent: Envelope | None = None
@@ -75,10 +81,29 @@ class NaobotAgent:
         if envelope.type == MessageType.ERROR:
             self.log("robot_error", envelope.payload)
 
-    async def create_intent(self, event: Envelope) -> Envelope:
+    async def create_intent(
+        self,
+        event: Envelope,
+        media_blocks: list[DataBlock] | None = None,
+    ) -> Envelope:
         soul = self.soul.get()
         memories = [item.text for item in self.memory.list(confirmed=True)]
-        decision = await self.brain.decide(event, soul, memories)
+        if media_blocks:
+            try:
+                signature = inspect.signature(self.brain.decide)
+            except (TypeError, ValueError):
+                signature = None
+            if signature is None or "media_blocks" in signature.parameters:
+                decision = await self.brain.decide(
+                    event,
+                    soul,
+                    memories,
+                    media_blocks=media_blocks,
+                )
+            else:
+                decision = await self.brain.decide(event, soul, memories)
+        else:
+            decision = await self.brain.decide(event, soul, memories)
 
         suggestion = decision.memory_suggestion
         if suggestion.get("type") == "suggest" and suggestion.get("text"):
@@ -135,6 +160,7 @@ class NaobotAgent:
             "soul": self.soul.get().model_dump(),
             "llm_configured": self.settings.llm_configured,
             "brain": brain,
+            "runtime_loaded_count": self.runtime_registry.loaded_count(),
             "last_intent": self.last_intent.model_dump() if self.last_intent else None,
             "logs": self.logs[-50:],
         }

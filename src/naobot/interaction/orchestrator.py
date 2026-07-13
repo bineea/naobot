@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 
 from naobot.models import Envelope, MessageType
 from naobot.settings import Settings
@@ -17,6 +18,15 @@ from ..media.backends import (
 from ..media.pipeline import MediaPipeline
 from ..media.protocol import MediaFrame
 from .session import InteractionSession
+
+
+@dataclass(slots=True)
+class CompletedTurn:
+    event: Envelope
+    vision_blocks: list = field(default_factory=list)
+    audio_frames: list[MediaFrame] = field(default_factory=list)
+    video_frames: list[MediaFrame] = field(default_factory=list)
+    single_person: bool = False
 
 
 class InteractionOrchestrator:
@@ -82,13 +92,13 @@ class InteractionOrchestrator:
         self.session.activate_from_touch(now_ms=now_ms, person_id=person_id)
         self._sync_stats(now_ms=now_ms)
 
-    async def complete_utterance(
+    async def complete_turn(
         self,
         *,
         audio_frames: Sequence[MediaFrame],
         video_frames: Sequence[MediaFrame],
         now_ms: int,
-    ) -> Envelope | None:
+    ) -> CompletedTurn | None:
         self.pipeline.update_connection(True)
         for frame in audio_frames:
             self.pipeline.push_audio_chunk(frame)
@@ -102,6 +112,7 @@ class InteractionOrchestrator:
 
         asr_result = await self.asr.transcribe(audio_frames)
         vision_result = await self.vision.summarize(video_frames)
+        identity_result = self.identity.identify(video_frames)
         self.session.mark_activity(now_ms=now_ms)
         self.pipeline.set_last_transcript(asr_result.transcript)
         self._sync_stats(now_ms=now_ms)
@@ -110,21 +121,41 @@ class InteractionOrchestrator:
             f"media://jpeg/{index + 1}/{frame.sequence}-{frame.timestamp_ms}"
             for index, frame in enumerate(video_frames[:3])
         ]
-        build_vision_input_blocks([frame.payload for frame in video_frames[:3]])
+        vision_blocks = build_vision_input_blocks([frame.payload for frame in video_frames[:3]])
 
         session_id = snapshot.session_id or "visitor-session"
-        return Envelope(
-            type=MessageType.EVENT,
-            session_id=session_id,
-            payload={
-                "name": "user_utterance",
-                "transcript": asr_result.transcript,
-                "person_id": snapshot.person_id,
-                "vision_summary": vision_result.summary,
-                "media_refs": media_refs,
-                "session_trigger": snapshot.session_trigger,
-            },
+        return CompletedTurn(
+            event=Envelope(
+                type=MessageType.EVENT,
+                session_id=session_id,
+                payload={
+                    "name": "user_utterance",
+                    "transcript": asr_result.transcript,
+                    "person_id": snapshot.person_id,
+                    "vision_summary": vision_result.summary,
+                    "media_refs": media_refs,
+                    "session_trigger": snapshot.session_trigger,
+                },
+            ),
+            vision_blocks=vision_blocks,
+            audio_frames=list(audio_frames),
+            video_frames=list(video_frames),
+            single_person=identity_result.vision_summary == "检测到单人",
         )
+
+    async def complete_utterance(
+        self,
+        *,
+        audio_frames: Sequence[MediaFrame],
+        video_frames: Sequence[MediaFrame],
+        now_ms: int,
+    ) -> Envelope | None:
+        turn = await self.complete_turn(
+            audio_frames=audio_frames,
+            video_frames=video_frames,
+            now_ms=now_ms,
+        )
+        return turn.event if turn is not None else None
 
     async def speak_text(self, text: str, *, now_ms: int):
         snapshot = self.session.snapshot(now_ms=now_ms)

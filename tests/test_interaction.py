@@ -245,6 +245,41 @@ async def test_orchestrator_converges_completed_utterance_into_event_envelope() 
     assert stats["last_transcript"] == "帮我记住今天下午开会"
 
 
+@pytest.mark.asyncio
+async def test_orchestrator_exposes_completed_turn_without_raw_jpeg_in_event_payload() -> None:
+    orchestrator = InteractionOrchestrator(
+        settings=Settings(),
+        pipeline=MediaPipeline(),
+        session=InteractionSession(),
+        wake_word=SpyWakeWordProvider(triggered=True),
+        identity=SpyIdentityProvider(person_id="person-7", eye_contact_ms=1_600),
+        asr=SpyASRProvider(transcript="请看看这个"),
+        vision=SpyVisionProvider(summary="用户拿着盒子"),
+        tts=SpyTTSProvider(),
+    )
+
+    await orchestrator.observe_audio(
+        [MediaFrame.audio_pcm16(b"wake", timestamp_ms=120, sequence=1)],
+        now_ms=120,
+    )
+
+    turn = await orchestrator.complete_turn(
+        audio_frames=[MediaFrame.audio_pcm16(b"speech", timestamp_ms=150, sequence=2)],
+        video_frames=[
+            MediaFrame.jpeg(b"jpeg-1", timestamp_ms=160, sequence=1),
+            MediaFrame.jpeg(b"jpeg-2", timestamp_ms=170, sequence=2),
+            MediaFrame.jpeg(b"jpeg-3", timestamp_ms=180, sequence=3),
+            MediaFrame.jpeg(b"jpeg-4", timestamp_ms=190, sequence=4),
+        ],
+        now_ms=190,
+    )
+
+    assert turn is not None
+    assert turn.event.payload["vision_summary"] == "用户拿着盒子"
+    assert "jpeg-1" not in str(turn.event.payload)
+    assert len(turn.vision_blocks) == 3
+
+
 def test_local_media_adapters_fail_with_clear_runtime_error_when_optional_deps_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

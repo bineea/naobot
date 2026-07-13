@@ -6,6 +6,7 @@ import json
 from collections.abc import Callable
 from typing import Any, Protocol
 
+from agentscope.message import DataBlock
 from pydantic import SecretStr
 
 from .llm import LLMClient, RuleBasedLLMClient
@@ -74,6 +75,7 @@ class AgentScopeBrainRuntime(LLMClient):
         event: Envelope,
         soul: SoulConfig,
         memories: list[str],
+        media_blocks: list[DataBlock] | None = None,
     ) -> LLMDecision:
         self._team_used = False
         self._last_error = None
@@ -96,6 +98,7 @@ class AgentScopeBrainRuntime(LLMClient):
                     soul,
                     memories,
                     route,
+                    media_blocks=media_blocks,
                     deadline=self._reply_deadline(self.team_timeout_seconds),
                 )
             else:
@@ -105,6 +108,7 @@ class AgentScopeBrainRuntime(LLMClient):
                     soul,
                     memories,
                     route,
+                    media_blocks=media_blocks,
                     deadline=self._reply_deadline(self.single_timeout_seconds),
                 )
                 escalation_reason = self._needs_team_escalation(decision)
@@ -125,6 +129,7 @@ class AgentScopeBrainRuntime(LLMClient):
                         soul,
                         memories,
                         escalated_route,
+                        media_blocks=media_blocks,
                         seed_decision=decision,
                         deadline=self._reply_deadline(self.team_timeout_seconds),
                     )
@@ -144,6 +149,7 @@ class AgentScopeBrainRuntime(LLMClient):
         memories: list[str],
         route: RouteDecision,
         *,
+        media_blocks: list[DataBlock] | None,
         deadline: float,
     ) -> LLMDecision:
         prompt = self._build_prompt(event, brain_input, soul, memories, route)
@@ -154,6 +160,7 @@ class AgentScopeBrainRuntime(LLMClient):
             person_id=brain_input.person_id,
             is_guest=self._is_guest(brain_input.person_id),
             deadline=deadline,
+            media_blocks=media_blocks,
         )
         return LLMDecision.model_validate(self._parse_json_object(output))
 
@@ -165,6 +172,7 @@ class AgentScopeBrainRuntime(LLMClient):
         memories: list[str],
         route: RouteDecision,
         *,
+        media_blocks: list[DataBlock] | None,
         seed_decision: LLMDecision | None = None,
         deadline: float,
     ) -> LLMDecision:
@@ -179,6 +187,7 @@ class AgentScopeBrainRuntime(LLMClient):
                     person_id=brain_input.person_id,
                     is_guest=is_guest,
                     deadline=deadline,
+                    media_blocks=media_blocks,
                 )
                 for role, system_prompt in SPECIALIST_PROMPTS
             )
@@ -200,6 +209,7 @@ class AgentScopeBrainRuntime(LLMClient):
             person_id=brain_input.person_id,
             is_guest=is_guest,
             deadline=deadline,
+            media_blocks=None,
         )
         return LLMDecision.model_validate(self._parse_json_object(output))
 
@@ -212,10 +222,11 @@ class AgentScopeBrainRuntime(LLMClient):
         person_id: str | None,
         is_guest: bool,
         deadline: float,
+        media_blocks: list[DataBlock] | None,
     ) -> str:
         if person_id is None:
             agent = await self._create_agent(system_prompt, agent_role, person_id, is_guest=is_guest)
-            return await self._collect_reply(agent, prompt, deadline)
+            return await self._collect_reply(agent, prompt, deadline, media_blocks=media_blocks)
 
         async with self._runtime_registry.person_runtime(
             person_id,
@@ -229,7 +240,7 @@ class AgentScopeBrainRuntime(LLMClient):
                 is_guest=is_guest,
                 state=runtime_session.state,
             )
-            output = await self._collect_reply(agent, prompt, deadline)
+            output = await self._collect_reply(agent, prompt, deadline, media_blocks=media_blocks)
             state = getattr(agent, "state", None)
             if state is not None:
                 await asyncio.shield(runtime_session.save(state))
@@ -496,10 +507,17 @@ class AgentScopeBrainRuntime(LLMClient):
             raise TimeoutError
         return remaining
 
-    async def _collect_reply(self, agent: StreamingAgent, prompt: str, deadline: float) -> str:
+    async def _collect_reply(
+        self,
+        agent: StreamingAgent,
+        prompt: str,
+        deadline: float,
+        media_blocks: list[DataBlock] | None = None,
+    ) -> str:
         from agentscope.message import Msg, TextBlock
 
-        message = Msg(name="naobot", role="user", content=[TextBlock(text=prompt)])
+        content = [TextBlock(text=prompt), *(media_blocks or [])[:3]]
+        message = Msg(name="naobot", role="user", content=content)
         chunks: list[str] = []
 
         async def _consume() -> str:

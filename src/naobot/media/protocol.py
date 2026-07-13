@@ -114,6 +114,14 @@ class MediaFrame:
     def is_speech(self) -> bool:
         return bool(self.flags & 0x1)
 
+    @property
+    def is_end_of_utterance(self) -> bool:
+        return bool(self.flags & 0x2)
+
+    @property
+    def event_boosted(self) -> bool:
+        return bool(self.flags & 0x4)
+
     @classmethod
     def audio_pcm16(
         cls,

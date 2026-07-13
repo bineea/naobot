@@ -3,6 +3,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from agentscope.message import Base64Source, DataBlock, TextBlock
 from agentscope.state import AgentState
 
 from naobot.brain import PRIMARY_SYSTEM_PROMPT, AgentScopeBrainRuntime
@@ -195,7 +196,6 @@ async def test_team_route_uses_dedicated_timeout_setting(tmp_path) -> None:
             "name": "user_request",
             "text": "请记住我是阿明，再结合刚才和现在的视觉画面判断左边的红包是不是我的，不确定就先问我。",
             "vision_summary": "刚才左边的人拿着红色背包，现在镜头里只剩红色背包。",
-            "person_id": "person-timeout",
         },
     )
 
@@ -569,3 +569,93 @@ async def test_real_agentscope_agent_has_runtime_state_context_and_new_timeouts(
     assert await agent.toolkit.get_tool_schemas() == []
     assert runtime.status()["single_timeout_seconds"] == 99
     assert runtime.status()["team_timeout_seconds"] == 99
+
+
+@pytest.mark.asyncio
+async def test_agentscope_brain_passes_media_blocks_to_specialists_but_not_editor(tmp_path) -> None:
+    captures: list[tuple[str, object]] = []
+
+    def factory(system_prompt: str, **kwargs):
+        if "产品负责人" in system_prompt:
+            return FakeStreamingAgent('{"text":"好的","goal":"团队处理","skills":[]}')
+        if system_prompt == PRIMARY_SYSTEM_PROMPT:
+            return FakeStreamingAgent(
+                '{"text":"先看看","goal":"初步判断","confidence":0.2,"skills":[]}'
+            )
+        return FakeStreamingAgent('{"recommendation":"看到了图像"}')
+
+    original_collect = AgentScopeBrainRuntime._collect_reply
+
+    async def capture_collect(self, agent, prompt, deadline, media_blocks=None):
+        captures.append((getattr(agent, "output", ""), media_blocks))
+        return await original_collect(self, agent, prompt, deadline, media_blocks=media_blocks)
+
+    runtime = AgentScopeBrainRuntime(
+        Settings(runtime_dir=tmp_path, llm_base_url="http://example.test/v1", llm_model="test"),
+        agent_factory=factory,
+    )
+    media_blocks = [
+        DataBlock(
+            name="frame-1.jpg",
+            source=Base64Source(data="aGVsbG8=", media_type="image/jpeg"),
+        )
+    ]
+
+    try:
+        AgentScopeBrainRuntime._collect_reply = capture_collect
+        decision = await runtime.decide(
+            Envelope(
+                type=MessageType.EVENT,
+                payload={
+                    "name": "user_request",
+                    "text": "请结合画面判断",
+                    "person_id": "person-media",
+                },
+            ),
+            SoulConfig(),
+            [],
+            media_blocks=media_blocks,
+        )
+    finally:
+        AgentScopeBrainRuntime._collect_reply = original_collect
+
+    assert decision.goal == "团队处理"
+    assert captures[0][1] == media_blocks
+    specialist_blocks = [item[1] for item in captures[1:4]]
+    assert specialist_blocks == [media_blocks, media_blocks, media_blocks]
+    assert captures[4][1] is None
+
+
+@pytest.mark.asyncio
+async def test_collect_reply_builds_text_plus_up_to_three_data_blocks(tmp_path) -> None:
+    class InspectingAgent:
+        def __init__(self) -> None:
+            self.message = None
+
+        async def reply_stream(self, inputs):
+            self.message = inputs
+            yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta='{"text":"ok","goal":"ok","skills":[]}')
+
+    runtime = AgentScopeBrainRuntime(
+        Settings(runtime_dir=tmp_path, llm_base_url="http://example.test/v1", llm_model="test"),
+        agent_factory=lambda *_args, **_kwargs: InspectingAgent(),
+    )
+    agent = InspectingAgent()
+    media_blocks = [
+        DataBlock(
+            name=f"frame-{index}.jpg",
+            source=Base64Source(data="aGVsbG8=", media_type="image/jpeg"),
+        )
+        for index in range(4)
+    ]
+
+    result = await runtime._collect_reply(
+        agent,
+        '{"brain_input":{"transcript":"你好"}}',
+        runtime._reply_deadline(1.0),
+        media_blocks=media_blocks,
+    )
+
+    assert result
+    assert isinstance(agent.message.content[0], TextBlock)
+    assert len(agent.message.content) == 4

@@ -263,3 +263,39 @@ async def test_face_repository_encrypts_embeddings_and_samples(tmp_path, monkeyp
 
     assert b"0.25" not in embedding_blob
     assert b"face-sample-binary" not in sample_blob
+
+
+@pytest.mark.asyncio
+async def test_runtime_persistence_lists_people_sessions_and_deletes_person_cascade(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("NAOBOT_DATA_KEY", Fernet.generate_key().decode("utf-8"))
+    settings = Settings(runtime_dir=tmp_path, robot_id="robot-test")
+    persistence = RuntimePersistence(settings)
+    repo = FaceDataRepository(settings, persistence=persistence)
+
+    await persistence.upsert_person("person-a", display_name="阿甲", metadata={"role": "friend"})
+    await persistence.save_agent_runtime(
+        "person-a",
+        "primary",
+        AgentState(session_id="session-a", summary="hello"),
+    )
+    await persistence.upsert_session("session-a", person_id="person-a", is_guest=False)
+    await repo.upsert_embedding("person-a", [0.1, 0.2], model_name="face-v1")
+    await repo.add_sample("person-a", b"jpeg", media_type="image/jpeg", sha256="sha-a")
+
+    people = await persistence.list_people()
+    person = await persistence.get_person("person-a")
+    sessions = await persistence.list_sessions()
+
+    assert people[0]["person_id"] == "person-a"
+    assert person is not None
+    assert person["display_name"] == "阿甲"
+    assert sessions[0]["session_id"] == "session-a"
+
+    await persistence.delete_person("person-a")
+
+    assert await persistence.get_person("person-a") is None
+    assert await persistence.list_people() == []
+    assert await persistence.list_sessions() == []

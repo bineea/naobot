@@ -142,7 +142,8 @@ class RuntimePersistence:
                         embedding_ciphertext BLOB NOT NULL,
                         version INTEGER NOT NULL DEFAULT 1,
                         updated_at TEXT NOT NULL,
-                        PRIMARY KEY (robot_id, person_id, model_name)
+                        PRIMARY KEY (robot_id, person_id, model_name),
+                        FOREIGN KEY (person_id) REFERENCES people(person_id) ON DELETE CASCADE
                     );
 
                     CREATE TABLE IF NOT EXISTS face_samples (
@@ -152,7 +153,8 @@ class RuntimePersistence:
                         media_type TEXT NOT NULL,
                         sha256 TEXT NOT NULL,
                         sample_ciphertext BLOB NOT NULL,
-                        created_at TEXT NOT NULL
+                        created_at TEXT NOT NULL,
+                        FOREIGN KEY (person_id) REFERENCES people(person_id) ON DELETE CASCADE
                     );
 
                     CREATE TABLE IF NOT EXISTS conversation_sessions (
@@ -162,7 +164,8 @@ class RuntimePersistence:
                         is_guest INTEGER NOT NULL DEFAULT 0,
                         status TEXT NOT NULL DEFAULT 'active',
                         created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
+                        updated_at TEXT NOT NULL,
+                        FOREIGN KEY (person_id) REFERENCES people(person_id) ON DELETE CASCADE
                     );
 
                     CREATE TABLE IF NOT EXISTS agent_runtimes (
@@ -172,7 +175,8 @@ class RuntimePersistence:
                         state_json TEXT NOT NULL,
                         version INTEGER NOT NULL DEFAULT 1,
                         updated_at TEXT NOT NULL,
-                        PRIMARY KEY (robot_id, person_id, agent_role)
+                        PRIMARY KEY (robot_id, person_id, agent_role),
+                        FOREIGN KEY (person_id) REFERENCES people(person_id) ON DELETE CASCADE
                     );
                     """
                 )
@@ -325,6 +329,103 @@ class RuntimePersistence:
                 (self.settings.robot_id, person_id),
             )
             await db.commit()
+
+    async def list_people(self) -> list[dict[str, Any]]:
+        await self.initialize()
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                """
+                SELECT person_id, display_name, metadata_json, created_at, updated_at
+                FROM people
+                ORDER BY updated_at DESC, person_id ASC
+                """
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [
+            {
+                "person_id": row[0],
+                "display_name": row[1],
+                "metadata": json.loads(row[2]),
+                "created_at": row[3],
+                "updated_at": row[4],
+            }
+            for row in rows
+        ]
+
+    async def get_person(self, person_id: str) -> dict[str, Any] | None:
+        await self.initialize()
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                """
+                SELECT person_id, display_name, metadata_json, created_at, updated_at
+                FROM people
+                WHERE person_id = ?
+                """,
+                (person_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "person_id": row[0],
+            "display_name": row[1],
+            "metadata": json.loads(row[2]),
+            "created_at": row[3],
+            "updated_at": row[4],
+        }
+
+    async def list_sessions(self) -> list[dict[str, Any]]:
+        await self.initialize()
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                """
+                SELECT session_id, person_id, is_guest, status, created_at, updated_at
+                FROM conversation_sessions
+                WHERE robot_id = ?
+                ORDER BY updated_at DESC, session_id ASC
+                """,
+                (self.settings.robot_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [
+            {
+                "session_id": row[0],
+                "person_id": row[1],
+                "is_guest": bool(row[2]),
+                "status": row[3],
+                "created_at": row[4],
+                "updated_at": row[5],
+            }
+            for row in rows
+        ]
+
+    async def delete_person(self, person_id: str) -> None:
+        await self.initialize()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA foreign_keys=ON")
+            await db.execute("BEGIN")
+            try:
+                await db.execute(
+                    "DELETE FROM face_samples WHERE robot_id = ? AND person_id = ?",
+                    (self.settings.robot_id, person_id),
+                )
+                await db.execute(
+                    "DELETE FROM face_embeddings WHERE robot_id = ? AND person_id = ?",
+                    (self.settings.robot_id, person_id),
+                )
+                await db.execute(
+                    "DELETE FROM conversation_sessions WHERE robot_id = ? AND person_id = ?",
+                    (self.settings.robot_id, person_id),
+                )
+                await db.execute(
+                    "DELETE FROM agent_runtimes WHERE robot_id = ? AND person_id = ?",
+                    (self.settings.robot_id, person_id),
+                )
+                await db.execute("DELETE FROM people WHERE person_id = ?", (person_id,))
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
 
 
 class FaceDataRepository:

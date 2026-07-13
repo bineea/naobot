@@ -12,6 +12,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import ValidationError
 
 from .agent import NaobotAgent
+from .media.service import MediaService
 from .models import Action, Envelope, MessageType, Routine, SoulConfig, new_id, now_ms
 from .policy import PolicyGuard
 from .settings import Settings
@@ -108,15 +109,24 @@ class RobotHub:
         return await self.send_envelope(intent)
 
 
-def create_app(settings: Settings | None = None, agent: NaobotAgent | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    agent: NaobotAgent | None = None,
+    media_service: MediaService | None = None,
+) -> FastAPI:
     settings = settings or Settings.from_env()
     agent = agent or NaobotAgent(settings)
+    media_service = media_service or MediaService(settings=settings, agent=agent)
     hub = DashboardHub()
     robot_hub = RobotHub()
+    attach = getattr(media_service, "attach", None)
+    if callable(attach):
+        attach(robot_hub=robot_hub, dashboard_hub=hub)
     app = FastAPI(title="naobot", version="0.1.0")
     app.state.agent = agent
     app.state.dashboard_hub = hub
     app.state.robot_hub = robot_hub
+    app.state.media_service = media_service
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> str:
@@ -129,7 +139,28 @@ def create_app(settings: Settings | None = None, agent: NaobotAgent | None = Non
 
     @app.get("/api/status")
     async def api_status() -> dict[str, Any]:
-        return agent.status()
+        status = agent.status()
+        status["media"] = media_service.status()
+        return status
+
+    @app.get("/api/people")
+    async def api_people() -> list[dict[str, Any]]:
+        return await media_service.list_people()
+
+    @app.post("/api/people/{person_id}/runtime/reset")
+    async def api_reset_person_runtime(person_id: str) -> dict[str, str]:
+        await media_service.reset_person_runtime(person_id)
+        return {"status": "reset"}
+
+    @app.delete("/api/people/{person_id}")
+    async def api_delete_person(person_id: str) -> dict[str, str]:
+        await media_service.delete_person(person_id)
+        return {"status": "deleted"}
+
+    @app.post("/api/people/enrollment/cancel")
+    async def api_cancel_enrollment() -> dict[str, Any]:
+        result = await media_service.cancel_enrollment()
+        return result if isinstance(result, dict) else {"status": "cancelled"}
 
     @app.post("/api/actions/test")
     async def api_action_test(action: Action) -> dict[str, Any]:
@@ -322,6 +353,10 @@ def create_app(settings: Settings | None = None, agent: NaobotAgent | None = Non
             agent.state.last_robot_seen_ms = None
             agent.log("robot_disconnected", {})
             await hub.broadcast({"kind": "robot_disconnected", "payload": agent.status()})
+
+    @app.websocket("/ws/media")
+    async def ws_media(websocket: WebSocket) -> None:
+        await media_service.handle_websocket(websocket)
 
     return app
 
