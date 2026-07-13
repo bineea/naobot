@@ -79,6 +79,16 @@ class InteractionSession:
         if self._active:
             self._last_activity_ms = now_ms
 
+    def switch_person(self, *, now_ms: int, person_id: str) -> bool:
+        if not self._active or not person_id or person_id == self._person_id:
+            return False
+        self._activate(
+            now_ms=now_ms,
+            person_id=person_id,
+            trigger=self._session_trigger or "eye_contact",
+        )
+        return True
+
     def start_tts(self, *, now_ms: int) -> None:
         now_ms = self._monotonic_now(now_ms)
         if not self._active:

@@ -94,6 +94,12 @@ class InteractionOrchestrator:
                 )
             elif identity.greeting_detected:
                 self.session.activate_from_greeting(now_ms=now_ms, person_id=identity.person_id)
+        elif self._switch_known_person(
+            current_person_id=snapshot.person_id,
+            detected_person_id=identity.person_id,
+            now_ms=now_ms,
+        ):
+            pass
         elif (
             snapshot.person_id is None
             and identity.person_id is not None
@@ -133,6 +139,12 @@ class InteractionOrchestrator:
         asr_result = await self.asr.transcribe(audio_frames)
         vision_result = await self.vision.summarize(video_frames)
         identity_result = await asyncio.to_thread(self.identity.identify, video_frames)
+        if self._switch_known_person(
+            current_person_id=snapshot.person_id,
+            detected_person_id=identity_result.person_id,
+            now_ms=now_ms,
+        ):
+            snapshot = self.session.snapshot(now_ms=now_ms)
         self.session.mark_activity(now_ms=now_ms)
         self.pipeline.set_last_transcript(asr_result.transcript)
         self._sync_stats(now_ms=now_ms)
@@ -189,6 +201,19 @@ class InteractionOrchestrator:
     def finish_tts(self, *, now_ms: int) -> None:
         self.session.end_tts(now_ms=now_ms)
         self._sync_stats(now_ms=now_ms)
+
+    def _switch_known_person(
+        self,
+        *,
+        current_person_id: str | None,
+        detected_person_id: str | None,
+        now_ms: int,
+    ) -> bool:
+        if current_person_id is None or detected_person_id is None:
+            return False
+        if current_person_id == detected_person_id:
+            return False
+        return self.session.switch_person(now_ms=now_ms, person_id=detected_person_id)
 
     def _sync_stats(self, *, now_ms: int) -> None:
         snapshot = self.session.snapshot(now_ms=now_ms)

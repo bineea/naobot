@@ -293,6 +293,95 @@ async def test_orchestrator_exposes_completed_turn_without_raw_jpeg_in_event_pay
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_rebuilds_session_when_video_identity_changes() -> None:
+    session = InteractionSession()
+    session.activate_from_wake_word(now_ms=100, person_id="person-a")
+    orchestrator = InteractionOrchestrator(
+        settings=Settings(),
+        pipeline=MediaPipeline(),
+        session=session,
+        wake_word=SpyWakeWordProvider(),
+        identity=SpyIdentityProvider(person_id="person-b", summary="检测到单人"),
+        asr=SpyASRProvider(),
+        vision=SpyVisionProvider(),
+        tts=SpyTTSProvider(),
+    )
+
+    await orchestrator.observe_video(
+        [MediaFrame.jpeg(b"person-b", timestamp_ms=200, sequence=1)],
+        now_ms=200,
+    )
+
+    snapshot = session.snapshot(now_ms=200)
+    stats = orchestrator.pipeline.stats()
+    assert snapshot.session_id == "person-b"
+    assert snapshot.person_id == "person-b"
+    assert stats["current_session"] == "person-b"
+    assert stats["current_person"] == "person-b"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_rebuilds_runtime_when_turn_identity_changes() -> None:
+    session = InteractionSession()
+    session.activate_from_wake_word(now_ms=100, person_id="person-a")
+    orchestrator = InteractionOrchestrator(
+        settings=Settings(),
+        pipeline=MediaPipeline(),
+        session=session,
+        wake_word=SpyWakeWordProvider(),
+        identity=SpyIdentityProvider(person_id="person-b", summary="检测到单人"),
+        asr=SpyASRProvider(transcript="我是 B"),
+        vision=SpyVisionProvider(summary="B 正在镜头前"),
+        tts=SpyTTSProvider(),
+    )
+
+    turn = await orchestrator.complete_turn(
+        audio_frames=[MediaFrame.audio_pcm16(b"speech-b", timestamp_ms=200, sequence=1)],
+        video_frames=[MediaFrame.jpeg(b"person-b", timestamp_ms=200, sequence=1)],
+        now_ms=200,
+    )
+
+    snapshot = session.snapshot(now_ms=200)
+    stats = orchestrator.pipeline.stats()
+    assert turn is not None
+    assert turn.event.session_id == "person-b"
+    assert turn.event.payload["person_id"] == "person-b"
+    assert snapshot.session_id == "person-b"
+    assert snapshot.person_id == "person-b"
+    assert stats["current_session"] == "person-b"
+    assert stats["current_person"] == "person-b"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_keeps_bound_runtime_for_unknown_turn_identity() -> None:
+    session = InteractionSession()
+    session.activate_from_wake_word(now_ms=100, person_id="person-a")
+    orchestrator = InteractionOrchestrator(
+        settings=Settings(),
+        pipeline=MediaPipeline(),
+        session=session,
+        wake_word=SpyWakeWordProvider(),
+        identity=SpyIdentityProvider(person_id=None, summary="检测到单人"),
+        asr=SpyASRProvider(transcript="继续"),
+        vision=SpyVisionProvider(summary="用户仍在镜头前"),
+        tts=SpyTTSProvider(),
+    )
+
+    turn = await orchestrator.complete_turn(
+        audio_frames=[MediaFrame.audio_pcm16(b"speech", timestamp_ms=200, sequence=1)],
+        video_frames=[MediaFrame.jpeg(b"unknown", timestamp_ms=200, sequence=1)],
+        now_ms=200,
+    )
+
+    snapshot = session.snapshot(now_ms=200)
+    assert turn is not None
+    assert turn.event.session_id == "person-a"
+    assert turn.event.payload["person_id"] == "person-a"
+    assert snapshot.session_id == "person-a"
+    assert snapshot.person_id == "person-a"
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_does_not_reactivate_session_on_followup_wakeword() -> None:
     orchestrator = InteractionOrchestrator(
         settings=Settings(),
