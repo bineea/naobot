@@ -1,6 +1,8 @@
 # naobot
 
-naobot 是 KT2 LLM 桌面智能机器人软件 MVP。它实现宿主机 Agent、FastAPI Dashboard、ESP32 MicroPython 固件骨架、CPython 机器人模拟器、协议模型、安全白名单、记忆/routine 和自动化测试。
+naobot 是 KT2 LLM 桌面智能机器人软件 MVP。它实现宿主机 AgentScope Brain、FastAPI Dashboard、ESP32 MicroPython 固件骨架、CPython 机器人模拟器、协议模型、安全白名单、记忆/routine 和自动化测试。
+
+当前大脑运行时基于 `agentscope==2.0.4` 的 Agent 和 OpenAI-compatible 模型。L3 只输出 `goal`、`text`、`expression`、`skills`、`memory_suggestion`；L2 `BehaviorRuntime` 再确定性编译为安全兼容 actions，并忽略 LLM 自行返回的 `actions`。默认空 Toolkit，禁止 shell、文件、Python、MCP、硬件工具和自主长期记忆；模型未配置、超时、异常或非法输出时进入规则 fallback。
 
 ## 文档入口
 
@@ -19,13 +21,15 @@ naobot 是 KT2 LLM 桌面智能机器人软件 MVP。它实现宿主机 Agent、
 - 不做自主桌边移动：桌面机器人存在跌落风险，在没有真实硬件传感器和桌边检测闭环验证前，不开放自主移动能力。
 - 不做 LLM 直接控制舵机角度：LLM 只能生成白名单动作 intent，不能输出裸舵机角度、PWM 或 servo id。
 - 不做未经确认的长期记忆写入：Memory 默认待确认，避免误记、敏感信息或临时偏好被自动保存。
+- 不做真实硬件已验证声明：当前软件闭环和固件骨架可测试，真实 ESP32/舵机/传感器仍需 Phase 1 bring-up 实测。
 
 ## 快速开始
 
 ```powershell
-python -m pip install -r requirements.txt
-python -m pip install -e .
-naobot serve
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\naobot.exe serve
 ```
 
 打开 `http://127.0.0.1:8765` 查看 Dashboard。
@@ -33,8 +37,8 @@ naobot serve
 模拟机器人事件：
 
 ```powershell
-naobot simulate --event touch_head
-naobot send-event --event battery_low
+.\.venv\Scripts\naobot.exe simulate --event touch_head
+.\.venv\Scripts\naobot.exe send-event --event battery_low
 ```
 
 ## LLM 配置
@@ -50,9 +54,11 @@ $env:NAOBOT_LLM_API_KEY="optional"
 ## 测试
 
 ```powershell
-pytest
-ruff check .
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m ruff check .
 ```
+
+关键约束包括：AgentScope Brain 4 秒超时和 4 轮上限、复杂请求最多 3 个专家加产品负责人收敛、安全事件禁用组队、有界优先级队列容量 32、Host heartbeat 每 2 秒独立发送，以及语义字段优先于兼容 `actions` 以避免固件重复执行。
 
 ## 目录
 

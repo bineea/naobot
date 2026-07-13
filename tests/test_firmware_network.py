@@ -270,6 +270,24 @@ def test_execute_intent_accepts_semantic_payload_with_motion_controller() -> Non
     assert ws.sent[-1]["type"] == "ack"
 
 
+def test_semantic_payload_takes_precedence_over_compatibility_actions() -> None:
+    payload = {
+        "expression": {"emotion": "happy"},
+        "skills": [{"name": "wave", "args": {"level": 1}}],
+        "actions": [
+            {"name": "set_expression", "args": {"emotion": "happy"}},
+            {"name": "wave", "args": {"level": 1}},
+        ],
+    }
+
+    actions = firmware_main._semantic_actions(payload)
+
+    assert actions == [
+        {"name": "set_expression", "args": {"emotion": "happy"}},
+        {"name": "wave", "args": {"level": 1}},
+    ]
+
+
 def test_execute_intent_stop_cancels_motion_controller() -> None:
     actions = FakeActions()
     motion = FakeMotion()

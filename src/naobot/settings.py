@@ -14,6 +14,11 @@ class Settings:
     llm_api_key: str | None = None
     llm_model: str | None = None
     robot_heartbeat_timeout_ms: int = 7000
+    host_heartbeat_interval_ms: int = 2000
+    event_queue_capacity: int = 32
+    brain_timeout_seconds: float = 4.0
+    brain_max_iters: int = 4
+    brain_team_enabled: bool = True
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -25,6 +30,12 @@ class Settings:
             llm_api_key=os.getenv("NAOBOT_LLM_API_KEY"),
             llm_model=os.getenv("NAOBOT_LLM_MODEL"),
             robot_heartbeat_timeout_ms=int(os.getenv("NAOBOT_ROBOT_HEARTBEAT_TIMEOUT_MS", "7000")),
+            host_heartbeat_interval_ms=int(os.getenv("NAOBOT_HOST_HEARTBEAT_INTERVAL_MS", "2000")),
+            event_queue_capacity=int(os.getenv("NAOBOT_EVENT_QUEUE_CAPACITY", "32")),
+            brain_timeout_seconds=float(os.getenv("NAOBOT_BRAIN_TIMEOUT_SECONDS", "4.0")),
+            brain_max_iters=int(os.getenv("NAOBOT_BRAIN_MAX_ITERS", "4")),
+            brain_team_enabled=os.getenv("NAOBOT_BRAIN_TEAM_ENABLED", "true").lower()
+            in {"1", "true", "yes", "on"},
         )
 
     @property

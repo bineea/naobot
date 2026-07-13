@@ -1,9 +1,29 @@
 import pytest
 
 from naobot.agent import NaobotAgent
+from naobot.brain import AgentScopeBrainRuntime
 from naobot.llm import RuleBasedLLMClient
-from naobot.models import Envelope, MessageType
+from naobot.models import Action, Envelope, ExpressionIntent, LLMDecision, MessageType, SkillIntent
 from naobot.settings import Settings
+
+
+class CountingLLM(RuleBasedLLMClient):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def decide(self, event, soul, memories):
+        self.calls += 1
+        return await super().decide(event, soul, memories)
+
+
+class UntrustedActionsLLM(RuleBasedLLMClient):
+    async def decide(self, event, soul, memories):
+        return LLMDecision(
+            goal="安全挥手",
+            expression=ExpressionIntent(emotion="happy"),
+            skills=[SkillIntent(name="wave", args={"level": 1})],
+            actions=[Action(name="flip", args={"servo_id": 1, "angle": 180})],
+        )
 
 
 @pytest.mark.asyncio
@@ -18,7 +38,7 @@ async def test_touch_head_creates_safe_intent(tmp_path) -> None:
     response = await agent.handle_robot_message(event)
     assert response is not None
     assert response.type == MessageType.INTENT
-    assert response.payload["actions"][0]["name"] == "set_face"
+    assert response.payload["actions"][0]["name"] == "set_expression"
 
 
 @pytest.mark.asyncio
@@ -91,3 +111,43 @@ def test_host_heartbeat_payload_contains_brain_state(tmp_path) -> None:
     assert heartbeat.payload["source"] == "host"
     assert heartbeat.payload["last_intent_id"] == "int_test"
     assert heartbeat.payload["agent_mode"] == agent.state.mode
+
+
+def test_observe_robot_message_updates_state_without_running_brain(tmp_path) -> None:
+    llm = CountingLLM()
+    agent = NaobotAgent(Settings(runtime_dir=tmp_path), llm=llm)
+    event = Envelope(
+        type=MessageType.EVENT,
+        payload={"name": "touch_head", "battery_pct": 81, "posture": "upright"},
+    )
+
+    agent.observe_robot_message(event)
+
+    assert llm.calls == 0
+    assert agent.state.last_event == "touch_head"
+    assert agent.state.battery_pct == 81
+
+
+def test_default_agent_uses_agentscope_runtime_with_observable_fallback(tmp_path) -> None:
+    agent = NaobotAgent(Settings(runtime_dir=tmp_path))
+
+    assert isinstance(agent.llm, AgentScopeBrainRuntime)
+    assert agent.status()["brain"]["runtime"] == "agentscope-2.0.4"
+    assert agent.status()["brain"]["mode"] == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_behavior_layer_ignores_untrusted_llm_actions(tmp_path) -> None:
+    agent = NaobotAgent(Settings(runtime_dir=tmp_path), llm=UntrustedActionsLLM())
+    event = Envelope(
+        type=MessageType.EVENT,
+        payload={"name": "touch_head", "battery_pct": 80, "posture": "upright"},
+    )
+
+    response = await agent.handle_robot_message(event)
+
+    assert response is not None
+    assert response.type == MessageType.INTENT
+    names = [action["name"] for action in response.payload["actions"]]
+    assert names == ["set_expression", "wave"]
+    assert "servo_id" not in str(response.payload)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from .llm import LLMClient, OpenAICompatibleLLMClient
+from .behavior import BehaviorRuntime
+from .brain import AgentScopeBrainRuntime
+from .llm import LLMClient
 from .models import Envelope, MessageType, RobotMode, RobotState, new_id, now_ms
 from .policy import PolicyGuard
 from .settings import Settings
@@ -12,10 +14,12 @@ class NaobotAgent:
         self.settings = settings
         self.state = RobotState()
         self.policy = PolicyGuard()
+        self.behavior = BehaviorRuntime(self.policy)
         self.soul = SoulStore(settings.runtime_dir)
         self.memory = MemoryStore(settings.runtime_dir)
         self.routines = RoutineStore(settings.runtime_dir)
-        self.llm = llm or OpenAICompatibleLLMClient(settings)
+        self.brain = llm or AgentScopeBrainRuntime(settings)
+        self.llm = self.brain  # 兼容现有注入和测试入口。
         self.logs: list[dict] = []
         self.last_intent: Envelope | None = None
 
@@ -57,53 +61,31 @@ class NaobotAgent:
         self.state.last_reflex = payload.get("last_reflex", self.state.last_reflex)
 
     async def handle_robot_message(self, envelope: Envelope) -> Envelope | None:
-        self.log("robot_rx", envelope.model_dump())
-        self.update_state_from_envelope(envelope)
+        self.observe_robot_message(envelope)
         if envelope.type == MessageType.EVENT:
             return await self.create_intent(envelope)
+        return None
+
+    def observe_robot_message(self, envelope: Envelope) -> None:
+        """记录机器人消息并刷新状态，不触发可能耗时的大脑推理。"""
+        self.log("robot_rx", envelope.model_dump())
+        self.update_state_from_envelope(envelope)
         if envelope.type == MessageType.ACK:
             self.log("ack", envelope.payload)
         if envelope.type == MessageType.ERROR:
             self.log("robot_error", envelope.payload)
-        return None
 
     async def create_intent(self, event: Envelope) -> Envelope:
         soul = self.soul.get()
         memories = [item.text for item in self.memory.list(confirmed=True)]
-        decision = await self.llm.decide(event, soul, memories)
+        decision = await self.brain.decide(event, soul, memories)
 
         suggestion = decision.memory_suggestion
         if suggestion.get("type") == "suggest" and suggestion.get("text"):
             self.memory.suggest(str(suggestion["text"]), source="llm")
 
-        intent = Envelope(
-            type=MessageType.INTENT,
-            id=new_id("int"),
-            seq=event.seq + 1,
-            ts_ms=now_ms(),
-            session_id=event.session_id,
-            priority=4,
-            deadline_ms=4000,
-            payload={
-                "goal": decision.goal,
-                "expression": decision.expression.model_dump() if decision.expression else None,
-                "skills": [skill.model_dump() for skill in decision.skills],
-                "actions": [action.model_dump() for action in decision.actions],
-                "text": decision.text,
-            },
-        )
-        result = self.policy.validate_intent(intent, self.state)
-        if not result.accepted:
-            intent = Envelope(
-                type=MessageType.ERROR,
-                id=new_id("err"),
-                seq=event.seq + 1,
-                ts_ms=now_ms(),
-                session_id=event.session_id,
-                priority=8,
-                payload={"code": "POLICY_REJECTED", "message": result.reason},
-            )
-        else:
+        intent = self.behavior.compile(decision, event, self.state)
+        if intent.type == MessageType.INTENT:
             self.last_intent = intent
         self.log("agent_tx", intent.model_dump())
         return intent
@@ -139,10 +121,20 @@ class NaobotAgent:
 
     def status(self) -> dict:
         self.refresh_link_state()
+        brain_status = getattr(self.brain, "status", None)
+        brain = (
+            brain_status()
+            if callable(brain_status)
+            else {
+                "runtime": type(self.brain).__name__,
+                "mode": "rules" if type(self.brain).__name__ == "RuleBasedLLMClient" else "injected",
+            }
+        )
         return {
             "robot": self.state.model_dump(),
             "soul": self.soul.get().model_dump(),
             "llm_configured": self.settings.llm_configured,
+            "brain": brain,
             "last_intent": self.last_intent.model_dump() if self.last_intent else None,
             "logs": self.logs[-50:],
         }

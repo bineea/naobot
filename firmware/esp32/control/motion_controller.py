@@ -29,9 +29,11 @@ class MotionController:
             if not accepted:
                 return False, reason
         action_items = []
-        for skill in payload.get("skills", []):
+        skills = payload.get("skills") or []
+        for skill in skills:
             action_items.append({"name": skill.get("name"), "args": skill.get("args", {})})
-        action_items.extend(payload.get("actions", []))
+        if not expression and not skills:
+            action_items.extend(payload.get("actions") or [])
         for action in action_items:
             accepted, reason = self.submit_action(action)
             if not accepted:

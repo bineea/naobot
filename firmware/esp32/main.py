@@ -116,7 +116,8 @@ class FirmwareProtocol:
 
 def _semantic_actions(payload):
     action_items = []
-    if payload.get("expression"):
+    expression = payload.get("expression")
+    if expression:
         action_items.append({"name": "set_expression", "args": payload.get("expression")})
     skills = payload.get("skills", [])
     actions = payload.get("actions", [])
@@ -130,7 +131,8 @@ def _semantic_actions(payload):
         if not isinstance(skill, dict):
             return None
         action_items.append({"name": skill.get("name"), "args": skill.get("args", {})})
-    action_items.extend(actions)
+    if not expression and not skills:
+        action_items.extend(actions)
     return action_items
 
 

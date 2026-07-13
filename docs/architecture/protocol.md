@@ -41,6 +41,13 @@
 - `skills`：可请求的技能动作，仍需 Host `PolicyGuard` 和固件安全层双重校验。
 - `actions`：兼容旧固件和 Dashboard 的白名单动作列表。
 
+优先级规则：
+
+- L3 AgentScope Brain 只允许输出 `goal`、`text`、`expression`、`skills`、`memory_suggestion`，不得输出 `actions`。
+- L2 `BehaviorRuntime` 根据 `expression` 和 `skills` 确定性生成兼容 `actions`，并忽略任何 LLM 提供的 `actions`。
+- 固件解析 intent 时，语义字段优先于兼容 `actions`；当同一 intent 同时包含 `skills`/`expression` 和 `actions` 时，不得重复执行兼容 `actions`。
+- 现有 envelope 类型保持兼容，仍使用 `event`、`intent`、`ack`、`status`、`error`、`heartbeat`。
+
 示例：
 
 ```json
@@ -74,6 +81,8 @@
 
 机器人执行或拒绝 intent 后返回 ack；协议错误或本地安全拒绝返回 error。
 
+Host 事件队列满时返回 `EVENT_QUEUE_FULL`；更高优先级事件替换待处理事件时，针对被替换事件返回 `EVENT_EVICTED`。两种错误都携带 `event_id`，固件不得把它们当作 intent 执行结果。
+
 ```json
 {
   "type": "ack",
@@ -99,6 +108,8 @@
 - `local_loop_ms`：固件主循环最近一次耗时。
 
 Host 心跳 payload 包含 `source=host`、`host_ts_ms`、`agent_mode` 和 `last_intent_id`。固件收到 Host 心跳只刷新大脑在线时间，不执行动作、不回 ack。
+
+Host heartbeat 默认每 2 秒发送，独立于 L3 推理和事件队列。事件处理使用容量 32 的有界优先级队列，高优先级事件优先处理；队列满时更高优先级事件可驱逐最低优先级事件，新的低优先级事件会被拒绝并返回错误。
 
 ## 禁止字段
 

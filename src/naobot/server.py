@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +15,48 @@ from .agent import NaobotAgent
 from .models import Action, Envelope, MessageType, Routine, SoulConfig, new_id, now_ms
 from .policy import PolicyGuard
 from .settings import Settings
+
+
+@dataclass(frozen=True)
+class QueuePutResult:
+    accepted: bool
+    evicted: Envelope | None = None
+
+
+class BoundedPriorityEventQueue:
+    """有界优先级事件队列；高优先级优先，同优先级保持 FIFO。"""
+
+    def __init__(self, capacity: int = 32) -> None:
+        if capacity < 1:
+            raise ValueError("event queue capacity must be positive")
+        self.capacity = capacity
+        self._buckets: list[deque[Envelope]] = [deque() for _ in range(11)]
+        self._size = 0
+        self._condition = asyncio.Condition()
+
+    async def put(self, envelope: Envelope) -> QueuePutResult:
+        async with self._condition:
+            evicted = None
+            if self._size >= self.capacity:
+                lowest = next((index for index, bucket in enumerate(self._buckets) if bucket), None)
+                if lowest is None or envelope.priority <= lowest:
+                    return QueuePutResult(False)
+                evicted = self._buckets[lowest].popleft()
+                self._size -= 1
+            self._buckets[envelope.priority].append(envelope)
+            self._size += 1
+            self._condition.notify()
+            return QueuePutResult(True, evicted)
+
+    async def get(self) -> Envelope:
+        async with self._condition:
+            while self._size == 0:
+                await self._condition.wait()
+            for priority in range(10, -1, -1):
+                if self._buckets[priority]:
+                    self._size -= 1
+                    return self._buckets[priority].popleft()
+        raise RuntimeError("event queue size is inconsistent")
 
 
 class DashboardHub:
@@ -40,6 +84,7 @@ class DashboardHub:
 class RobotHub:
     def __init__(self) -> None:
         self.websocket: WebSocket | None = None
+        self._send_lock = asyncio.Lock()
 
     def connect(self, websocket: WebSocket) -> None:
         self.websocket = websocket
@@ -49,14 +94,15 @@ class RobotHub:
             self.websocket = None
 
     async def send_envelope(self, envelope: Envelope) -> bool:
-        if self.websocket is None:
-            return False
-        try:
-            await self.websocket.send_json(envelope.model_dump())
-        except RuntimeError:
-            self.websocket = None
-            return False
-        return True
+        async with self._send_lock:
+            if self.websocket is None:
+                return False
+            try:
+                await self.websocket.send_json(envelope.model_dump())
+            except (RuntimeError, WebSocketDisconnect):
+                self.websocket = None
+                return False
+            return True
 
     async def send_intent(self, intent: Envelope) -> bool:
         return await self.send_envelope(intent)
@@ -201,17 +247,29 @@ def create_app(settings: Settings | None = None, agent: NaobotAgent | None = Non
         agent.state.last_robot_seen_ms = now_ms()
         agent.log("robot_connected", {})
         await hub.broadcast({"kind": "robot_connected", "payload": agent.status()})
+        event_queue = BoundedPriorityEventQueue(settings.event_queue_capacity)
+
+        async def event_worker() -> None:
+            while True:
+                event = await event_queue.get()
+                response = await agent.create_intent(event)
+                if not await robot_hub.send_envelope(response):
+                    return
+                await hub.broadcast({"kind": "agent_tx", "payload": response.model_dump()})
+
+        async def heartbeat_worker() -> None:
+            while True:
+                heartbeat = agent.host_heartbeat()
+                if not await robot_hub.send_envelope(heartbeat):
+                    return
+                agent.refresh_link_state()
+                await hub.broadcast({"kind": "heartbeat_tick", "payload": agent.status()})
+                await asyncio.sleep(settings.host_heartbeat_interval_ms / 1000)
+
+        workers = [asyncio.create_task(event_worker()), asyncio.create_task(heartbeat_worker())]
         try:
             while True:
-                try:
-                    raw = await asyncio.wait_for(websocket.receive_text(), timeout=2.0)
-                except TimeoutError:
-                    heartbeat = agent.host_heartbeat()
-                    if not await robot_hub.send_envelope(heartbeat):
-                        raise WebSocketDisconnect from None
-                    agent.refresh_link_state()
-                    await hub.broadcast({"kind": "heartbeat_tick", "payload": agent.status()})
-                    continue
+                raw = await websocket.receive_text()
                 try:
                     envelope = Envelope.model_validate(json.loads(raw))
                 except (json.JSONDecodeError, ValidationError) as exc:
@@ -220,14 +278,44 @@ def create_app(settings: Settings | None = None, agent: NaobotAgent | None = Non
                         priority=8,
                         payload={"code": "INVALID_PROTOCOL", "message": str(exc).splitlines()[0]},
                     )
-                    await websocket.send_json(error.model_dump())
+                    await robot_hub.send_envelope(error)
                     continue
-                response = await agent.handle_robot_message(envelope)
+                agent.observe_robot_message(envelope)
                 await hub.broadcast({"kind": "robot_rx", "payload": envelope.model_dump()})
-                if response:
-                    await websocket.send_json(response.model_dump())
-                    await hub.broadcast({"kind": "agent_tx", "payload": response.model_dump()})
+                if envelope.type == MessageType.EVENT:
+                    result = await event_queue.put(envelope)
+                    if result.evicted is not None:
+                        agent.log("event_evicted", {"event_id": result.evicted.id})
+                        await robot_hub.send_envelope(
+                            Envelope(
+                                type=MessageType.ERROR,
+                                priority=7,
+                                session_id=result.evicted.session_id,
+                                payload={
+                                    "code": "EVENT_EVICTED",
+                                    "message": "Host 大脑事件被更高优先级事件替换",
+                                    "event_id": result.evicted.id,
+                                },
+                            )
+                        )
+                    if not result.accepted:
+                        error = Envelope(
+                            type=MessageType.ERROR,
+                            priority=7,
+                            session_id=envelope.session_id,
+                            payload={
+                                "code": "EVENT_QUEUE_FULL",
+                                "message": "Host 大脑事件队列已满",
+                                "event_id": envelope.id,
+                            },
+                        )
+                        await robot_hub.send_envelope(error)
         except WebSocketDisconnect:
+            pass
+        finally:
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
             robot_hub.disconnect(websocket)
             agent.state.agent_connected = False
             agent.state.link_state = "disconnected"

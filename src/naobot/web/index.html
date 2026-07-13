@@ -46,7 +46,10 @@
           <div class="panel"><strong>心跳年龄</strong><p id="heartbeatAge">-</p></div>
           <div class="panel"><strong>最后心跳</strong><p id="lastHeartbeat">-</p></div>
           <div class="panel"><strong>电量</strong><p id="battery">-</p></div>
-          <div class="panel"><strong>LLM</strong><p id="llm">-</p></div>
+          <div class="panel"><strong>模型</strong><p id="llm">-</p></div>
+          <div class="panel"><strong>大脑运行时</strong><p id="brainRuntime">-</p></div>
+          <div class="panel"><strong>大脑模式</strong><p id="brainMode">-</p></div>
+          <div class="panel"><strong>协作推理</strong><p id="brainTeam">-</p></div>
           <div class="panel"><strong>控制权</strong><p id="authority">-</p></div>
           <div class="panel"><strong>反射状态</strong><p id="reflex">-</p></div>
           <div class="panel"><strong>运动状态</strong><p id="motion">-</p></div>
@@ -117,7 +120,10 @@
       document.getElementById('reflex').textContent = state.robot.reflex_state || '-';
       document.getElementById('motion').textContent = state.robot.motion_state || '-';
       document.getElementById('lastReflex').textContent = state.robot.last_reflex || '-';
-      document.getElementById('llm').innerHTML = state.llm_configured ? '<span class="badge">OpenAI-compatible</span>' : '<span class="badge">规则模拟</span>';
+      document.getElementById('llm').innerHTML = state.llm_configured ? '<span class="badge">OpenAI-compatible</span>' : '<span class="badge">未配置</span>';
+      document.getElementById('brainRuntime').textContent = state.brain.runtime || '-';
+      document.getElementById('brainMode').textContent = state.brain.mode || '-';
+      document.getElementById('brainTeam').textContent = state.brain.team_used ? 'active' : 'idle';
       document.getElementById('soulName').value = state.soul.name;
       document.getElementById('userCall').value = state.soul.user_call;
       document.getElementById('liveliness').value = state.soul.liveliness;

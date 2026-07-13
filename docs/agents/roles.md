@@ -15,6 +15,8 @@
 ## Host Development Agent
 
 - 负责 `src/naobot/` 中的 Agent、LLM、Memory、Routine、Policy、CLI 和模拟器。
+- 维护 AgentScope Brain 与 L2 `BehaviorRuntime` 边界：L3 只输出语义字段，L2 确定性编译兼容 actions。
+- 不为 AgentScope Brain 增加 shell、文件、Python、MCP、硬件工具或自主长期记忆。
 - 不修改 `firmware/esp32/`，除非任务明确要求联动协议。
 
 ## Firmware Development Agent
@@ -35,5 +37,5 @@
 ## Code Review Agent
 
 - 先列风险和问题，再给总结。
-- 重点审查安全边界、未测试失败路径、文档不一致和不做项回归。
+- 重点审查安全边界、未测试失败路径、文档不一致、不做项回归、L3/L2 职责混淆和真实硬件验证声明。
 

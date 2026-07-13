@@ -107,3 +107,38 @@ def test_motion_controller_cancels_running_skill_when_reflex_triggers() -> None:
     assert not motion.is_running()
     assert motion.motion_state == "cancelled"
     assert ("stop",) in servos.calls
+
+
+def test_motion_controller_does_not_queue_compatibility_actions_twice() -> None:
+    actions = ActionPlayer(FakeServos(), FakeDisplay(), FakeBuzzer())
+    reflex = ReflexController(FakePower(), FakeImu(), actions, FakeDisplay(), FakeBuzzer())
+    motion = MotionController(actions, FakeSafety(), reflex, lambda: 0)
+    message = {
+        "payload": {
+            "expression": {"emotion": "happy"},
+            "skills": [{"name": "wave", "args": {"level": 1}}],
+            "actions": [
+                {"name": "set_expression", "args": {"emotion": "happy"}},
+                {"name": "wave", "args": {"level": 1}},
+            ],
+        }
+    }
+
+    accepted, reason = motion.submit_intent(message)
+
+    assert accepted, reason
+    assert motion.current.name == "set_expression"
+    assert [skill.name for skill in motion.queue] == ["wave"]
+
+
+def test_motion_controller_accepts_null_skills_with_compatibility_actions() -> None:
+    actions = ActionPlayer(FakeServos(), FakeDisplay(), FakeBuzzer())
+    reflex = ReflexController(FakePower(), FakeImu(), actions, FakeDisplay(), FakeBuzzer())
+    motion = MotionController(actions, FakeSafety(), reflex, lambda: 0)
+
+    accepted, reason = motion.submit_intent(
+        {"payload": {"expression": None, "skills": None, "actions": [{"name": "blink", "args": {}}]}}
+    )
+
+    assert accepted, reason
+    assert motion.current.name == "blink"

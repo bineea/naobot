@@ -3,6 +3,9 @@
 ## Phase 0：软件 MVP
 
 - Host Agent、FastAPI Dashboard、模拟器、协议模型、安全策略、Memory、Routine、固件骨架可用。
+- AgentScope Brain 运行时可用：`agentscope==2.0.4`、OpenAI-compatible 模型、空 Toolkit、4 秒超时、4 轮上限、fallback 可观察。
+- L2 BehaviorRuntime 可用：确定性编译 `goal/text/expression/skills/memory_suggestion`，忽略 LLM `actions`，通过 `PolicyGuard` 生成兼容 actions。
+- WebSocket 接入有界优先级事件队列，默认容量 32；Host heartbeat 每 2 秒独立于推理发送。
 - 通过自动化测试验证核心安全边界。
 - 不要求真实 ESP32 和舵机现场验证。
 
@@ -11,6 +14,7 @@
 - 确认 ESP32 型号、引脚、屏幕、触摸、电源检测、IMU、舵机接线。
 - 将固件 stub 替换为真实驱动。
 - 完成安全姿态、急停、低电和跌倒降级实测。
+- 验证语义字段优先于兼容 actions 的固件执行策略，避免同一 intent 在真实硬件上重复执行。
 
 ## Phase 2：互动体验
 

@@ -37,4 +37,4 @@ async def test_openai_compatible_client_falls_back_to_rules(monkeypatch, tmp_pat
     assert decision.goal
     assert decision.expression is not None
     assert decision.skills[0].name == "wave"
-    assert decision.actions[0].name == "set_face"
+    assert decision.actions == []

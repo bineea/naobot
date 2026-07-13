@@ -1,16 +1,16 @@
 #!/bin/sh
 
-if command -v python >/dev/null 2>&1; then
-  exec python tools/check_prd_sync.py
+if [ -x .venv/Scripts/python.exe ]; then
+  exec .venv/Scripts/python.exe tools/check_prd_sync.py
 fi
 
-if command -v python3 >/dev/null 2>&1; then
-  exec python3 tools/check_prd_sync.py
+if [ -x .venv/bin/python ]; then
+  exec .venv/bin/python tools/check_prd_sync.py
 fi
 
 if command -v py >/dev/null 2>&1; then
-  exec py -3 tools/check_prd_sync.py
+  exec py -3.11 tools/check_prd_sync.py
 fi
 
-echo "未找到 Python，无法执行 PRD 一致性检查。" >&2
+echo "未找到项目 Python 3.11 环境，无法执行 PRD 一致性检查。" >&2
 exit 1
