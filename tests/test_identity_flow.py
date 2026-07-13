@@ -6,7 +6,11 @@ import pytest
 from cryptography.fernet import Fernet
 
 from naobot.interaction.orchestrator import CompletedTurn
-from naobot.media.backends import IdentityResult
+from naobot.media.backends import (
+    CosineIdentityMatcher,
+    IdentityResult,
+    OpenCVMediaPipeIdentityFacade,
+)
 from naobot.media.protocol import MediaFrame
 from naobot.media.service import EnrollmentManager
 from naobot.models import Envelope, MessageType
@@ -259,3 +263,135 @@ async def test_runtime_persistence_enrollment_is_atomic_when_sample_insert_fails
     assert people == 0
     assert embeddings == 0
     assert samples == 0
+
+
+@pytest.mark.asyncio
+async def test_enrollment_refreshes_matcher_and_matches_registered_person_immediately(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("NAOBOT_DATA_KEY", Fernet.generate_key().decode("utf-8"))
+    settings = Settings(runtime_dir=tmp_path, robot_id="robot-test")
+    persistence = RuntimePersistence(settings)
+    repository = FaceDataRepository(settings, persistence=persistence)
+    matcher = CosineIdentityMatcher(threshold=0.8)
+    facade = OpenCVMediaPipeIdentityFacade(
+        jpeg_decoder=lambda payload: payload,
+        face_detector=lambda image: [{"embedding_input": image}],
+        embedder=lambda face_input: [0.0, 1.0] if face_input == b"unknown" else [1.0, 0.0],
+        identity_matcher=matcher,
+        match_interval_ms=0,
+    )
+
+    async def refresh() -> None:
+        facade.refresh_embeddings(await repository.list_embeddings(model_name="identity"))
+
+    manager = EnrollmentManager(
+        settings=settings,
+        identity=facade,
+        persistence=persistence,
+        repository=repository,
+        on_identity_changed=refresh,
+    )
+    frames = [
+        MediaFrame.jpeg(f"known-{index}".encode(), timestamp_ms=index, sequence=index)
+        for index in range(1, 6)
+    ]
+    await manager.observe_turn(
+        build_turn(transcript="记住我"),
+        single_person=True,
+        recent_video_frames=frames,
+        now_ms=1_000,
+    )
+    await manager.observe_turn(
+        build_turn(transcript="确认"),
+        single_person=True,
+        recent_video_frames=frames,
+        now_ms=1_100,
+    )
+    completed = await manager.observe_touch(
+        session_id="visitor-1",
+        now_ms=1_200,
+        recent_video_frames=frames,
+    )
+
+    known = facade.identify([MediaFrame.jpeg(b"known-probe", timestamp_ms=2_000, sequence=6)])
+    unknown = facade.identify([MediaFrame.jpeg(b"unknown", timestamp_ms=2_001, sequence=7)])
+    assert completed is not None
+    assert known.person_id == completed["person_id"]
+    assert unknown.person_id is None
+
+
+@pytest.mark.asyncio
+async def test_face_repository_lists_decrypted_embeddings_for_matcher_cache(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("NAOBOT_DATA_KEY", Fernet.generate_key().decode("utf-8"))
+    settings = Settings(runtime_dir=tmp_path, robot_id="robot-test")
+    persistence = RuntimePersistence(settings)
+    repository = FaceDataRepository(settings, persistence=persistence)
+    await repository.upsert_embedding("person-a", [1.0, 0.0], model_name="identity")
+    await repository.upsert_embedding("person-b", [0.0, 1.0], model_name="other")
+
+    embeddings = await repository.list_embeddings(model_name="identity")
+
+    assert embeddings == [{"person_id": "person-a", "embedding": [1.0, 0.0]}]
+
+
+def test_cosine_matcher_treats_low_similarity_as_unknown() -> None:
+    matcher = CosineIdentityMatcher(threshold=0.8)
+    matcher.replace_embeddings(
+        [
+            {"person_id": "person-a", "embedding": [1.0, 0.0]},
+            {"person_id": "person-b", "embedding": [0.0, 1.0]},
+        ]
+    )
+
+    assert matcher([0.99, 0.01]) == ("person-a", pytest.approx(0.9999, abs=0.001))
+    assert matcher([0.7, 0.7]) is None
+
+
+def test_identity_facade_creates_one_embedding_from_exactly_five_frames() -> None:
+    vectors = {
+        b"1": [1.0, 0.0],
+        b"2": [1.0, 0.0],
+        b"3": [1.0, 0.0],
+        b"4": [0.0, 1.0],
+        b"5": [0.0, 1.0],
+    }
+    facade = OpenCVMediaPipeIdentityFacade(
+        jpeg_decoder=lambda payload: payload,
+        face_detector=lambda image: [{"embedding_input": image}],
+        embedder=lambda face_input: vectors[face_input],
+    )
+    frames = [
+        MediaFrame.jpeg(str(index).encode("ascii"), timestamp_ms=index, sequence=index)
+        for index in range(1, 6)
+    ]
+
+    embedding = facade.create_embedding(frames)
+
+    assert embedding == pytest.approx([0.83205, 0.5547], abs=0.0001)
+    with pytest.raises(ValueError, match="exactly 5"):
+        facade.create_embedding(frames[:4])
+
+
+def test_identity_facade_respects_match_interval_and_keeps_unknown_isolated() -> None:
+    calls = []
+    matcher = CosineIdentityMatcher(threshold=0.9)
+    matcher.replace_embeddings([{"person_id": "person-a", "embedding": [1.0, 0.0]}])
+    facade = OpenCVMediaPipeIdentityFacade(
+        jpeg_decoder=lambda payload: payload,
+        face_detector=lambda image: [{"embedding_input": image}],
+        embedder=lambda face_input: calls.append(face_input) or [0.0, 1.0],
+        identity_matcher=matcher,
+        match_interval_ms=1_000,
+    )
+
+    first = facade.identify([MediaFrame.jpeg(b"one", timestamp_ms=1_000, sequence=1)])
+    second = facade.identify([MediaFrame.jpeg(b"two", timestamp_ms=1_500, sequence=2)])
+
+    assert first.person_id is None
+    assert second.person_id is None
+    assert calls == [b"one"]

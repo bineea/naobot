@@ -37,6 +37,8 @@ from naobot.media.protocol import (
     MediaFrameKind,
     MediaHello,
 )
+from naobot.media.service import MediaService
+from naobot.settings import Settings
 
 
 class FakeAsyncClient:
@@ -325,6 +327,39 @@ def test_local_identity_facade_is_callable_with_injected_components() -> None:
 
     assert result.person_id == "person-7"
     assert result.eye_contact_ms == 1_500
+
+
+def test_identity_model_path_is_lazily_assembled_or_clearly_degraded(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("naobot.media.backends.find_spec", lambda _name: object())
+    missing = tmp_path / "missing.onnx"
+
+    degraded = MediaService._build_default_providers(
+        Settings(identity_model_path=str(missing))
+    )
+
+    assert degraded.health["identity"].configured is False
+
+    model_path = tmp_path / "identity.onnx"
+    model_path.write_bytes(b"placeholder")
+    configured = MediaService._build_default_providers(
+        Settings(identity_model_path=str(model_path))
+    )
+
+    assert configured.health["identity"].configured is True
+    assert isinstance(configured.identity, OpenCVMediaPipeIdentityFacade)
+
+
+def test_missing_local_wake_dependency_is_safely_disabled(monkeypatch) -> None:
+    monkeypatch.setattr("naobot.media.backends.find_spec", lambda _name: None)
+
+    providers = MediaService._build_default_providers(
+        Settings(wake_model_path="wake.onnx")
+    )
+
+    assert providers.health["wake_word"].configured is False
 
 
 @pytest.mark.asyncio

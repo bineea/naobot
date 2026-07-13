@@ -50,6 +50,9 @@ class InteractionOrchestrator:
         self.asr = asr
         self.vision = vision
         self.tts = tts
+        self.last_temporal_summary: dict[str, object] | None = None
+        self._last_temporal_summary_at_ms: int | None = None
+        self._last_temporal_payload: bytes | None = None
         self._sync_stats(now_ms=0)
 
     async def observe_audio(self, audio_frames: Sequence[MediaFrame], *, now_ms: int) -> None:
@@ -76,6 +79,7 @@ class InteractionOrchestrator:
         for frame in video_frames:
             self.pipeline.push_video_frame(frame)
         identity = self.identity.identify(video_frames)
+        self._update_temporal_summary(video_frames, identity.vision_summary, now_ms=now_ms)
         snapshot = self.session.snapshot(now_ms=now_ms)
         if not snapshot.active:
             if identity.eye_contact_ms >= self.session.eye_contact_activation_ms:
@@ -86,6 +90,16 @@ class InteractionOrchestrator:
                 )
             elif identity.greeting_detected:
                 self.session.activate_from_greeting(now_ms=now_ms, person_id=identity.person_id)
+        elif (
+            snapshot.person_id is None
+            and identity.person_id is not None
+            and identity.eye_contact_ms >= self.session.eye_contact_activation_ms
+        ):
+            self.session.activate_from_eye_contact(
+                now_ms=now_ms,
+                eye_contact_ms=identity.eye_contact_ms,
+                person_id=identity.person_id,
+            )
         else:
             self.session.mark_activity(now_ms=now_ms)
         self._sync_stats(now_ms=now_ms)
@@ -181,3 +195,42 @@ class InteractionOrchestrator:
         )
         self.pipeline.set_listening(snapshot.listening)
         self.pipeline.set_speaking(snapshot.speaking)
+
+    def _update_temporal_summary(
+        self,
+        video_frames: Sequence[MediaFrame],
+        scene_summary: str,
+        *,
+        now_ms: int,
+    ) -> None:
+        if not video_frames:
+            return
+        interval_ms = max(1, self.settings.temporal_summary_interval_ms)
+        if (
+            self._last_temporal_summary_at_ms is not None
+            and now_ms - self._last_temporal_summary_at_ms < interval_ms
+        ):
+            return
+        payload = video_frames[-1].payload
+        self.last_temporal_summary = {
+            "timestamp_ms": now_ms,
+            "motion_score": self._motion_score(self._last_temporal_payload, payload),
+            "scene_summary": scene_summary or "未检测到稳定场景",
+        }
+        self._last_temporal_summary_at_ms = now_ms
+        self._last_temporal_payload = payload
+
+    @staticmethod
+    def _motion_score(previous: bytes | None, current: bytes) -> float:
+        if previous is None or not previous or not current:
+            return 0.0
+        sample_count = min(len(previous), len(current), 2_048)
+        if sample_count <= 0:
+            return 0.0
+        previous_step = max(1, len(previous) // sample_count)
+        current_step = max(1, len(current) // sample_count)
+        differences = (
+            abs(previous[index * previous_step] - current[index * current_step])
+            for index in range(sample_count)
+        )
+        return round(sum(differences) / (sample_count * 255.0), 4)

@@ -6,7 +6,7 @@ import importlib
 import json
 import os
 import secrets
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -21,15 +21,20 @@ from ..settings import Settings
 from .backends import (
     ASRProvider,
     ASRResult,
+    CompositeWakeWordDetector,
+    CosineIdentityMatcher,
     FasterWhisperASR,
     IdentityProvider,
     IdentityResult,
+    LocalPhraseWakeWordDetector,
     MediaBackendError,
+    OnnxFaceEmbedder,
     OpenAICompatibleASR,
     OpenAICompatibleTTS,
     OpenAICompatibleVisionProvider,
     OpenCVMediaPipeIdentityFacade,
     OpenWakeWordDetector,
+    PCM16VoiceActivityDetector,
     SherpaOnnxTTS,
     TTSProvider,
     TTSResult,
@@ -90,12 +95,14 @@ class EnrollmentManager:
         persistence: RuntimePersistence,
         repository: FaceDataRepository | None = None,
         confirm_window_ms: int = 10_000,
+        on_identity_changed: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.settings = settings
         self.identity = identity
         self.persistence = persistence
         self.repository = repository or FaceDataRepository(settings, persistence=persistence)
         self.confirm_window_ms = confirm_window_ms
+        self._on_identity_changed = on_identity_changed
         self._pending: PendingEnrollment | None = None
         self._last_result: dict[str, Any] = {"state": "idle"}
 
@@ -171,6 +178,8 @@ class EnrollmentManager:
                 for frame in frames
             ],
         )
+        if self._on_identity_changed is not None:
+            await self._on_identity_changed()
         self._pending = None
         return self._set_result("completed", person_id=person_id)
 
@@ -288,6 +297,7 @@ class MediaService:
         enrollment_manager: EnrollmentManager | None = None,
         provider_health: dict[str, ProviderHealth] | None = None,
         clock: Callable[[], int] | None = None,
+        vad: PCM16VoiceActivityDetector | None = None,
     ) -> None:
         self.settings = settings
         self.agent = agent
@@ -302,6 +312,12 @@ class MediaService:
             video_queue_limit=settings.media_video_queue_limit,
             audio_queue_limit=settings.media_audio_queue_limit,
         )
+        self.vad = vad
+        if self.vad is None and settings.local_vad_enabled:
+            self.vad = PCM16VoiceActivityDetector(
+                rms_threshold=settings.vad_rms_threshold,
+                end_silence_ms=settings.vad_end_silence_ms,
+            )
         if all(provider is None for provider in (wake_word, identity, asr, vision, tts)):
             providers = self._build_default_providers(settings)
             self.wake_word = providers.wake_word
@@ -341,10 +357,15 @@ class MediaService:
             "persistence",
             RuntimePersistence(settings),
         )
+        self.face_repository = FaceDataRepository(settings, persistence=self.persistence)
+        self._identity_cache_loaded = False
+        self._identity_cache_lock = asyncio.Lock()
         self.enrollment = enrollment_manager or EnrollmentManager(
             settings=settings,
             identity=self.identity,
             persistence=self.persistence,
+            repository=self.face_repository,
+            on_identity_changed=self._refresh_identity_cache,
         )
         self.orchestrator = InteractionOrchestrator(
             settings=settings,
@@ -368,6 +389,8 @@ class MediaService:
         self._connections = 0
         self._current_boot_id: str | None = None
         self._connection_lock = asyncio.Lock()
+        initial_snapshot = self.session.snapshot(now_ms=self._clock())
+        self._tracked_session_id = initial_snapshot.session_id if initial_snapshot.active else None
 
     def attach(self, *, robot_hub, dashboard_hub=None) -> None:
         self.robot_hub = robot_hub
@@ -434,6 +457,7 @@ class MediaService:
     async def delete_person(self, person_id: str) -> None:
         await self.runtime_registry.reset_person_runtime(person_id)
         await self.persistence.delete_person(person_id)
+        await self._refresh_identity_cache()
 
     async def cancel_enrollment(self) -> dict[str, Any]:
         return await self.enrollment.cancel()
@@ -452,6 +476,11 @@ class MediaService:
             "current_person": stats["current_person"],
             "current_session": stats["current_session"],
             "session_trigger": stats["session_trigger"],
+            "last_temporal_summary": (
+                dict(self.orchestrator.last_temporal_summary)
+                if self.orchestrator.last_temporal_summary is not None
+                else None
+            ),
             "enrollment": self.enrollment.status(),
             "provider_status": {
                 "status": status,
@@ -531,18 +560,28 @@ class MediaService:
 
     async def _handle_frame(self, frame: MediaFrame) -> None:
         current_ms = self._clock()
+        await self._sync_guest_runtime(current_ms)
         if frame.kind.name == "JPEG":
+            await self._ensure_identity_cache()
             await self.orchestrator.observe_video([frame], now_ms=current_ms)
+            await self._sync_guest_runtime(current_ms)
             return
         if frame.kind.name != "AUDIO_PCM16":
             await self._send_media_error("INVALID_MEDIA_KIND", f"不支持的媒体帧类型 {frame.kind.name}")
             return
+        if self.vad is not None:
+            frame = self.vad.annotate(frame)
         await self.orchestrator.observe_audio([frame], now_ms=current_ms)
-        self._audio_turn.append(frame)
+        await self._sync_guest_runtime(current_ms)
+        if frame.is_speech or self._audio_turn:
+            self._audio_turn.append(frame)
+            self._audio_turn = self._audio_turn[-self.settings.media_audio_queue_limit :]
         if not frame.is_end_of_utterance:
             return
         audio_turn = list(self._audio_turn)
         self._audio_turn.clear()
+        if not audio_turn:
+            return
         turn = await self.orchestrator.complete_turn(
             audio_frames=audio_turn,
             video_frames=self.pipeline.video_window()[-5:],
@@ -567,6 +606,39 @@ class MediaService:
         if self.robot_hub is not None:
             await self.robot_hub.send_intent(intent)
         await self._speak_intent_text(intent, current_ms)
+
+    async def _ensure_identity_cache(self) -> None:
+        if self._identity_cache_loaded:
+            return
+        async with self._identity_cache_lock:
+            if self._identity_cache_loaded:
+                return
+            await self._refresh_identity_cache()
+
+    async def _refresh_identity_cache(self) -> None:
+        refresh = getattr(self.identity, "refresh_embeddings", None)
+        if not callable(refresh):
+            self._identity_cache_loaded = True
+            return
+        if not (self.settings.data_key or os.getenv("NAOBOT_DATA_KEY")):
+            refresh([])
+            self._identity_cache_loaded = True
+            return
+        embeddings = await self.face_repository.list_embeddings(model_name="identity")
+        refresh(embeddings)
+        self._identity_cache_loaded = True
+
+    async def _sync_guest_runtime(self, current_ms: int) -> None:
+        snapshot = self.session.snapshot(now_ms=current_ms)
+        current_session_id = snapshot.session_id if snapshot.active else None
+        expired_session_id = self._tracked_session_id
+        if (
+            expired_session_id is not None
+            and expired_session_id != current_session_id
+            and expired_session_id.lower().startswith(("visitor", "guest"))
+        ):
+            await self.runtime_registry.destroy_guest_runtime(expired_session_id)
+        self._tracked_session_id = current_session_id
 
     async def _emit_touch_intent(self, *, session_id: str) -> None:
         event = Envelope(
@@ -610,22 +682,40 @@ class MediaService:
 
     @staticmethod
     def _build_default_providers(settings: Settings) -> MediaProviders:
+        wake_providers: list[WakeWordProvider] = []
         if settings.wake_model_path:
             try:
-                wake_word: WakeWordProvider = OpenWakeWordDetector(
-                    model_factory=lambda: importlib.import_module("openwakeword").Model()
+                wake_providers.append(
+                    OpenWakeWordDetector(model_path=settings.wake_model_path)
                 )
-                wake_health = ProviderHealth("wake_word", True, "local")
             except RuntimeError:
-                wake_word = NullWakeWordProvider()
-                wake_health = ProviderHealth("wake_word", False, "local")
-        else:
+                pass
+        if settings.local_phrase_model:
+            try:
+                wake_providers.append(
+                    LocalPhraseWakeWordDetector(model_name=settings.local_phrase_model)
+                )
+            except RuntimeError:
+                pass
+        if not wake_providers:
             wake_word = NullWakeWordProvider()
             wake_health = ProviderHealth("wake_word", False, "local")
+        elif len(wake_providers) == 1:
+            wake_word = wake_providers[0]
+            wake_health = ProviderHealth("wake_word", True, "local")
+        else:
+            wake_word = CompositeWakeWordDetector(wake_providers)
+            wake_health = ProviderHealth("wake_word", True, "local")
 
         if settings.identity_model_path:
             try:
-                identity = OpenCVMediaPipeIdentityFacade()
+                identity = OpenCVMediaPipeIdentityFacade(
+                    embedder=OnnxFaceEmbedder(settings.identity_model_path),
+                    identity_matcher=CosineIdentityMatcher(
+                        threshold=settings.identity_match_threshold
+                    ),
+                    match_interval_ms=settings.identity_match_interval_ms,
+                )
                 identity_health = ProviderHealth("identity", True, "local")
             except RuntimeError:
                 identity = NullIdentityProvider()

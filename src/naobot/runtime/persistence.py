@@ -580,6 +580,37 @@ class FaceDataRepository:
         payload = json.loads(fernet.decrypt(row[0]).decode("utf-8"))
         return list(payload["embedding"])
 
+    async def list_embeddings(self, *, model_name: str | None = None) -> list[dict[str, Any]]:
+        fernet = self._fernet()
+        await self.persistence.initialize()
+        query = """
+            SELECT person_id, embedding_ciphertext
+            FROM face_embeddings
+            WHERE robot_id = ?
+        """
+        params: list[Any] = [self.settings.robot_id]
+        if model_name:
+            query += " AND model_name = ?"
+            params.append(model_name)
+        query += " ORDER BY person_id ASC, updated_at DESC"
+        async with aiosqlite.connect(self.persistence.db_path) as db:
+            async with db.execute(query, params) as cursor:
+                rows = await cursor.fetchall()
+        embeddings: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for person_id, ciphertext in rows:
+            if person_id in seen:
+                continue
+            payload = json.loads(fernet.decrypt(ciphertext).decode("utf-8"))
+            embeddings.append(
+                {
+                    "person_id": person_id,
+                    "embedding": [float(value) for value in payload["embedding"]],
+                }
+            )
+            seen.add(person_id)
+        return embeddings
+
     async def add_sample(
         self,
         person_id: str,

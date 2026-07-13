@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from agentscope.state import AgentState
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -10,9 +11,18 @@ from starlette.websockets import WebSocketDisconnect
 from naobot.agent import NaobotAgent
 from naobot.interaction.session import InteractionSession
 from naobot.llm import RuleBasedLLMClient
-from naobot.media.backends import ASRResult, IdentityResult, TTSResult, VisionResult, WakeWordResult
+from naobot.media.backends import (
+    ASRResult,
+    IdentityResult,
+    LocalPhraseWakeWordDetector,
+    TTSResult,
+    VisionResult,
+    WakeWordResult,
+)
 from naobot.media.protocol import MediaFrame, MediaFrameKind, MediaHello
 from naobot.media.service import MediaHub, MediaService
+from naobot.models import Envelope, MessageType
+from naobot.runtime.registry import RuntimeRegistry
 from naobot.server import create_app
 from naobot.settings import Settings
 
@@ -111,6 +121,38 @@ class StepClock:
 
     def __call__(self) -> int:
         return self.current_ms
+
+
+class QuietWakeWord:
+    def detect(self, _frames):
+        return WakeWordResult()
+
+
+class PassiveIdentity:
+    def identify(self, _frames):
+        return IdentityResult(person_id=None, eye_contact_ms=0, vision_summary="未检测到人脸")
+
+
+class CountingVision(FakeVision):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def summarize(self, frames):
+        self.calls += 1
+        return await super().summarize(frames)
+
+
+class CountingAgent:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def create_intent(self, event, media_blocks=None):
+        self.calls += 1
+        return Envelope(
+            type=MessageType.INTENT,
+            session_id=event.session_id,
+            payload={"text": ""},
+        )
 
 
 def make_media_client(tmp_path, *, settings: Settings | None = None):
@@ -399,3 +441,148 @@ async def test_media_session_time_uses_host_clock_for_tts_resume_and_enrollment(
     await media_service._handle_control_json('{"kind":"touch_head"}')
 
     assert any(item.get("kind") == "enrollment" and item.get("status") == "completed" for item in sent_json)
+
+
+@pytest.mark.asyncio
+async def test_media_service_never_calls_cloud_or_agent_before_activation(tmp_path) -> None:
+    settings = Settings(runtime_dir=tmp_path)
+    agent = CountingAgent()
+    asr = FakeASR()
+    vision = CountingVision()
+    service = MediaService(
+        settings=settings,
+        agent=agent,
+        wake_word=QuietWakeWord(),
+        identity=PassiveIdentity(),
+        asr=asr,
+        vision=vision,
+        tts=FakeTTS(),
+    )
+
+    await service._handle_frame(
+        MediaFrame.audio_pcm16(b"speech", timestamp_ms=100, sequence=1, flags=0x3)
+    )
+
+    assert asr.calls == 0
+    assert vision.calls == 0
+    assert agent.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_host_vad_does_not_accumulate_silent_audio_before_speech(tmp_path) -> None:
+    service = MediaService(
+        settings=Settings(runtime_dir=tmp_path, vad_rms_threshold=500),
+        agent=CountingAgent(),
+        wake_word=QuietWakeWord(),
+        identity=PassiveIdentity(),
+        asr=FakeASR(),
+        vision=CountingVision(),
+        tts=FakeTTS(),
+    )
+
+    for sequence in range(1, 101):
+        await service._handle_frame(
+            MediaFrame.audio_pcm16(
+                b"\x00\x00" * 160,
+                timestamp_ms=sequence * 10,
+                sequence=sequence,
+            )
+        )
+
+    assert service._audio_turn == []
+
+
+@pytest.mark.asyncio
+async def test_local_greeting_activates_before_cloud_turn(tmp_path) -> None:
+    settings = Settings(runtime_dir=tmp_path)
+    agent = CountingAgent()
+    asr = FakeASR()
+    vision = CountingVision()
+    wake = LocalPhraseWakeWordDetector(transcriber=lambda _frames: "你好，小龟")
+    service = MediaService(
+        settings=settings,
+        agent=agent,
+        wake_word=wake,
+        identity=PassiveIdentity(),
+        asr=asr,
+        vision=vision,
+        tts=FakeTTS(),
+    )
+
+    await service._handle_frame(
+        MediaFrame.audio_pcm16(b"hello", timestamp_ms=100, sequence=1, flags=0x1)
+    )
+    assert asr.calls == 0
+    await service._handle_frame(
+        MediaFrame.audio_pcm16(b"end", timestamp_ms=120, sequence=2, flags=0x3)
+    )
+
+    snapshot = service.session.snapshot(now_ms=120)
+    assert snapshot.active is True
+    assert snapshot.session_trigger == "greeting"
+    assert asr.calls == 1
+    assert vision.calls == 1
+    assert agent.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_media_status_exposes_ram_only_temporal_summary(tmp_path, monkeypatch) -> None:
+    def reject_media_write(*_args, **_kwargs):
+        raise AssertionError("环境感知媒体不应落盘")
+
+    monkeypatch.setattr("pathlib.Path.write_bytes", reject_media_write)
+    settings = Settings(runtime_dir=tmp_path, temporal_summary_interval_ms=1_000)
+    service = MediaService(
+        settings=settings,
+        agent=CountingAgent(),
+        wake_word=QuietWakeWord(),
+        identity=PassiveIdentity(),
+        asr=FakeASR(),
+        vision=CountingVision(),
+        tts=FakeTTS(),
+        clock=StepClock(1_000),
+    )
+
+    await service._handle_frame(MediaFrame.jpeg(b"jpeg", timestamp_ms=1, sequence=1))
+
+    summary = service.status()["last_temporal_summary"]
+    assert summary["timestamp_ms"] == 1_000
+    assert summary["scene_summary"] == "未检测到人脸"
+    assert not list(tmp_path.glob("*.jpg"))
+    assert not list(tmp_path.glob("*.pcm"))
+
+
+@pytest.mark.asyncio
+async def test_expired_visitor_session_destroys_guest_runtime(tmp_path) -> None:
+    clock = StepClock(1_000)
+    settings = Settings(runtime_dir=tmp_path, session_idle_ms=10)
+    registry = RuntimeRegistry(settings)
+    session = InteractionSession(session_idle_ms=10)
+    session.activate_from_touch(now_ms=1_000, person_id=None)
+    visitor_id = session.snapshot(now_ms=1_000).session_id
+    assert visitor_id is not None
+    await registry.save_state(
+        visitor_id,
+        "primary",
+        AgentState(session_id="guest-runtime"),
+        is_guest=True,
+    )
+    service = MediaService(
+        settings=settings,
+        agent=CountingAgent(),
+        session=session,
+        wake_word=QuietWakeWord(),
+        identity=PassiveIdentity(),
+        asr=FakeASR(),
+        vision=CountingVision(),
+        tts=FakeTTS(),
+        runtime_registry=registry,
+        clock=clock,
+    )
+    assert registry.loaded_count() == 1
+
+    clock.set(1_011)
+    await service._handle_frame(MediaFrame.jpeg(b"jpeg", timestamp_ms=10, sequence=1))
+
+    assert service.session.snapshot(now_ms=1_011).active is False
+    assert registry.loaded_count() == 0

@@ -31,6 +31,13 @@ class Settings:
     media_audio_window_ms: int = 15000
     media_video_queue_limit: int = 20
     media_audio_queue_limit: int = 100
+    local_vad_enabled: bool = True
+    vad_rms_threshold: float = 500.0
+    vad_end_silence_ms: int = 400
+    local_phrase_model: str | None = None
+    temporal_summary_interval_ms: int = 1000
+    identity_match_threshold: float = 0.78
+    identity_match_interval_ms: int = 1000
     asr_endpoint: str | None = None
     asr_model: str | None = None
     asr_api_key: str | None = None
@@ -89,6 +96,20 @@ class Settings:
             media_audio_window_ms=int(os.getenv("NAOBOT_MEDIA_AUDIO_WINDOW_MS", "15000")),
             media_video_queue_limit=int(os.getenv("NAOBOT_MEDIA_VIDEO_QUEUE_LIMIT", "20")),
             media_audio_queue_limit=int(os.getenv("NAOBOT_MEDIA_AUDIO_QUEUE_LIMIT", "100")),
+            local_vad_enabled=os.getenv("NAOBOT_LOCAL_VAD_ENABLED", "true").lower()
+            in {"1", "true", "yes", "on"},
+            vad_rms_threshold=float(os.getenv("NAOBOT_VAD_RMS_THRESHOLD", "500")),
+            vad_end_silence_ms=int(os.getenv("NAOBOT_VAD_END_SILENCE_MS", "400")),
+            local_phrase_model=os.getenv("NAOBOT_LOCAL_PHRASE_MODEL"),
+            temporal_summary_interval_ms=int(
+                os.getenv("NAOBOT_TEMPORAL_SUMMARY_INTERVAL_MS", "1000")
+            ),
+            identity_match_threshold=float(
+                os.getenv("NAOBOT_IDENTITY_MATCH_THRESHOLD", "0.78")
+            ),
+            identity_match_interval_ms=int(
+                os.getenv("NAOBOT_IDENTITY_MATCH_INTERVAL_MS", "1000")
+            ),
             asr_endpoint=os.getenv("NAOBOT_ASR_ENDPOINT"),
             asr_model=os.getenv("NAOBOT_ASR_MODEL"),
             asr_api_key=os.getenv("NAOBOT_ASR_API_KEY"),
