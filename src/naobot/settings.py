@@ -31,6 +31,7 @@ class Settings:
     media_audio_window_ms: int = 15000
     media_video_queue_limit: int = 20
     media_audio_queue_limit: int = 100
+    media_hello_timeout_seconds: float = 5.0
     local_vad_enabled: bool = True
     vad_rms_threshold: float = 500.0
     vad_end_silence_ms: int = 400
@@ -97,6 +98,9 @@ class Settings:
             media_audio_window_ms=int(os.getenv("NAOBOT_MEDIA_AUDIO_WINDOW_MS", "15000")),
             media_video_queue_limit=int(os.getenv("NAOBOT_MEDIA_VIDEO_QUEUE_LIMIT", "20")),
             media_audio_queue_limit=int(os.getenv("NAOBOT_MEDIA_AUDIO_QUEUE_LIMIT", "100")),
+            media_hello_timeout_seconds=float(
+                os.getenv("NAOBOT_MEDIA_HELLO_TIMEOUT_SECONDS", "5.0")
+            ),
             local_vad_enabled=os.getenv("NAOBOT_LOCAL_VAD_ENABLED", "true").lower()
             in {"1", "true", "yes", "on"},
             vad_rms_threshold=float(os.getenv("NAOBOT_VAD_RMS_THRESHOLD", "500")),

@@ -439,10 +439,13 @@ def test_local_media_adapters_fail_with_clear_runtime_error_when_optional_deps_m
 
 
 def test_settings_from_env_includes_media_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert Settings().media_hello_timeout_seconds == 5.0
+
     monkeypatch.setenv("NAOBOT_DEVICE_TOKEN", "device-token")
     monkeypatch.setenv("NAOBOT_SESSION_IDLE_MS", "45000")
     monkeypatch.setenv("NAOBOT_VIDEO_EVENT_FPS", "18")
     monkeypatch.setenv("NAOBOT_MEDIA_AUDIO_QUEUE_LIMIT", "88")
+    monkeypatch.setenv("NAOBOT_MEDIA_HELLO_TIMEOUT_SECONDS", "1.25")
     monkeypatch.setenv("NAOBOT_ASR_ENDPOINT", "https://asr.example.com/v1")
     monkeypatch.setenv("NAOBOT_TTS_MODEL", "tts-1")
     monkeypatch.setenv("NAOBOT_VISION_API_KEY", "vision-key")
@@ -458,6 +461,7 @@ def test_settings_from_env_includes_media_defaults(monkeypatch: pytest.MonkeyPat
     assert settings.media_audio_window_ms == 15_000
     assert settings.media_video_queue_limit == 20
     assert settings.media_audio_queue_limit == 88
+    assert settings.media_hello_timeout_seconds == 1.25
     assert settings.asr_endpoint == "https://asr.example.com/v1"
     assert settings.tts_model == "tts-1"
     assert settings.vision_api_key == "vision-key"

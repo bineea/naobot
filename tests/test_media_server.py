@@ -204,6 +204,51 @@ def make_media_client(tmp_path, *, settings: Settings | None = None):
     return TestClient(create_app(settings, agent, media_service=media_service)), agent, media_service, llm, asr
 
 
+class ControlledMediaWebSocket:
+    def __init__(self, hello: dict | None = None) -> None:
+        self.incoming = asyncio.Queue()
+        if hello is not None:
+            self.incoming.put_nowait({"text": json.dumps(hello)})
+        self.accepted = asyncio.Event()
+        self.outcome = asyncio.Event()
+        self.sent_json = []
+        self.close_codes = []
+
+    async def accept(self) -> None:
+        self.accepted.set()
+
+    async def receive(self):
+        return await self.incoming.get()
+
+    async def send_json(self, payload) -> None:
+        self.sent_json.append(payload)
+        if payload.get("kind") == "media_ready":
+            self.outcome.set()
+
+    async def send_bytes(self, _payload) -> None:
+        return None
+
+    async def close(self, code: int) -> None:
+        self.close_codes.append(code)
+        self.outcome.set()
+
+    def disconnect(self) -> None:
+        self.incoming.put_nowait({"type": "websocket.disconnect", "code": 1000})
+
+
+def valid_media_hello(device_id: str, *, token: str = "") -> dict:
+    return {
+        "device_id": device_id,
+        "token": token,
+        "boot_id": f"boot-{device_id}",
+        "capabilities": MediaHello(
+            device_id=device_id,
+            token=token,
+            boot_id=f"boot-{device_id}",
+        ).capabilities,
+    }
+
+
 def receive_until_type(websocket, message_type: str, max_messages: int = 20):
     for _ in range(max_messages):
         message = websocket.receive_json()
@@ -250,6 +295,111 @@ def test_media_websocket_rejects_invalid_token_with_1008(tmp_path) -> None:
             websocket.receive_json()
 
     assert exc.value.code == 1008
+
+
+@pytest.mark.asyncio
+async def test_silent_unauthenticated_connection_does_not_occupy_authenticated_slot(
+    tmp_path,
+) -> None:
+    settings = Settings(runtime_dir=tmp_path, media_hello_timeout_seconds=0.1)
+    _client, _agent, service, _llm, _asr = make_media_client(tmp_path, settings=settings)
+    silent = ControlledMediaWebSocket()
+    authenticated = ControlledMediaWebSocket(valid_media_hello("authenticated"))
+
+    silent_task = asyncio.create_task(service.handle_websocket(silent))  # type: ignore[arg-type]
+    await silent.accepted.wait()
+
+    assert service.status()["connections"] == 0
+    assert service.hub.websocket is None
+
+    authenticated_task = asyncio.create_task(
+        service.handle_websocket(authenticated)  # type: ignore[arg-type]
+    )
+    await asyncio.wait_for(authenticated.outcome.wait(), timeout=0.5)
+
+    assert authenticated.sent_json[0]["kind"] == "media_ready"
+    assert service.hub.websocket is authenticated
+    assert service.status()["connections"] == 1
+
+    await asyncio.wait_for(silent_task, timeout=0.5)
+    assert silent.close_codes == [1008]
+    assert service.hub.websocket is authenticated
+    assert service.status()["connections"] == 1
+
+    authenticated.disconnect()
+    await authenticated_task
+
+
+@pytest.mark.asyncio
+async def test_media_hello_timeout_closes_with_1008(tmp_path) -> None:
+    settings = Settings(runtime_dir=tmp_path, media_hello_timeout_seconds=0.01)
+    _client, _agent, service, _llm, _asr = make_media_client(tmp_path, settings=settings)
+    silent = ControlledMediaWebSocket()
+
+    await asyncio.wait_for(
+        service.handle_websocket(silent),  # type: ignore[arg-type]
+        timeout=0.5,
+    )
+
+    assert silent.close_codes == [1008]
+    assert service.hub.websocket is None
+    assert service.status()["connections"] == 0
+
+
+@pytest.mark.asyncio
+async def test_invalid_token_does_not_disconnect_authenticated_connection(tmp_path) -> None:
+    settings = Settings(
+        runtime_dir=tmp_path,
+        device_token="expected-token",
+        media_hello_timeout_seconds=0.1,
+    )
+    _client, _agent, service, _llm, _asr = make_media_client(tmp_path, settings=settings)
+    authenticated = ControlledMediaWebSocket(
+        valid_media_hello("authenticated", token="expected-token")
+    )
+    rejected = ControlledMediaWebSocket(valid_media_hello("rejected", token="wrong-token"))
+
+    authenticated_task = asyncio.create_task(
+        service.handle_websocket(authenticated)  # type: ignore[arg-type]
+    )
+    await asyncio.wait_for(authenticated.outcome.wait(), timeout=0.5)
+    await service.handle_websocket(rejected)  # type: ignore[arg-type]
+
+    assert rejected.close_codes == [1008]
+    assert service.hub.websocket is authenticated
+    assert service.status()["connections"] == 1
+
+    authenticated.disconnect()
+    await authenticated_task
+
+
+@pytest.mark.asyncio
+async def test_concurrent_authenticated_connections_allow_exactly_one(tmp_path) -> None:
+    settings = Settings(runtime_dir=tmp_path, media_hello_timeout_seconds=0.1)
+    _client, _agent, service, _llm, _asr = make_media_client(tmp_path, settings=settings)
+    sockets = [
+        ControlledMediaWebSocket(valid_media_hello("device-1")),
+        ControlledMediaWebSocket(valid_media_hello("device-2")),
+    ]
+
+    tasks = [
+        asyncio.create_task(service.handle_websocket(socket))  # type: ignore[arg-type]
+        for socket in sockets
+    ]
+    await asyncio.gather(
+        *(asyncio.wait_for(socket.outcome.wait(), timeout=0.5) for socket in sockets)
+    )
+
+    accepted = [socket for socket in sockets if socket.sent_json]
+    rejected = [socket for socket in sockets if socket.close_codes]
+    assert len(accepted) == 1
+    assert len(rejected) == 1
+    assert rejected[0].close_codes == [1013]
+    assert service.hub.websocket is accepted[0]
+    assert service.status()["connections"] == 1
+
+    accepted[0].disconnect()
+    await asyncio.gather(*tasks)
 
 
 def test_media_turn_streams_tts_and_forwards_intent(tmp_path) -> None:

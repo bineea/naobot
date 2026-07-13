@@ -403,15 +403,17 @@ class MediaService:
     async def handle_websocket(self, websocket: WebSocket) -> None:
         await websocket.accept()
         worker: asyncio.Task | None = None
-        async with self._connection_lock:
-            if self.hub.websocket is not None:
-                await websocket.close(code=1013)
-                return
-            await self.hub.connect(websocket)
-            self._connections += 1
-            self.pipeline.update_connection(True)
+        registered = False
         try:
             hello = await self._receive_hello(websocket)
+            async with self._connection_lock:
+                if self.hub.websocket is not None:
+                    await websocket.close(code=1013)
+                    return
+                await self.hub.connect(websocket)
+                self._connections += 1
+                self.pipeline.update_connection(True)
+                registered = True
             self._current_boot_id = str(hello.get("boot_id") or "")
             self.pipeline.reset_stream()
             self._audio_turn.clear()
@@ -440,15 +442,17 @@ class MediaService:
         except WebSocketDisconnect:
             pass
         finally:
-            if worker is not None:
-                worker.cancel()
-                await asyncio.gather(worker, return_exceptions=True)
-            if self._worker is worker:
-                self._worker = None
-            await self._destroy_tracked_guest_runtime()
-            self.hub.disconnect(websocket)
-            self._connections = max(0, self._connections - 1)
-            self.pipeline.update_connection(self._connections > 0)
+            if registered:
+                if worker is not None:
+                    worker.cancel()
+                    await asyncio.gather(worker, return_exceptions=True)
+                if self._worker is worker:
+                    self._worker = None
+                await self._destroy_tracked_guest_runtime()
+                async with self._connection_lock:
+                    self.hub.disconnect(websocket)
+                    self._connections = max(0, self._connections - 1)
+                    self.pipeline.update_connection(self._connections > 0)
 
     async def list_people(self) -> list[dict[str, Any]]:
         return await self.persistence.list_people()
@@ -496,7 +500,14 @@ class MediaService:
         }
 
     async def _receive_hello(self, websocket: WebSocket) -> dict[str, Any]:
-        message = await websocket.receive()
+        try:
+            message = await asyncio.wait_for(
+                websocket.receive(),
+                timeout=self.settings.media_hello_timeout_seconds,
+            )
+        except TimeoutError as exc:
+            await websocket.close(code=1008)
+            raise WebSocketDisconnect(code=1008) from exc
         if "text" not in message:
             await websocket.close(code=1008)
             raise WebSocketDisconnect(code=1008)
