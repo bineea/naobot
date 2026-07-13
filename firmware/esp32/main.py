@@ -8,6 +8,7 @@ try:
 except ImportError:
     import time
 
+from comm.connection_worker import ConnectionWorker
 from comm.websocket_client import WebSocketClient
 from comm.wifi_config import connect_wifi_async
 from config import (
@@ -76,6 +77,15 @@ async def sleep_to_safety_deadline(
     if delay_ms:
         await sleeper(delay_ms)
     return delay_ms
+
+
+async def wait_for_connection(worker, poll_interval_ms=5):
+    worker.start()
+    while True:
+        done, transport = worker.poll()
+        if done:
+            return transport
+        await sleep_ms(poll_interval_ms)
 
 
 class FirmwareProtocol:
@@ -237,14 +247,15 @@ def check_brain_timeout(state, display, motion):
 
 
 async def network_loop(display, power, imu, actions, safety, protocol, state, motion, reflex):
+    connection_worker = ConnectionWorker(lambda: WebSocketClient(AGENT_WS_URL))
     while True:
         if not await connect_wifi_async(WIFI_SSID, WIFI_PASSWORD, WIFI_CONNECT_TIMEOUT_MS):
             display.show_status("wifi offline")
             await sleep_ms(WS_RECONNECT_DELAY_MS)
             continue
 
-        ws = WebSocketClient(AGENT_WS_URL)
-        if not ws.connect():
+        ws = await wait_for_connection(connection_worker)
+        if ws is None:
             display.show_status("agent offline")
             await sleep_ms(WS_RECONNECT_DELAY_MS)
             continue

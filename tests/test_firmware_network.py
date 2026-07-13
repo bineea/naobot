@@ -1,6 +1,10 @@
+import asyncio
 import importlib
 import sys
+import threading
 from pathlib import Path
+
+import pytest
 
 FIRMWARE_ROOT = Path(__file__).resolve().parents[1] / "firmware" / "esp32"
 if str(FIRMWARE_ROOT) not in sys.path:
@@ -109,6 +113,41 @@ def test_parse_ws_url_rejects_wss() -> None:
         assert "ws://" in str(exc)
     else:
         raise AssertionError("wss url should be rejected")
+
+
+@pytest.mark.asyncio
+async def test_blocking_connection_worker_does_not_stall_safety_ticks() -> None:
+    connection_worker = importlib.import_module("comm.connection_worker")
+    connect_started = threading.Event()
+    release_connect = threading.Event()
+
+    class BlockingTransport:
+        connected = False
+
+        def connect(self):
+            connect_started.set()
+            release_connect.wait(timeout=1)
+            self.connected = True
+            return True
+
+    transport = BlockingTransport()
+    worker = connection_worker.ConnectionWorker(lambda: transport)
+    connection_task = asyncio.create_task(
+        firmware_main.wait_for_connection(worker, poll_interval_ms=1)
+    )
+
+    while not connect_started.is_set():
+        await asyncio.sleep(0)
+    safety_ticks = 0
+    for _ in range(6):
+        safety_ticks += 1
+        await asyncio.sleep(0.005)
+
+    assert safety_ticks == 6
+    assert connection_task.done() is False
+    release_connect.set()
+    result = await asyncio.wait_for(connection_task, timeout=1)
+    assert result is transport
 
 
 def test_websocket_text_frame_is_masked() -> None:

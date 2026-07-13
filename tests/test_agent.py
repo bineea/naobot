@@ -86,6 +86,8 @@ def test_heartbeat_updates_control_state(tmp_path) -> None:
             "media_queue": 3,
             "media_dropped": 4,
             "psram_free": 7_654_321,
+            "local_loop_interval_ms": 51,
+            "local_loop_overrun_ms": 3,
         },
     )
 
@@ -108,11 +110,15 @@ def test_heartbeat_updates_control_state(tmp_path) -> None:
     assert agent.state.media_queue == 3
     assert agent.state.media_dropped == 4
     assert agent.state.psram_free == 7_654_321
+    assert agent.state.local_loop_interval_ms == 51
+    assert agent.state.local_loop_overrun_ms == 3
     assert agent.status()["robot"]["camera_fps"] == 10
     assert agent.status()["robot"]["audio_state"] == "listening"
     assert agent.status()["robot"]["media_queue"] == 3
     assert agent.status()["robot"]["media_dropped"] == 4
     assert agent.status()["robot"]["psram_free"] == 7_654_321
+    assert agent.status()["robot"]["local_loop_interval_ms"] == 51
+    assert agent.status()["robot"]["local_loop_overrun_ms"] == 3
 
 
 def test_robot_link_becomes_stale_after_heartbeat_timeout(tmp_path) -> None:

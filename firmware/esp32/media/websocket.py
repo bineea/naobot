@@ -36,11 +36,13 @@ except ImportError:
 
 OP_TEXT = 0x1
 OP_BINARY = 0x2
+OP_CONTINUATION = 0x0
 OP_CLOSE = 0x8
 OP_PING = 0x9
 OP_PONG = 0xA
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 DEFAULT_MAX_RX_BYTES = 256 * 1024 + 64
+DEFAULT_MAX_MESSAGE_BYTES = 256 * 1024
 
 
 class _ProtocolError(Exception):
@@ -102,12 +104,14 @@ class MediaWebSocket:
         connect_timeout_sec=MEDIA_SOCKET_CONNECT_TIMEOUT_SEC,
         send_chunk_bytes=MEDIA_SOCKET_SEND_CHUNK_BYTES,
         max_rx_bytes=DEFAULT_MAX_RX_BYTES,
+        max_message_bytes=DEFAULT_MAX_MESSAGE_BYTES,
     ):
         self.url = url
         self.io_timeout_sec = min(io_timeout_sec, 0.01)
         self.connect_timeout_sec = min(connect_timeout_sec, 0.01)
         self.send_chunk_bytes = max(1, min(send_chunk_bytes, 1024))
         self.max_rx_bytes = max(128, max_rx_bytes)
+        self.max_message_bytes = max(1, max_message_bytes)
         self.host, self.port, self.path = parse_ws_url(url)
         self.sock = None
         self.connected = False
@@ -117,6 +121,10 @@ class MediaWebSocket:
         self._tx_mask = None
         self._tx_offset = 0
         self._tx_total = 0
+        self._tx_close_after = False
+        self._control_queue = []
+        self._fragment_opcode = None
+        self._fragment_payload = bytearray()
 
     @property
     def tx_pending(self):
@@ -192,7 +200,7 @@ class MediaWebSocket:
         self._tx_offset = 0
         return self.flush_tx_chunk()
 
-    def _prepare_tx(self, payload, opcode):
+    def _prepare_tx(self, payload, opcode, close_after=False):
         payload = bytes(payload)
         length = len(payload)
         mask = _random_bytes(4)
@@ -210,6 +218,7 @@ class MediaWebSocket:
         self._tx_payload = payload
         self._tx_mask = mask
         self._tx_total = len(header) + length
+        self._tx_close_after = close_after
 
     def flush_tx_chunk(self):
         if not self.tx_pending:
@@ -229,7 +238,12 @@ class MediaWebSocket:
             return False
         self._tx_offset += count
         if self._tx_offset >= self._tx_total:
+            close_after = self._tx_close_after
             self._clear_tx()
+            if close_after:
+                self.close(send_close=False)
+            else:
+                self._promote_control()
         return True
 
     def _tx_chunk(self):
@@ -255,6 +269,13 @@ class MediaWebSocket:
         self._tx_mask = None
         self._tx_offset = 0
         self._tx_total = 0
+        self._tx_close_after = False
+
+    def _promote_control(self):
+        if self.tx_pending or not self._control_queue:
+            return
+        opcode, payload, close_after = self._control_queue.pop(0)
+        self._prepare_tx(payload, opcode, close_after=close_after)
 
     def recv_frame(self):
         if not self.connected or self.sock is None:
@@ -279,17 +300,20 @@ class MediaWebSocket:
                 frame = self._parse_frame()
             if frame is None:
                 return None
-            opcode, payload = frame
+            fin, opcode, payload = frame
             if opcode == OP_CLOSE:
-                self._send_control_now(OP_CLOSE, payload or b"\x03\xe8")
-                self.close(send_close=False)
+                self._send_control_or_queue(
+                    OP_CLOSE,
+                    payload or b"\x03\xe8",
+                    close_after=True,
+                )
                 return None
             if opcode == OP_PING:
-                self._send_control_now(OP_PONG, payload)
+                self._send_control_or_queue(OP_PONG, payload)
                 return None
             if opcode == OP_PONG:
                 return None
-            return opcode, payload
+            return self._handle_data_frame(fin, opcode, payload)
         except _ProtocolError as exc:
             self._close_with_code(exc.close_code)
             return None
@@ -314,12 +338,19 @@ class MediaWebSocket:
         opcode = first & 0x0F
         masked = bool(second & 0x80)
         payload_length = second & 0x7F
-        if rsv or masked or not fin:
+        if rsv or masked:
             raise _ProtocolError(1002)
-        if opcode not in (OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG):
+        if opcode not in (
+            OP_CONTINUATION,
+            OP_TEXT,
+            OP_BINARY,
+            OP_CLOSE,
+            OP_PING,
+            OP_PONG,
+        ):
             raise _ProtocolError(1002)
         is_control = opcode >= 0x8
-        if is_control and payload_length >= 126:
+        if is_control and (not fin or payload_length >= 126):
             raise _ProtocolError(1002)
         offset = 2
         if payload_length == 126:
@@ -343,7 +374,34 @@ class MediaWebSocket:
         del self._rx[:frame_end]
         if opcode == OP_CLOSE and len(payload) == 1:
             raise _ProtocolError(1002)
-        return opcode, payload
+        return fin, opcode, payload
+
+    def _handle_data_frame(self, fin, opcode, payload):
+        if opcode == OP_CONTINUATION:
+            if self._fragment_opcode is None:
+                raise _ProtocolError(1002)
+            if len(self._fragment_payload) + len(payload) > self.max_message_bytes:
+                raise _ProtocolError(1009)
+            self._fragment_payload.extend(payload)
+            if not fin:
+                return None
+            message_opcode = self._fragment_opcode
+            message_payload = bytes(self._fragment_payload)
+            self._clear_fragment()
+            return message_opcode, message_payload
+        if self._fragment_opcode is not None:
+            raise _ProtocolError(1002)
+        if len(payload) > self.max_message_bytes:
+            raise _ProtocolError(1009)
+        if fin:
+            return opcode, payload
+        self._fragment_opcode = opcode
+        self._fragment_payload = bytearray(payload)
+        return None
+
+    def _clear_fragment(self):
+        self._fragment_opcode = None
+        self._fragment_payload = bytearray()
 
     def _encode_frame(self, payload, opcode=OP_TEXT):
         payload = bytes(payload)
@@ -388,16 +446,33 @@ class MediaWebSocket:
         except Exception:
             return False
 
+    def _send_control_or_queue(self, opcode, payload=b"", close_after=False):
+        if self.tx_pending:
+            self._control_queue.append((opcode, bytes(payload), close_after))
+            return True
+        sent = self._send_control_now(opcode, payload)
+        if close_after:
+            self.close(send_close=False)
+        return sent
+
     def _close_with_code(self, code):
-        self._send_control_now(OP_CLOSE, bytes(((code >> 8) & 0xFF, code & 0xFF)))
-        self.close(send_close=False)
+        self._send_control_or_queue(
+            OP_CLOSE,
+            bytes(((code >> 8) & 0xFF, code & 0xFF)),
+            close_after=True,
+        )
 
     def close(self, send_close=True):
         if send_close and self.connected:
+            if self.tx_pending:
+                self._control_queue.append((OP_CLOSE, b"\x03\xe8", True))
+                return
             self._send_control_now(OP_CLOSE, b"\x03\xe8")
         self.connected = False
         self._rx = bytearray()
         self._clear_tx()
+        self._control_queue = []
+        self._clear_fragment()
         if self.sock is not None:
             try:
                 self.sock.close()

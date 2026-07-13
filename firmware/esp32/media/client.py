@@ -10,6 +10,8 @@ try:
 except ImportError:
     import time
 
+from comm.connection_worker import ConnectionWorker
+
 from media.devices import AudioInput, AudioOutput, Camera
 from media.protocol import (
     FLAG_EVENT_BOOST,
@@ -147,6 +149,7 @@ class MediaClient:
         vad=None,
         tts_buffer_limit_bytes=TTS_BUFFER_LIMIT_BYTES,
         tts_playback_timeout_ms=TTS_PLAYBACK_TIMEOUT_MS,
+        connection_worker_factory=ConnectionWorker,
     ):
         self.url = url
         self.device_id = device_id
@@ -157,6 +160,7 @@ class MediaClient:
         self.audio_output = audio_output or AudioOutput()
         self.transport_factory = transport_factory or MediaWebSocket
         self.transport = None
+        self._connection_worker = connection_worker_factory(self._new_transport)
         self.queue = MediaQueue(queue_limit)
         self.vad = vad or EnergyVAD()
         self.tts_buffer_limit_bytes = max(1024, tts_buffer_limit_bytes)
@@ -180,14 +184,16 @@ class MediaClient:
         self._tts_chunks = []
         self._tts_buffered_bytes = 0
         self._tts_end_received = False
-        self._tts_started_ms = None
+        self._tts_last_progress_ms = None
 
     def connect(self):
-        if self.transport is None:
-            self.transport = self.transport_factory(self.url)
-        if not self.transport.connect():
-            self._disconnect()
-            return False
+        return self._poll_connection()
+
+    def _new_transport(self):
+        return self.transport_factory(self.url)
+
+    def _activate_transport(self, transport):
+        self.transport = transport
         hello = {
             "kind": "media_hello",
             "device_id": self.device_id,
@@ -205,7 +211,7 @@ class MediaClient:
         current_ms = now_ms() if current_ms is None else current_ms
         try:
             if self.transport is None or not self.transport.connected:
-                if not self.connect():
+                if not self._poll_connection():
                     return False
             incoming = self.transport.recv_frame()
             if incoming is not None:
@@ -216,7 +222,7 @@ class MediaClient:
             if self._tts_timed_out(current_ms):
                 self._reset_tts()
             elif self._speaking:
-                self._drain_tts_chunk()
+                self._drain_tts_chunk(current_ms)
             else:
                 event_boost = ticks_diff(self.state.get("event_boost_until_ms", 0), current_ms) > 0
                 self.collect(current_ms, event_boost=event_boost)
@@ -229,6 +235,22 @@ class MediaClient:
             self._disconnect()
             self._update_state(current_ms)
             return False
+
+    def _poll_connection(self):
+        done, transport = self._connection_worker.poll()
+        if done:
+            if transport is None:
+                self._disconnect()
+                return False
+            return self._activate_transport(transport)
+        self._connection_worker.start()
+        done, transport = self._connection_worker.poll()
+        if not done:
+            return False
+        if transport is None:
+            self._disconnect()
+            return False
+        return self._activate_transport(transport)
 
     def collect(self, current_ms, event_boost=False, audio_flags=0):
         if self._speaking:
@@ -288,6 +310,7 @@ class MediaClient:
                 self._start_tts(current_ms)
             elif kind == "tts_end":
                 self._tts_end_received = True
+                self._mark_tts_progress(current_ms)
                 self._finish_tts_if_drained()
             return
         if opcode != OP_BINARY:
@@ -303,8 +326,9 @@ class MediaClient:
             return
         self._tts_chunks.append(frame.payload)
         self._tts_buffered_bytes += len(frame.payload)
+        self._mark_tts_progress(current_ms)
 
-    def _drain_tts_chunk(self):
+    def _drain_tts_chunk(self, current_ms):
         if not self._tts_chunks:
             self._finish_tts_if_drained()
             return
@@ -315,6 +339,7 @@ class MediaClient:
             return
         written = min(written, len(chunk))
         self._tts_buffered_bytes -= written
+        self._mark_tts_progress(current_ms)
         remaining = payload[written:]
         if remaining:
             self._tts_chunks[0] = remaining
@@ -327,23 +352,27 @@ class MediaClient:
         self._tts_chunks = []
         self._tts_buffered_bytes = 0
         self._tts_end_received = False
-        self._tts_started_ms = current_ms
+        self._tts_last_progress_ms = current_ms
         self._speaking = True
         self.state["audio_state"] = "speaking"
 
     def _tts_timed_out(self, current_ms):
         return (
             self._speaking
-            and self._tts_started_ms is not None
-            and ticks_diff(current_ms, self._tts_started_ms) >= self.tts_playback_timeout_ms
+            and self._tts_last_progress_ms is not None
+            and ticks_diff(current_ms, self._tts_last_progress_ms)
+            >= self.tts_playback_timeout_ms
         )
+
+    def _mark_tts_progress(self, current_ms):
+        self._tts_last_progress_ms = current_ms
 
     def _reset_tts(self):
         self._speaking = False
         self._tts_chunks = []
         self._tts_buffered_bytes = 0
         self._tts_end_received = False
-        self._tts_started_ms = None
+        self._tts_last_progress_ms = None
         self.state["audio_state"] = (
             "listening" if self.audio_input.available else "unavailable"
         )
@@ -371,7 +400,10 @@ class MediaClient:
 
     def _disconnect(self):
         if self.transport is not None:
-            self.transport.close()
+            try:
+                self.transport.close(send_close=False)
+            except TypeError:
+                self.transport.close()
         self.transport = None
         self.state["media_connected"] = False
         self._reset_tts()

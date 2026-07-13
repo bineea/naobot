@@ -6,6 +6,7 @@ import importlib
 import json
 import struct
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -213,8 +214,51 @@ def decode_client_frame(raw):
     return raw[0] & 0x0F, payload
 
 
+def decode_client_frames(raw):
+    frames = []
+    offset = 0
+    while offset < len(raw):
+        start = offset
+        first, second = raw[offset], raw[offset + 1]
+        offset += 2
+        length = second & 0x7F
+        if length == 126:
+            length = int.from_bytes(raw[offset : offset + 2], "big")
+            offset += 2
+        elif length == 127:
+            length = int.from_bytes(raw[offset : offset + 8], "big")
+            offset += 8
+        assert second & 0x80
+        mask = raw[offset : offset + 4]
+        offset += 4
+        payload = bytes(raw[offset + i] ^ mask[i % 4] for i in range(length))
+        offset += length
+        frames.append((first & 0x0F, payload, offset - start))
+    return frames
+
+
 def pin_number(value):
     return value
+
+
+def wait_for_media_step(client, start_ms=0, timeout_sec=1.0):
+    deadline = time.perf_counter() + timeout_sec
+    current_ms = start_ms
+    while time.perf_counter() < deadline:
+        if client.step(current_ms):
+            return True
+        current_ms += 1
+        time.sleep(0.001)
+    return False
+
+
+def wait_for_media_connection(client, timeout_sec=1.0):
+    deadline = time.perf_counter() + timeout_sec
+    while time.perf_counter() < deadline:
+        if client.connect():
+            return True
+        time.sleep(0.001)
+    return False
 
 
 def test_n16r8_44pin_board_profile_matches_fixed_wiring() -> None:
@@ -515,12 +559,148 @@ def test_media_websocket_handles_partial_recv_ping_and_close_handshake() -> None
     assert sock.closed is True
 
 
+def test_media_websocket_queues_pong_until_large_data_frame_boundary() -> None:
+    sock = ScriptedSocket((server_frame(OP_PING, b"during-send"),), send_limit=64)
+    websocket = MediaWebSocket(
+        "ws://host:8765/ws/media",
+        send_chunk_bytes=128,
+    )
+    websocket.sock = sock
+    websocket.connected = True
+    payload = b"x" * 4096
+
+    assert websocket.send_binary(payload)
+    bytes_before_ping = len(b"".join(sock.sent))
+    assert websocket.recv_frame() is None
+    assert len(b"".join(sock.sent)) == bytes_before_ping
+
+    while websocket.tx_pending:
+        assert websocket.flush_tx_chunk()
+
+    frames = decode_client_frames(b"".join(sock.sent))
+    assert [(opcode, body) for opcode, body, _size in frames] == [
+        (OP_BINARY, payload),
+        (0xA, b"during-send"),
+    ]
+
+
+def test_media_websocket_queues_close_until_large_data_frame_boundary() -> None:
+    close_payload = b"\x03\xe8"
+    sock = ScriptedSocket((server_frame(OP_CLOSE, close_payload),), send_limit=64)
+    websocket = MediaWebSocket(
+        "ws://host:8765/ws/media",
+        send_chunk_bytes=128,
+    )
+    websocket.sock = sock
+    websocket.connected = True
+    payload = b"z" * 4096
+
+    assert websocket.send_binary(payload)
+    assert websocket.recv_frame() is None
+    assert websocket.connected is True
+
+    while websocket.tx_pending:
+        assert websocket.flush_tx_chunk()
+
+    frames = decode_client_frames(b"".join(sock.sent))
+    assert [(opcode, body) for opcode, body, _size in frames] == [
+        (OP_BINARY, payload),
+        (OP_CLOSE, close_payload),
+    ]
+    assert websocket.connected is False
+    assert sock.closed is True
+
+
+def test_media_websocket_queues_local_close_until_large_data_frame_boundary() -> None:
+    sock = ScriptedSocket(send_limit=64)
+    websocket = MediaWebSocket(
+        "ws://host:8765/ws/media",
+        send_chunk_bytes=128,
+    )
+    websocket.sock = sock
+    websocket.connected = True
+    payload = b"l" * 4096
+
+    assert websocket.send_binary(payload)
+    websocket.close()
+    assert websocket.connected is True
+
+    while websocket.tx_pending:
+        assert websocket.flush_tx_chunk()
+
+    frames = decode_client_frames(b"".join(sock.sent))
+    assert [(opcode, body) for opcode, body, _size in frames] == [
+        (OP_BINARY, payload),
+        (OP_CLOSE, b"\x03\xe8"),
+    ]
+    assert websocket.connected is False
+
+
+@pytest.mark.parametrize("opcode", [OP_TEXT, OP_BINARY])
+def test_media_websocket_reassembles_server_fragments_with_interleaved_ping(opcode) -> None:
+    fragments = (
+        server_frame(opcode, b"first-", fin=False)
+        + server_frame(OP_PING, b"keepalive")
+        + server_frame(0x0, b"second-", fin=False)
+        + server_frame(0x0, b"last", fin=True)
+    )
+    sock = ScriptedSocket((fragments,))
+    websocket = MediaWebSocket("ws://host:8765/ws/media")
+    websocket.sock = sock
+    websocket.connected = True
+
+    assert websocket.recv_frame() is None
+    assert websocket.recv_frame() is None
+    assert decode_client_frame(b"".join(sock.sent)) == (0xA, b"keepalive")
+    assert websocket.recv_frame() is None
+    assert websocket.recv_frame() == (opcode, b"first-second-last")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        server_frame(0x0, b"orphan"),
+        server_frame(OP_TEXT, b"first", fin=False) + server_frame(OP_BINARY, b"nested"),
+    ],
+)
+def test_media_websocket_rejects_illegal_fragment_sequences(raw) -> None:
+    sock = ScriptedSocket((raw,))
+    websocket = MediaWebSocket("ws://host:8765/ws/media")
+    websocket.sock = sock
+    websocket.connected = True
+
+    assert websocket.recv_frame() is None
+    if websocket.connected:
+        assert websocket.recv_frame() is None
+
+    opcode, payload = decode_client_frame(b"".join(sock.sent))
+    assert opcode == OP_CLOSE
+    assert int.from_bytes(payload[:2], "big") == 1002
+
+
+def test_media_websocket_limits_reassembled_message_size() -> None:
+    raw = server_frame(OP_BINARY, b"123456", fin=False) + server_frame(0x0, b"789", fin=True)
+    sock = ScriptedSocket((raw,))
+    websocket = MediaWebSocket(
+        "ws://host:8765/ws/media",
+        max_message_bytes=8,
+    )
+    websocket.sock = sock
+    websocket.connected = True
+
+    assert websocket.recv_frame() is None
+    assert websocket.recv_frame() is None
+
+    opcode, payload = decode_client_frame(b"".join(sock.sent))
+    assert opcode == OP_CLOSE
+    assert int.from_bytes(payload[:2], "big") == 1009
+
+
 @pytest.mark.parametrize(
     "raw",
     [
         server_frame(OP_TEXT, b"masked", masked=True),
         server_frame(OP_TEXT, b"rsv", rsv=0x40),
-        server_frame(OP_TEXT, b"fragment", fin=False),
         bytes((0x80 | OP_PING, 126, 0, 126)) + b"x" * 126,
     ],
 )
@@ -577,7 +757,8 @@ def test_media_client_sends_identity_hello_before_binary_media() -> None:
     transport = FakeTransport()
     client = make_client(transport)
 
-    assert client.step(0) is True
+    assert client.step(0) is False
+    assert wait_for_media_step(client, start_ms=1)
 
     hello = json.loads(transport.sent_text[0])
     assert hello == {
@@ -619,8 +800,43 @@ def test_media_client_reconnects_after_disconnect_without_raising() -> None:
 
     assert client.step(0) is False
     assert state["media_connected"] is False
-    assert client.step(100) is True
+    assert wait_for_media_step(client, start_ms=100)
     assert state["media_connected"] is True
+
+
+def test_media_step_starts_blocking_connect_off_uasyncio_thread() -> None:
+    release_connect = threading.Event()
+
+    class BlockingTransport(FakeTransport):
+        def connect(self):
+            release_connect.wait(timeout=0.1)
+            self.connected = True
+            return True
+
+    transport = BlockingTransport()
+    client = make_client(transport)
+
+    started = time.perf_counter()
+    assert client.step(0) is False
+    elapsed = time.perf_counter() - started
+    release_connect.set()
+
+    assert elapsed < 0.05
+
+
+def test_media_connect_api_never_runs_blocking_transport_inline() -> None:
+    class SlowTransport(FakeTransport):
+        def connect(self):
+            time.sleep(0.1)
+            self.connected = True
+            return True
+
+    client = make_client(SlowTransport())
+
+    started = time.perf_counter()
+    assert client.connect() is False
+
+    assert time.perf_counter() - started < 0.05
 
 
 def test_tts_downlink_pauses_uploads_but_resumes_after_tts_end() -> None:
@@ -632,7 +848,7 @@ def test_tts_downlink_pauses_uploads_but_resumes_after_tts_end() -> None:
         camera=Camera(camera_module=camera_module),
         audio_out=output,
     )
-    assert client.connect() is True
+    assert wait_for_media_connection(client)
 
     client.handle_incoming(OP_TEXT, b'{"kind":"tts_start"}')
     client.collect(0, event_boost=False)
@@ -660,7 +876,7 @@ def test_tts_downlink_pauses_uploads_but_resumes_after_tts_end() -> None:
 def test_tts_new_start_and_disconnect_reset_playback_atomically() -> None:
     transport = FakeTransport()
     client = make_client(transport)
-    assert client.connect()
+    assert wait_for_media_connection(client)
     old_frame = MediaFrame(KIND_TTS_PCM16, 1, 1, b"old").encode()
 
     client.handle_incoming(OP_TEXT, b'{"kind":"tts_start"}', current_ms=10)
@@ -692,7 +908,7 @@ def test_tts_zero_write_retries_and_playback_timeout_cannot_stick_speaking() -> 
         transport_factory=lambda _url: transport,
         tts_playback_timeout_ms=100,
     )
-    assert client.connect()
+    assert wait_for_media_connection(client)
     frame = MediaFrame(KIND_TTS_PCM16, 1, 1, b"data").encode()
     client.handle_incoming(OP_TEXT, b'{"kind":"tts_start"}', current_ms=0)
     client.handle_incoming(OP_BINARY, frame, current_ms=1)
@@ -711,6 +927,54 @@ def test_tts_zero_write_retries_and_playback_timeout_cannot_stick_speaking() -> 
     assert client._speaking is False
     assert client._tts_chunks == []
     assert client.state["audio_state"] == "unavailable"
+
+
+def test_tts_receive_progress_refreshes_stall_timeout() -> None:
+    transport = FakeTransport()
+    output = ControlledAudioOutput([0, 0, 0])
+    client = MediaClient(
+        "ws://host:8765/ws/media",
+        device_id="robot-1",
+        token="secret",
+        boot_id="boot-1",
+        camera=Camera(camera_module=None),
+        audio_input=AudioInput(i2s_class=None, pin_factory=None),
+        audio_output=output,
+        transport_factory=lambda _url: transport,
+        tts_playback_timeout_ms=100,
+    )
+    assert wait_for_media_connection(client)
+    client.handle_incoming(OP_TEXT, b'{"kind":"tts_start"}', current_ms=0)
+
+    for sequence, current_ms in enumerate((90, 180, 270), start=1):
+        frame = MediaFrame(KIND_TTS_PCM16, current_ms, sequence, b"data").encode()
+        client.handle_incoming(OP_BINARY, frame, current_ms=current_ms)
+        assert client.step(current_ms)
+        assert client.state["audio_state"] == "speaking"
+
+
+def test_tts_write_progress_refreshes_stall_timeout_during_long_playback() -> None:
+    transport = FakeTransport()
+    output = ControlledAudioOutput([1, 1, 1])
+    client = MediaClient(
+        "ws://host:8765/ws/media",
+        device_id="robot-1",
+        token="secret",
+        boot_id="boot-1",
+        camera=Camera(camera_module=None),
+        audio_input=AudioInput(i2s_class=None, pin_factory=None),
+        audio_output=output,
+        transport_factory=lambda _url: transport,
+        tts_playback_timeout_ms=100,
+    )
+    assert wait_for_media_connection(client)
+    client.handle_incoming(OP_TEXT, b'{"kind":"tts_start"}', current_ms=0)
+    frame = MediaFrame(KIND_TTS_PCM16, 1, 1, b"long").encode()
+    client.handle_incoming(OP_BINARY, frame, current_ms=1)
+
+    for current_ms in (90, 180, 270):
+        assert client.step(current_ms)
+        assert client.state["audio_state"] == "speaking"
 
 
 def test_tts_jitter_buffer_is_bounded() -> None:
@@ -784,6 +1048,12 @@ def test_media_step_failure_stall_probe_has_no_internal_long_sleep() -> None:
 
     assert elapsed < 0.05
     assert state["media_connected"] is False
+    deadline = time.perf_counter() + 1
+    while not transport.closed and time.perf_counter() < deadline:
+        step_started = time.perf_counter()
+        client.step(1)
+        assert time.perf_counter() - step_started < 0.05
+        time.sleep(0.001)
     assert transport.closed is True
 
 
@@ -872,7 +1142,7 @@ def test_control_and_media_socket_timeouts_are_strictly_bounded() -> None:
 def test_send_failure_keeps_unsent_frame_at_queue_head() -> None:
     transport = ExplodingTransport()
     client = make_client(transport)
-    assert client.connect() is True
+    assert wait_for_media_connection(client)
     speech = MediaFrame(KIND_AUDIO_PCM16, 1, 42, b"speech", FLAG_SPEECH)
     client.queue.put(speech)
 
@@ -891,7 +1161,7 @@ def test_pending_media_send_does_not_dequeue_a_second_frame() -> None:
 
     transport = PendingTransport()
     client = make_client(transport)
-    assert client.connect()
+    assert wait_for_media_connection(client)
     first = MediaFrame(KIND_JPEG, 1, 1, b"first")
     second = MediaFrame(KIND_AUDIO_PCM16, 2, 2, b"second", FLAG_SPEECH)
     client.queue.put(first)
@@ -947,7 +1217,7 @@ def test_camera_binding_recipe_exposes_nonblocking_frame_probe_and_gil_release()
     assert "MP_THREAD_GIL_ENTER()" in source
 
 
-def test_custom_image_recipe_structure_pins_exact_upstream_versions() -> None:
+def test_custom_image_recipe_static_structure_pins_exact_upstream_versions() -> None:
     build_root = FIRMWARE_ROOT / "build"
     script = (build_root / "build.ps1").read_text(encoding="utf-8")
     sdkconfig = (build_root / "sdkconfig.board").read_text(encoding="utf-8")
@@ -978,3 +1248,6 @@ def test_readme_reports_recipe_only_and_no_freertos_isolation_claim() -> None:
     assert "静态编译" not in readme
     assert "未实际执行 C 编译" in readme
     assert "不提供 FreeRTOS 高优先级隔离保证" in readme
+    assert "静态结构检查" in readme
+    assert "DNS、TCP 和 WebSocket 握手" in readme
+    assert "硬件、动作和反射对象不会跨线程" in readme

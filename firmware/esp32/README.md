@@ -61,7 +61,7 @@ ESP32 和宿主机需要在同一局域网。先在宿主机运行 `naobot serve
 
 heartbeat 额外报告 `camera_fps`、`audio_state`、`media_queue`、`media_dropped` 和 `psram_free`。
 
-50 ms 安全循环按 deadline 补偿睡眠，并额外记录实际调度间隔和 overrun。当前实现基于 MicroPython `uasyncio` 协作式任务与有界 I/O，不提供 FreeRTOS 高优先级隔离保证；真实硬件驱动、GC 或底层网络栈仍可能引入抖动，必须通过板上 stall probe 验证。
+50 ms 安全循环按 deadline 补偿睡眠，并额外记录实际调度间隔和 overrun。控制与媒体连接由独立 MicroPython `_thread` worker 执行 DNS、TCP 和 WebSocket 握手，完成后才把 socket transport 交回 `uasyncio`；硬件、动作和反射对象不会跨线程。当前实现仍不提供 FreeRTOS 高优先级隔离保证；真实硬件驱动、GC、线程调度或底层网络栈仍可能引入抖动，必须通过板上 stall probe 验证。
 
 ## 定制 MicroPython 镜像
 
@@ -123,4 +123,4 @@ mpremote connect COM3 soft-reset
 
 ## 硬件验证状态
 
-当前只完成 CPython fake、Python 语法检查、协议测试和构建配方结构验证，未实际执行 C 编译，也未生成真实 `.bin`。尚未在真实 N16R8 44 针板、OV2640、INMP441、MAX98357A 或 CH343 串口链路上验证。首次 bring-up 必须检查 GPIO8/9 共线、摄像头帧稳定性、I2S 声道/幅值、PSRAM 余量、TTS 连续播放以及媒体拥塞时 50 ms 安全循环抖动。
+当前只完成 CPython fake、Python 语法检查、协议测试和构建配方静态结构检查，未实际执行 C 编译，也未生成真实 `.bin`。尚未在真实 N16R8 44 针板、OV2640、INMP441、MAX98357A 或 CH343 串口链路上验证。首次 bring-up 必须检查 GPIO8/9 共线、摄像头帧稳定性、I2S 声道/幅值、PSRAM 余量、TTS 连续播放以及媒体拥塞时 50 ms 安全循环抖动。

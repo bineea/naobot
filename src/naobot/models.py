@@ -109,6 +109,8 @@ class RobotState(BaseModel):
     media_queue: int = Field(default=0, ge=0)
     media_dropped: int = Field(default=0, ge=0)
     psram_free: int = Field(default=0, ge=0)
+    local_loop_interval_ms: int = Field(default=0, ge=0)
+    local_loop_overrun_ms: int = Field(default=0, ge=0)
 
     @field_validator("battery_pct")
     @classmethod

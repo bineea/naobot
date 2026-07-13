@@ -70,6 +70,12 @@ class NaobotAgent:
         self.state.media_queue = int(payload.get("media_queue", self.state.media_queue))
         self.state.media_dropped = int(payload.get("media_dropped", self.state.media_dropped))
         self.state.psram_free = int(payload.get("psram_free", self.state.psram_free))
+        self.state.local_loop_interval_ms = int(
+            payload.get("local_loop_interval_ms", self.state.local_loop_interval_ms)
+        )
+        self.state.local_loop_overrun_ms = int(
+            payload.get("local_loop_overrun_ms", self.state.local_loop_overrun_ms)
+        )
 
     async def handle_robot_message(self, envelope: Envelope) -> Envelope | None:
         self.observe_robot_message(envelope)
