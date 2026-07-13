@@ -45,7 +45,7 @@ class InteractionOrchestrator:
     async def observe_audio(self, audio_frames: Sequence[MediaFrame], *, now_ms: int) -> None:
         self.pipeline.update_connection(True)
         for frame in audio_frames:
-            self.pipeline.push_audio_chunk(frame, is_speech=True)
+            self.pipeline.push_audio_chunk(frame)
         wake = coerce_wake_word_result(self.wake_word.detect(audio_frames))
         snapshot = self.session.snapshot(now_ms=now_ms)
         if wake.triggered:
@@ -91,7 +91,7 @@ class InteractionOrchestrator:
     ) -> Envelope | None:
         self.pipeline.update_connection(True)
         for frame in audio_frames:
-            self.pipeline.push_audio_chunk(frame, is_speech=True)
+            self.pipeline.push_audio_chunk(frame)
         for frame in video_frames:
             self.pipeline.push_video_frame(frame)
 

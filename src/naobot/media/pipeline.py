@@ -51,6 +51,7 @@ class MediaPipeline:
         self.audio_window_ms = audio_window_ms
         self.video_queue_limit = video_queue_limit
         self.audio_queue_limit = audio_queue_limit
+        self._total_capacity = video_queue_limit + audio_queue_limit
         self._video_window = TimestampWindow(video_window_ms, lambda frame: frame.timestamp_ms)
         self._audio_window = TimestampWindow(audio_window_ms, lambda chunk: chunk.frame.timestamp_ms)
         self._video_queue: MediaQueue[MediaFrame] = MediaQueue()
@@ -87,23 +88,30 @@ class MediaPipeline:
     def set_last_transcript(self, transcript: str) -> None:
         self._last_transcript = transcript
 
-    def push_video_frame(self, frame: MediaFrame) -> None:
-        self._video_window.append(frame)
+    def push_video_frame(self, frame: MediaFrame) -> bool:
+        if not self._video_window.append(frame):
+            self._media_dropped += 1
+            return False
+        if self._combined_queue_size() >= self._total_capacity:
+            self._drop_oldest_video()
         if len(self._video_queue) >= self.video_queue_limit:
-            if self._video_queue.drop_oldest() is not None:
-                self._media_dropped += 1
+            self._drop_oldest_video()
         self._video_queue.append(frame)
+        return True
 
-    def push_audio_chunk(self, frame: MediaFrame, *, is_speech: bool) -> None:
-        chunk = AudioChunk(frame=frame, is_speech=is_speech)
-        self._audio_window.append(chunk)
+    def push_audio_chunk(self, frame: MediaFrame) -> bool:
+        chunk = AudioChunk(frame=frame)
+        if not self._audio_window.append(chunk):
+            self._media_dropped += 1
+            return False
+        if self._combined_queue_size() >= self._total_capacity:
+            self._drop_oldest_video()
         if len(self._audio_queue) >= self.audio_queue_limit:
-            dropped = self._audio_queue.drop_first_matching(lambda item: not item.is_speech)
-            if dropped is None:
-                dropped = self._audio_queue.drop_oldest()
-            if dropped is not None:
-                self._media_dropped += 1
+            self._drop_oldest_non_speech_audio()
+        if len(self._audio_queue) >= self.audio_queue_limit:
+            self._drop_oldest_speech_audio()
         self._audio_queue.append(chunk)
+        return True
 
     def next_video_frame(self) -> MediaFrame | None:
         return self._video_queue.popleft()
@@ -145,3 +153,20 @@ class MediaPipeline:
         if duration_ms <= 0:
             return float(len(frames))
         return round(((len(frames) - 1) * 1000.0) / duration_ms, 2)
+
+    def _combined_queue_size(self) -> int:
+        return len(self._video_queue) + len(self._audio_queue)
+
+    def _drop_oldest_video(self) -> None:
+        if self._video_queue.drop_oldest() is not None:
+            self._media_dropped += 1
+
+    def _drop_oldest_non_speech_audio(self) -> None:
+        dropped = self._audio_queue.drop_first_matching(lambda item: item.is_speech is False)
+        if dropped is not None:
+            self._media_dropped += 1
+
+    def _drop_oldest_speech_audio(self) -> None:
+        dropped = self._audio_queue.drop_first_matching(lambda item: item.is_speech is True)
+        if dropped is not None:
+            self._media_dropped += 1

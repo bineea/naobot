@@ -149,6 +149,16 @@ def test_session_idle_timeout_and_half_duplex_resume() -> None:
     assert session.snapshot(now_ms=40_001).active is False
 
 
+def test_session_gate_uses_monotonic_now_ms() -> None:
+    session = InteractionSession(session_idle_ms=30_000, tts_resume_delay_ms=200)
+    session.activate_from_touch(now_ms=10_000, person_id=None)
+
+    session.mark_activity(now_ms=9_000)
+    assert session.snapshot(now_ms=9_500).active is True
+    assert session.snapshot(now_ms=39_999).active is True
+    assert session.snapshot(now_ms=40_001).active is False
+
+
 @pytest.mark.asyncio
 async def test_orchestrator_blocks_cloud_providers_before_session_activation() -> None:
     wake = SpyWakeWordProvider(triggered=False, greeting_detected=False)

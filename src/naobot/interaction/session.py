@@ -32,6 +32,7 @@ class InteractionSession:
         self._person_id: str | None = None
         self._session_trigger: str | None = None
         self._last_activity_ms: int | None = None
+        self._last_seen_ms: int = 0
         self._speaking = False
         self._resume_listening_at_ms: int | None = None
 
@@ -60,22 +61,26 @@ class InteractionSession:
         return True
 
     def mark_activity(self, *, now_ms: int) -> None:
+        now_ms = self._monotonic_now(now_ms)
         if self._active:
             self._last_activity_ms = now_ms
 
     def start_tts(self, *, now_ms: int) -> None:
+        now_ms = self._monotonic_now(now_ms)
         if not self._active:
             return
         self._speaking = True
         self._resume_listening_at_ms = None
 
     def end_tts(self, *, now_ms: int) -> None:
+        now_ms = self._monotonic_now(now_ms)
         if not self._active:
             return
         self._speaking = False
         self._resume_listening_at_ms = now_ms + self.tts_resume_delay_ms
 
     def snapshot(self, *, now_ms: int) -> SessionSnapshot:
+        now_ms = self._monotonic_now(now_ms)
         self._expire_if_idle(now_ms)
         listening = (
             self._active
@@ -96,6 +101,7 @@ class InteractionSession:
         )
 
     def _activate(self, *, now_ms: int, person_id: str | None, trigger: str) -> None:
+        now_ms = self._monotonic_now(now_ms)
         self._active = True
         self._person_id = person_id
         self._session_id = person_id or f"visitor-{now_ms}"
@@ -103,6 +109,10 @@ class InteractionSession:
         self._last_activity_ms = now_ms
         self._speaking = False
         self._resume_listening_at_ms = None
+
+    def _monotonic_now(self, now_ms: int) -> int:
+        self._last_seen_ms = max(self._last_seen_ms, now_ms)
+        return self._last_seen_ms
 
     def _expire_if_idle(self, now_ms: int) -> None:
         if not self._active or self._last_activity_ms is None:

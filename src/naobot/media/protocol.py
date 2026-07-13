@@ -8,6 +8,9 @@ from enum import IntEnum
 PROTOCOL_MAGIC = b"NABM"
 PROTOCOL_VERSION = 1
 PROTOCOL_HEADER = struct.Struct(">4sBBHIQI")
+MAX_AUDIO_PCM16_PAYLOAD = 64 * 1024
+MAX_JPEG_PAYLOAD = 256 * 1024
+MAX_TTS_PCM16_PAYLOAD = 256 * 1024
 
 NOMINAL_VIDEO_FPS = 10
 NOMINAL_EVENT_VIDEO_FPS = 15
@@ -36,6 +39,13 @@ class MediaFrameKind(IntEnum):
     TTS_PCM16 = 3
 
 
+MAX_PAYLOAD_BYTES_BY_KIND = {
+    MediaFrameKind.AUDIO_PCM16: MAX_AUDIO_PCM16_PAYLOAD,
+    MediaFrameKind.JPEG: MAX_JPEG_PAYLOAD,
+    MediaFrameKind.TTS_PCM16: MAX_TTS_PCM16_PAYLOAD,
+}
+
+
 @dataclass(slots=True)
 class MediaFrame:
     kind: MediaFrameKind
@@ -54,6 +64,9 @@ class MediaFrame:
             raise ValueError("flags must fit into uint16")
         if len(self.payload) > 0xFFFFFFFF:
             raise ValueError("payload length exceeds uint32")
+        limit = MAX_PAYLOAD_BYTES_BY_KIND[self.kind]
+        if len(self.payload) > limit:
+            raise ValueError(f"{self.kind.name} payload exceeds {limit} bytes")
 
     def encode(self) -> bytes:
         header = PROTOCOL_HEADER.pack(
@@ -82,6 +95,9 @@ class MediaFrame:
             kind = MediaFrameKind(raw_kind)
         except ValueError as exc:
             raise ValueError("invalid frame kind") from exc
+        limit = MAX_PAYLOAD_BYTES_BY_KIND[kind]
+        if payload_length > limit:
+            raise ValueError(f"{kind.name} payload exceeds {limit} bytes")
 
         payload = raw[PROTOCOL_HEADER.size :]
         if len(payload) != payload_length:
@@ -93,6 +109,10 @@ class MediaFrame:
             payload=payload,
             flags=flags,
         )
+
+    @property
+    def is_speech(self) -> bool:
+        return bool(self.flags & 0x1)
 
     @classmethod
     def audio_pcm16(

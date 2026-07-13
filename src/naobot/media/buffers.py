@@ -13,7 +13,11 @@ T = TypeVar("T")
 @dataclass(slots=True)
 class AudioChunk:
     frame: MediaFrame
-    is_speech: bool = True
+    is_speech: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.is_speech is None:
+            self.is_speech = self.frame.is_speech
 
 
 class TimestampWindow(Generic[T]):
@@ -23,10 +27,16 @@ class TimestampWindow(Generic[T]):
         self._window_ms = window_ms
         self._timestamp_getter = timestamp_getter
         self._items: deque[T] = deque()
+        self._last_timestamp_ms: int | None = None
 
-    def append(self, item: T) -> None:
+    def append(self, item: T) -> bool:
+        timestamp_ms = self._timestamp_getter(item)
+        if self._last_timestamp_ms is not None and timestamp_ms < self._last_timestamp_ms:
+            return False
         self._items.append(item)
-        self.trim(self._timestamp_getter(item))
+        self._last_timestamp_ms = timestamp_ms
+        self.trim(timestamp_ms)
+        return True
 
     def trim(self, current_timestamp_ms: int) -> None:
         cutoff = current_timestamp_ms - self._window_ms
