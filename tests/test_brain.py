@@ -1,4 +1,5 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -31,6 +32,32 @@ class FakeStreamingAgent:
             await asyncio.sleep(self.delay)
         for event in self.prefix_events:
             yield event
+        yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta=self.output)
+
+
+class CoordinatedStateAgent:
+    def __init__(
+        self,
+        *,
+        output: str,
+        state: AgentState | None,
+        started: asyncio.Event,
+        release: asyncio.Event | None = None,
+    ) -> None:
+        self.output = output
+        self.state = state or AgentState()
+        self.started = started
+        self.release = release
+
+    async def reply_stream(self, inputs):
+        payload = json.loads(inputs.content[0].text)
+        transcript = payload["brain_input"]["transcript"]
+        history = list(self.state.middle_context.get("history", []))
+        history.append(transcript)
+        self.state.middle_context["history"] = history
+        self.started.set()
+        if self.release is not None:
+            await self.release.wait()
         yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta=self.output)
 
 
@@ -180,6 +207,83 @@ async def test_team_route_uses_dedicated_timeout_setting(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_default_route_ignores_requires_team_and_complexity_without_debug_override(tmp_path) -> None:
+    calls = []
+
+    def factory(system_prompt: str, **kwargs):
+        calls.append(system_prompt)
+        return FakeStreamingAgent('{"text":"收到","goal":"单路由处理","skills":[]}')
+
+    runtime = AgentScopeBrainRuntime(
+        Settings(runtime_dir=tmp_path, llm_base_url="http://example.test/v1", llm_model="test"),
+        agent_factory=factory,
+    )
+
+    decision = await runtime.decide(
+        Envelope(
+            type=MessageType.EVENT,
+            payload={
+                "name": "user_request",
+                "text": "帮我看下天气",
+                "requires_team": True,
+                "complexity": 99,
+                "person_id": "person-default-route",
+            },
+        ),
+        SoulConfig(),
+        [],
+    )
+
+    assert decision.goal == "单路由处理"
+    assert len(calls) == 1
+    assert runtime.status()["last_route"]["mode"] == "single"
+    assert "debug_requires_team" not in runtime.status()["last_route"]["reasons"]
+    assert "debug_complexity" not in runtime.status()["last_route"]["reasons"]
+
+
+@pytest.mark.asyncio
+async def test_debug_override_can_force_team_route_for_compatibility(tmp_path) -> None:
+    calls = []
+
+    def factory(system_prompt: str, **kwargs):
+        calls.append(system_prompt)
+        if "产品负责人" in system_prompt:
+            return FakeStreamingAgent('{"text":"收到","goal":"团队处理","skills":[]}')
+        return FakeStreamingAgent('{"recommendation":"兼容调试强制团队"}')
+
+    runtime = AgentScopeBrainRuntime(
+        Settings(
+            runtime_dir=tmp_path,
+            llm_base_url="http://example.test/v1",
+            llm_model="test",
+            brain_debug_force_team_override=True,
+        ),
+        agent_factory=factory,
+    )
+
+    decision = await runtime.decide(
+        Envelope(
+            type=MessageType.EVENT,
+            payload={
+                "name": "user_request",
+                "text": "帮我看下天气",
+                "requires_team": True,
+                "complexity": 99,
+                "person_id": "person-debug-route",
+            },
+        ),
+        SoulConfig(),
+        [],
+    )
+
+    assert decision.goal == "团队处理"
+    assert len(calls) == 4
+    assert runtime.status()["last_route"]["mode"] == "team"
+    assert "debug_requires_team" in runtime.status()["last_route"]["reasons"]
+    assert "debug_complexity" in runtime.status()["last_route"]["reasons"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "event_name",
     ["fall_detected", "battery_low", "emergency_stop", "imu_fault"],
@@ -323,6 +427,118 @@ async def test_create_agent_receives_state_and_context_config_and_persists_runti
 
     saved_state = await registry.load_state("person-42", "primary")
     assert saved_state.session_id == captures[0]["state"].session_id
+
+
+@pytest.mark.asyncio
+async def test_same_person_decisions_share_lifecycle_lock_and_preserve_history(tmp_path) -> None:
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    def factory(system_prompt: str, **kwargs):
+        person_id = kwargs["person_id"]
+        state = kwargs.get("state")
+        if person_id == "person-serial" and not first_started.is_set():
+            return CoordinatedStateAgent(
+                output='{"text":"first","goal":"第一条","skills":[]}',
+                state=state,
+                started=first_started,
+                release=release_first,
+            )
+        return CoordinatedStateAgent(
+            output='{"text":"second","goal":"第二条","skills":[]}',
+            state=state,
+            started=second_started,
+        )
+
+    registry = RuntimeRegistry(
+        Settings(runtime_dir=tmp_path, llm_base_url="http://example.test/v1", llm_model="test")
+    )
+    runtime = AgentScopeBrainRuntime(
+        Settings(runtime_dir=tmp_path, llm_base_url="http://example.test/v1", llm_model="test"),
+        agent_factory=factory,
+        runtime_registry=registry,
+    )
+
+    first_task = asyncio.create_task(
+        runtime.decide(
+            Envelope(
+                type=MessageType.EVENT,
+                payload={"name": "user_request", "text": "A", "person_id": "person-serial"},
+            ),
+            SoulConfig(),
+            [],
+        )
+    )
+    await asyncio.wait_for(first_started.wait(), timeout=0.2)
+
+    second_task = asyncio.create_task(
+        runtime.decide(
+            Envelope(
+                type=MessageType.EVENT,
+                payload={"name": "user_request", "text": "B", "person_id": "person-serial"},
+            ),
+            SoulConfig(),
+            [],
+        )
+    )
+
+    await asyncio.sleep(0.05)
+    assert second_started.is_set() is False
+
+    release_first.set()
+    await asyncio.gather(first_task, second_task)
+
+    saved_state = await registry.load_state("person-serial", "primary")
+    assert saved_state.middle_context["history"] == ["A", "B"]
+
+
+@pytest.mark.asyncio
+async def test_different_people_can_run_in_parallel(tmp_path) -> None:
+    started: dict[str, asyncio.Event] = {
+        "person-a": asyncio.Event(),
+        "person-b": asyncio.Event(),
+    }
+    release = asyncio.Event()
+
+    def factory(system_prompt: str, **kwargs):
+        return CoordinatedStateAgent(
+            output='{"text":"ok","goal":"并行完成","skills":[]}',
+            state=kwargs.get("state"),
+            started=started[kwargs["person_id"]],
+            release=release,
+        )
+
+    runtime = AgentScopeBrainRuntime(
+        Settings(runtime_dir=tmp_path, llm_base_url="http://example.test/v1", llm_model="test"),
+        agent_factory=factory,
+    )
+
+    task_a = asyncio.create_task(
+        runtime.decide(
+            Envelope(
+                type=MessageType.EVENT,
+                payload={"name": "user_request", "text": "A", "person_id": "person-a"},
+            ),
+            SoulConfig(),
+            [],
+        )
+    )
+    task_b = asyncio.create_task(
+        runtime.decide(
+            Envelope(
+                type=MessageType.EVENT,
+                payload={"name": "user_request", "text": "B", "person_id": "person-b"},
+            ),
+            SoulConfig(),
+            [],
+        )
+    )
+
+    await asyncio.wait_for(started["person-a"].wait(), timeout=0.2)
+    await asyncio.wait_for(started["person-b"].wait(), timeout=0.2)
+    release.set()
+    await asyncio.gather(task_a, task_b)
 
 
 @pytest.mark.asyncio

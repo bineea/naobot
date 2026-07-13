@@ -90,14 +90,22 @@ class AgentScopeBrainRuntime(LLMClient):
         try:
             if route.mode == "team":
                 self._team_used = True
-                decision = await asyncio.wait_for(
-                    self._run_team_decision(event, brain_input, soul, memories, route),
-                    timeout=self.team_timeout_seconds,
+                decision = await self._run_team_decision(
+                    event,
+                    brain_input,
+                    soul,
+                    memories,
+                    route,
+                    deadline=self._reply_deadline(self.team_timeout_seconds),
                 )
             else:
-                decision = await asyncio.wait_for(
-                    self._run_single_decision(event, brain_input, soul, memories, route),
-                    timeout=self.single_timeout_seconds,
+                decision = await self._run_single_decision(
+                    event,
+                    brain_input,
+                    soul,
+                    memories,
+                    route,
+                    deadline=self._reply_deadline(self.single_timeout_seconds),
                 )
                 escalation_reason = self._needs_team_escalation(decision)
                 if escalation_reason:
@@ -111,20 +119,18 @@ class AgentScopeBrainRuntime(LLMClient):
                     )
                     self._last_route = escalated_route
                     self._team_used = True
-                    decision = await asyncio.wait_for(
-                        self._run_team_decision(
-                            event,
-                            brain_input,
-                            soul,
-                            memories,
-                            escalated_route,
-                            seed_decision=decision,
-                        ),
-                        timeout=self.team_timeout_seconds,
+                    decision = await self._run_team_decision(
+                        event,
+                        brain_input,
+                        soul,
+                        memories,
+                        escalated_route,
+                        seed_decision=decision,
+                        deadline=self._reply_deadline(self.team_timeout_seconds),
                     )
             self._mode = "agentscope"
             return decision
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return await self._use_fallback(event, soul, memories, "brain_timeout")
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -137,6 +143,8 @@ class AgentScopeBrainRuntime(LLMClient):
         soul: SoulConfig,
         memories: list[str],
         route: RouteDecision,
+        *,
+        deadline: float,
     ) -> LLMDecision:
         prompt = self._build_prompt(event, brain_input, soul, memories, route)
         output = await self._run_agent(
@@ -145,6 +153,7 @@ class AgentScopeBrainRuntime(LLMClient):
             agent_role="primary",
             person_id=brain_input.person_id,
             is_guest=self._is_guest(brain_input.person_id),
+            deadline=deadline,
         )
         return LLMDecision.model_validate(self._parse_json_object(output))
 
@@ -157,6 +166,7 @@ class AgentScopeBrainRuntime(LLMClient):
         route: RouteDecision,
         *,
         seed_decision: LLMDecision | None = None,
+        deadline: float,
     ) -> LLMDecision:
         prompt = self._build_prompt(event, brain_input, soul, memories, route)
         is_guest = self._is_guest(brain_input.person_id)
@@ -168,6 +178,7 @@ class AgentScopeBrainRuntime(LLMClient):
                     agent_role=role,
                     person_id=brain_input.person_id,
                     is_guest=is_guest,
+                    deadline=deadline,
                 )
                 for role, system_prompt in SPECIALIST_PROMPTS
             )
@@ -188,6 +199,7 @@ class AgentScopeBrainRuntime(LLMClient):
             agent_role="editor",
             person_id=brain_input.person_id,
             is_guest=is_guest,
+            deadline=deadline,
         )
         return LLMDecision.model_validate(self._parse_json_object(output))
 
@@ -199,32 +211,29 @@ class AgentScopeBrainRuntime(LLMClient):
         agent_role: str,
         person_id: str | None,
         is_guest: bool,
+        deadline: float,
     ) -> str:
-        from agentscope.message import Msg, TextBlock
+        if person_id is None:
+            agent = await self._create_agent(system_prompt, agent_role, person_id, is_guest=is_guest)
+            return await self._collect_reply(agent, prompt, deadline)
 
-        agent = await self._create_agent(system_prompt, agent_role, person_id, is_guest=is_guest)
-        message = Msg(name="naobot", role="user", content=[TextBlock(text=prompt)])
-        chunks: list[str] = []
-        async for event in agent.reply_stream(message):
-            event_type = getattr(event, "type", None)
-            event_type = getattr(event_type, "value", event_type)
-            if event_type != "TEXT_BLOCK_DELTA":
-                continue
-            delta = getattr(event, "delta", None)
-            if isinstance(delta, str):
-                chunks.append(delta)
-        output = "".join(chunks).strip()
-        if not output:
-            raise ValueError("AgentScope returned an empty response")
-        state = getattr(agent, "state", None)
-        if state is not None and person_id:
-            await self._runtime_registry.save_state(
-                person_id,
+        async with self._runtime_registry.person_runtime(
+            person_id,
+            agent_role,
+            is_guest=is_guest,
+        ) as runtime_session:
+            agent = await self._create_agent(
+                system_prompt,
                 agent_role,
-                state,
+                person_id,
                 is_guest=is_guest,
+                state=runtime_session.state,
             )
-        return output
+            output = await self._collect_reply(agent, prompt, deadline)
+            state = getattr(agent, "state", None)
+            if state is not None:
+                await asyncio.shield(runtime_session.save(state))
+            return output
 
     async def _create_agent(
         self,
@@ -233,6 +242,7 @@ class AgentScopeBrainRuntime(LLMClient):
         person_id: str | None,
         *,
         is_guest: bool,
+        state: Any | None = None,
     ) -> StreamingAgent:
         from agentscope.agent import Agent, ContextConfig, ReActConfig
         from agentscope.credential import OpenAICredential
@@ -240,13 +250,7 @@ class AgentScopeBrainRuntime(LLMClient):
         from agentscope.state import AgentState
         from agentscope.tool import Toolkit
 
-        state = AgentState()
-        if person_id:
-            state = await self._runtime_registry.load_state(
-                person_id,
-                agent_role,
-                is_guest=is_guest,
-            )
+        state = state if isinstance(state, AgentState) else AgentState()
         context_config = ContextConfig(trigger_ratio=0.8, reserve_ratio=0.1)
         if self._agent_factory is not None:
             created = self._invoke_agent_factory(
@@ -340,10 +344,13 @@ class AgentScopeBrainRuntime(LLMClient):
             reasons.append("long_transcript")
 
         debug_forced = False
-        if payload.get("requires_team") is True:
+        if self.settings.brain_debug_force_team_override and payload.get("requires_team") is True:
             debug_forced = True
             reasons.append("debug_requires_team")
-        if int(payload.get("complexity", 0) or 0) >= 7:
+        if (
+            self.settings.brain_debug_force_team_override
+            and int(payload.get("complexity", 0) or 0) >= 7
+        ):
             debug_forced = True
             reasons.append("debug_complexity")
 
@@ -477,3 +484,37 @@ class AgentScopeBrainRuntime(LLMClient):
             return True
         lowered = person_id.lower()
         return lowered.startswith("guest") or lowered.startswith("visitor")
+
+    @staticmethod
+    def _reply_deadline(timeout_seconds: float) -> float:
+        return asyncio.get_running_loop().time() + timeout_seconds
+
+    @staticmethod
+    def _remaining_timeout(deadline: float) -> float:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise TimeoutError
+        return remaining
+
+    async def _collect_reply(self, agent: StreamingAgent, prompt: str, deadline: float) -> str:
+        from agentscope.message import Msg, TextBlock
+
+        message = Msg(name="naobot", role="user", content=[TextBlock(text=prompt)])
+        chunks: list[str] = []
+
+        async def _consume() -> str:
+            async for event in agent.reply_stream(message):
+                event_type = getattr(event, "type", None)
+                event_type = getattr(event_type, "value", event_type)
+                if event_type != "TEXT_BLOCK_DELTA":
+                    continue
+                delta = getattr(event, "delta", None)
+                if isinstance(delta, str):
+                    chunks.append(delta)
+            output = "".join(chunks).strip()
+            if not output:
+                raise ValueError("AgentScope returned an empty response")
+            return output
+
+        timeout = self._remaining_timeout(deadline)
+        return await asyncio.wait_for(_consume(), timeout=timeout)

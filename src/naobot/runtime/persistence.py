@@ -3,15 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
-from agentscope.message import Base64Source, DataBlock, HintBlock, TextBlock, ToolResultBlock, URLSource
 from agentscope.state import AgentState
 from cryptography.fernet import Fernet
+from pydantic import BaseModel
 
 from ..settings import Settings
 
@@ -20,50 +19,84 @@ def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _media_digest(source: Base64Source | URLSource) -> str:
-    if isinstance(source, Base64Source):
-        payload = source.data.encode("utf-8")
-    else:
-        payload = str(source.url).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+def _media_digest(payload: str) -> str:
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _scrub_data_block(block: DataBlock) -> TextBlock:
-    digest = _media_digest(block.source)
-    media_type = block.source.media_type
-    source_kind = "base64" if isinstance(block.source, Base64Source) else "url"
-    name = block.name or "unnamed"
-    return TextBlock(
-        text=(
-            f"[媒体摘要 name={name} media_type={media_type} "
+def _media_text_summary(
+    *,
+    media_type: str,
+    source_kind: str,
+    digest: str,
+    name: str | None = None,
+) -> dict[str, Any]:
+    label = f" name={name}" if name else ""
+    return {
+        "type": "text",
+        "text": (
+            f"[媒体摘要{label} media_type={media_type} "
             f"source={source_kind} sha256={digest}]"
-        )
-    )
+        ),
+    }
 
 
-def _scrub_block(block: Any) -> Any:
-    if isinstance(block, DataBlock):
-        return _scrub_data_block(block)
-    if isinstance(block, HintBlock) and isinstance(block.hint, list):
-        block.hint = [_scrub_block(item) for item in block.hint]
-        return block
-    if isinstance(block, ToolResultBlock) and isinstance(block.output, list):
-        block.output = [_scrub_block(item) for item in block.output]
-        return block
-    return block
+def _media_source_summary(*, media_type: str, source_kind: str, digest: str) -> dict[str, Any]:
+    return {
+        "kind": "media_source_summary",
+        "media_type": media_type,
+        "source": source_kind,
+        "sha256": digest,
+    }
 
 
-def scrub_agent_state_for_storage(state: AgentState) -> AgentState:
-    scrubbed = state.model_copy(deep=True)
-    if isinstance(scrubbed.summary, list):
-        scrubbed.summary = [_scrub_block(block) for block in scrubbed.summary]
-    scrubbed.context = [
-        message.model_copy(
-            update={"content": [_scrub_block(block) for block in deepcopy(message.content)]}
-        )
-        for message in scrubbed.context
-    ]
-    return scrubbed
+def _scrub_serialized_value(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        return _scrub_serialized_value(value.model_dump(mode="json"))
+    if isinstance(value, dict):
+        value_type = value.get("type")
+        if value_type == "data" and isinstance(value.get("source"), dict):
+            source = value["source"]
+            source_type = source.get("type")
+            media_type = str(source.get("media_type", "application/octet-stream"))
+            if source_type == "base64":
+                digest = _media_digest(str(source.get("data", "")))
+                return _media_text_summary(
+                    media_type=media_type,
+                    source_kind="base64",
+                    digest=digest,
+                    name=value.get("name"),
+                )
+            if source_type == "url":
+                digest = _media_digest(str(source.get("url", "")))
+                return _media_text_summary(
+                    media_type=media_type,
+                    source_kind="url",
+                    digest=digest,
+                    name=value.get("name"),
+                )
+        if value_type == "base64":
+            return _media_source_summary(
+                media_type=str(value.get("media_type", "application/octet-stream")),
+                source_kind="base64",
+                digest=_media_digest(str(value.get("data", ""))),
+            )
+        if value_type == "url":
+            return _media_source_summary(
+                media_type=str(value.get("media_type", "application/octet-stream")),
+                source_kind="url",
+                digest=_media_digest(str(value.get("url", ""))),
+            )
+        return {key: _scrub_serialized_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_scrub_serialized_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_scrub_serialized_value(item) for item in value]
+    return value
+
+
+def scrub_agent_state_for_storage(state: AgentState) -> dict[str, Any]:
+    serialized = state.model_dump(mode="json", exclude_none=True)
+    return _scrub_serialized_value(serialized)
 
 
 class RuntimePersistence:
@@ -160,23 +193,41 @@ class RuntimePersistence:
         await self.initialize()
         now = _utc_now()
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                """
-                INSERT INTO people(person_id, display_name, metadata_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(person_id) DO UPDATE SET
-                    display_name = COALESCE(excluded.display_name, people.display_name),
-                    metadata_json = excluded.metadata_json,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    person_id,
-                    display_name,
-                    json.dumps(metadata or {}, ensure_ascii=False),
-                    now,
-                    now,
-                ),
-            )
+            if metadata is None:
+                await db.execute(
+                    """
+                    INSERT INTO people(person_id, display_name, metadata_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(person_id) DO UPDATE SET
+                        display_name = COALESCE(excluded.display_name, people.display_name),
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        person_id,
+                        display_name,
+                        "{}",
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                await db.execute(
+                    """
+                    INSERT INTO people(person_id, display_name, metadata_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(person_id) DO UPDATE SET
+                        display_name = COALESCE(excluded.display_name, people.display_name),
+                        metadata_json = excluded.metadata_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        person_id,
+                        display_name,
+                        json.dumps(metadata, ensure_ascii=False),
+                        now,
+                        now,
+                    ),
+                )
             await db.commit()
 
     async def upsert_session(
@@ -232,15 +283,15 @@ class RuntimePersistence:
 
     async def save_agent_runtime(self, person_id: str, agent_role: str, state: AgentState) -> int:
         await self.initialize()
-        await self.upsert_person(person_id)
+        await self.upsert_person(person_id, metadata=None)
         await self.upsert_session(
             state.session_id,
             person_id=person_id,
             is_guest=False,
             status="active",
         )
-        scrubbed_state = scrub_agent_state_for_storage(state)
-        state_json = scrubbed_state.model_dump_json(exclude_none=True)
+        scrubbed_payload = scrub_agent_state_for_storage(state)
+        state_json = json.dumps(scrubbed_payload, ensure_ascii=False)
         now = _utc_now()
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
@@ -296,7 +347,7 @@ class FaceDataRepository:
     ) -> None:
         fernet = self._fernet()
         await self.persistence.initialize()
-        await self.persistence.upsert_person(person_id)
+        await self.persistence.upsert_person(person_id, metadata=None)
         ciphertext = fernet.encrypt(
             json.dumps({"embedding": embedding}, ensure_ascii=False).encode("utf-8")
         )
@@ -354,7 +405,7 @@ class FaceDataRepository:
     ) -> None:
         fernet = self._fernet()
         await self.persistence.initialize()
-        await self.persistence.upsert_person(person_id)
+        await self.persistence.upsert_person(person_id, metadata=None)
         ciphertext = fernet.encrypt(sample_bytes)
         async with aiosqlite.connect(self.persistence.db_path) as db:
             await db.execute(

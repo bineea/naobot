@@ -4,10 +4,15 @@ import pytest
 from agentscope.message import Base64Source, DataBlock, Msg, TextBlock, URLSource
 from agentscope.state import AgentState
 from cryptography.fernet import Fernet
+from pydantic import BaseModel
 
-from naobot.runtime.persistence import FaceDataRepository
+from naobot.runtime.persistence import FaceDataRepository, RuntimePersistence
 from naobot.runtime.registry import RuntimeRegistry
 from naobot.settings import Settings
+
+
+class NestedMediaModel(BaseModel):
+    payload: object
 
 
 @pytest.mark.asyncio
@@ -108,6 +113,44 @@ async def test_runtime_registry_scrubs_media_payload_before_persisting(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_scrub_agent_state_recursively_cleans_middle_context_nested_media(tmp_path) -> None:
+    settings = Settings(runtime_dir=tmp_path, robot_id="robot-test")
+    registry = RuntimeRegistry(settings)
+
+    state = AgentState(
+        session_id="session-nested",
+        middle_context={
+            "nested": NestedMediaModel(
+                payload={
+                    "list": [
+                        Base64Source(data="VERY_SECRET_BASE64", media_type="image/png"),
+                        {"tuple": (URLSource(url="https://example.com/secret.png", media_type="image/png"),)},
+                    ],
+                    "block": DataBlock(
+                        source=Base64Source(data="ANOTHER_SECRET", media_type="image/png"),
+                        name="nested-block",
+                    ),
+                }
+            )
+        },
+    )
+
+    await registry.save_state("person-nested", "primary", state)
+    loaded = await registry.load_state("person-nested", "primary")
+
+    raw_state = sqlite3.connect(tmp_path / "naobot.db").execute(
+        "SELECT state_json FROM agent_runtimes WHERE person_id = ? AND agent_role = ?",
+        ("person-nested", "primary"),
+    ).fetchone()[0]
+
+    assert "VERY_SECRET_BASE64" not in raw_state
+    assert "https://example.com/secret.png" not in raw_state
+    assert "ANOTHER_SECRET" not in raw_state
+    assert "sha256" in raw_state
+    assert "nested" in loaded.middle_context
+
+
+@pytest.mark.asyncio
 async def test_runtime_registry_can_reset_person_runtime(tmp_path) -> None:
     settings = Settings(runtime_dir=tmp_path, robot_id="robot-test")
     registry = RuntimeRegistry(settings)
@@ -118,6 +161,27 @@ async def test_runtime_registry_can_reset_person_runtime(tmp_path) -> None:
     state = await registry.load_state("person-reset", "primary")
 
     assert state.session_id != "session-reset"
+
+
+@pytest.mark.asyncio
+async def test_upsert_person_metadata_is_preserved_when_runtime_saves_without_metadata(tmp_path) -> None:
+    settings = Settings(runtime_dir=tmp_path, robot_id="robot-test")
+    persistence = RuntimePersistence(settings)
+
+    await persistence.upsert_person("person-meta", metadata={"nickname": "小王"})
+    await persistence.upsert_person("person-meta", metadata=None)
+    await persistence.save_agent_runtime(
+        "person-meta",
+        "primary",
+        AgentState(session_id="session-meta", summary="hello"),
+    )
+
+    metadata_json = sqlite3.connect(tmp_path / "naobot.db").execute(
+        "SELECT metadata_json FROM people WHERE person_id = ?",
+        ("person-meta",),
+    ).fetchone()[0]
+
+    assert metadata_json == '{"nickname": "小王"}'
 
 
 @pytest.mark.asyncio

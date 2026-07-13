@@ -21,6 +21,7 @@ class Settings:
     brain_team_timeout_seconds: float = 15.0
     brain_max_iters: int = 4
     brain_team_enabled: bool = True
+    brain_debug_force_team_override: bool = False
     data_key: str | None = None
 
     @classmethod
@@ -46,6 +47,11 @@ class Settings:
             ),
             brain_max_iters=int(os.getenv("NAOBOT_BRAIN_MAX_ITERS", "4")),
             brain_team_enabled=os.getenv("NAOBOT_BRAIN_TEAM_ENABLED", "true").lower()
+            in {"1", "true", "yes", "on"},
+            brain_debug_force_team_override=os.getenv(
+                "NAOBOT_BRAIN_DEBUG_FORCE_TEAM_OVERRIDE",
+                "false",
+            ).lower()
             in {"1", "true", "yes", "on"},
             data_key=os.getenv("NAOBOT_DATA_KEY"),
         )
