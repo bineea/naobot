@@ -61,15 +61,15 @@ Host 位于 `src/naobot/`，运行在 Python 3.11：
 
 固件位于 `firmware/esp32/`，运行在 MicroPython：
 
-- 控制 client 与媒体 client 分别拥有独立的 `ConnectionWorker`，DNS/TCP/WebSocket 握手在各自 `_thread` 中执行，完成后才把 transport 交回 `uasyncio`。
-- 主 50 ms 循环只执行硬件、动作、状态和反射；硬件对象不跨连接线程。
+- 控制 client 使用 `ConnectionWorker` 隔离 DNS/TCP/WebSocket 握手；媒体使用单一 `MediaRuntimeWorker` 线程独占 Camera、I2S、媒体 WebSocket、重连和关闭生命周期，不把媒体 transport 交回 `uasyncio`。
+- 主 50 ms 循环只执行控制硬件、动作、状态和反射，并通过单槽 mailbox/标量快照与媒体线程通信；`_thread` 不可用时媒体关闭，不回退到安全循环同步采集。
 - 固件 heartbeat 上报控制权、反射、运动、媒体和本地 loop 指标；7 秒未收到 Host 消息时取消 Host skill 并进入本地自治。
 - 语义 `skills/expression` 优先于兼容 `actions`，避免重复执行。
 - 固件能量 VAD设置 speech/end-of-utterance flags；Host 本地 VAD只在固件未标注时补充。
 - TTS 期间只停止麦克风上传，摄像头继续按 10/15 FPS 上传；收到 `tts_end` 且音频缓冲排空后立即恢复麦克风。Host 仍单独执行 200 ms 恢复延迟。
 - 反射优先于网络、媒体、TTS 和 Host intent。媒体设备 unavailable 或媒体连接失败时，控制和反射路径继续运行。
 
-固件当前只支持明文 `ws://`。连接 worker 降低握手阻塞风险，但不等于 FreeRTOS 高优先级隔离，也没有真实板上时序保证。
+固件当前只支持明文 `ws://`。媒体线程隔离和控制连接 worker 降低阻塞安全循环的风险，但不等于 FreeRTOS 高优先级隔离，也没有真实板上时序保证。
 
 ## Dashboard 与模拟器
 

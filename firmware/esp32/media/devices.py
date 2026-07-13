@@ -28,6 +28,7 @@ class Camera:
         self.module = camera_module if camera_module is not None else _load_camera_module()
         self.available = False
         self.last_error = None
+        self._closed = False
         if self.module is None:
             return
         try:
@@ -86,6 +87,17 @@ class Camera:
         except Exception:
             return 0
 
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self.available = False
+        if self.module is not None and hasattr(self.module, "deinit"):
+            try:
+                self.module.deinit()
+            except Exception as exc:
+                self.last_error = exc
+
 
 class AudioInput:
     def __init__(self, i2s_class=None, pin_factory=None, chunk_bytes=PCM_CHUNK_BYTES):
@@ -118,6 +130,7 @@ class AudioInput:
             self.available = True
         except Exception as exc:
             self.last_error = exc
+            self._deinit()
 
     def read_chunk(self):
         if not self.available or self.i2s is None or not self._ready:
@@ -136,6 +149,23 @@ class AudioInput:
 
     def _mark_ready(self, _i2s):
         self._ready = True
+
+    def close(self):
+        self.available = False
+        self._ready = False
+        self._deinit()
+
+    def _deinit(self):
+        if self.i2s is None:
+            return
+        try:
+            if hasattr(self.i2s, "irq"):
+                self.i2s.irq(None)
+            if hasattr(self.i2s, "deinit"):
+                self.i2s.deinit()
+        except Exception as exc:
+            self.last_error = exc
+        self.i2s = None
 
 
 class AudioOutput:
@@ -168,6 +198,7 @@ class AudioOutput:
             self.available = True
         except Exception as exc:
             self.last_error = exc
+            self._deinit()
 
     def write(self, payload):
         if not self.available or self.i2s is None or not self._ready:
@@ -182,3 +213,20 @@ class AudioOutput:
 
     def _mark_ready(self, _i2s):
         self._ready = True
+
+    def close(self):
+        self.available = False
+        self._ready = False
+        self._deinit()
+
+    def _deinit(self):
+        if self.i2s is None:
+            return
+        try:
+            if hasattr(self.i2s, "irq"):
+                self.i2s.irq(None)
+            if hasattr(self.i2s, "deinit"):
+                self.i2s.deinit()
+        except Exception as exc:
+            self.last_error = exc
+        self.i2s = None

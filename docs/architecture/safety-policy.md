@@ -47,7 +47,7 @@ L3 只输出 `goal/text/expression/skills/memory_suggestion`；L2 `BehaviorRunti
 - Host 心跳超时后取消 Host skill，进入本地自治；反射仍可执行。
 - 语义 `skills/expression` 优先于兼容 `actions`，避免重复动作。
 - 动作未实现或执行失败必须返回 `error`，不能回假 `ack`。
-- 固件不保存长期记忆、不调用 LLM、不实现 Dashboard/Blockly，也不把硬件对象交给连接 worker 线程。
+- 固件不保存长期记忆、不调用 LLM、不实现 Dashboard/Blockly。控制硬件始终留在安全循环；Camera/I2S 只由独立媒体 runtime 线程独占，不交给控制连接 worker。
 - 未实现力反馈、电流检测、触觉或边缘检测前，不启用夹持或桌边反射。
 
 ## 硬件事实边界

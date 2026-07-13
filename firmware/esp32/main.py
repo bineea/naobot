@@ -33,7 +33,7 @@ from hardware.servo import ServoBank
 from hardware.touch import TouchInputs
 from interaction.event_adapter import EventAdapter
 from interaction.local_fallback import LocalFallback
-from media.client import media_loop
+from media.runtime_worker import create_default_worker
 from motion.action_player import ActionPlayer
 from reflex.reflex_controller import ReflexController
 from safety.guard import MOVEMENT_ACTIONS, SafetyGuard
@@ -384,7 +384,8 @@ async def main():
     fallback = LocalFallback(display, actions)
     adapter = EventAdapter(touch, imu, power)
     protocol = FirmwareProtocol(SESSION_ID)
-    media_state = {}
+    media_worker = create_default_worker()
+    media_state = media_worker.snapshot()
     network_state = {
         "ws": None,
         "agent_online": False,
@@ -400,32 +401,36 @@ async def main():
     display.set_face("idle")
     print("naobot firmware booted; agent:", AGENT_WS_URL)
     asyncio.create_task(network_loop(display, power, imu, actions, safety, protocol, network_state, motion, reflex))
-    asyncio.create_task(media_loop(media_state))
+    media_worker.start()
 
     previous_loop_start = None
-    while True:
-        loop_start = now_ms()
-        if previous_loop_start is not None:
-            network_state["local_loop_interval_ms"] = max(
-                0, ticks_diff(loop_start, previous_loop_start)
-            )
-        previous_loop_start = loop_start
-        if reflex.check():
-            motion.cancel("reflex")
-            reflex.run()
-        motion.tick()
-        event = adapter.poll()
-        if event:
-            media_state["event_boost_until_ms"] = ticks_add(now_ms(), MEDIA_EVENT_BOOST_MS)
-            if not safety.can_emit_event(event):
-                actions.stop()
-                display.set_face("alert")
-            else:
-                ws = network_state.get("ws")
-                envelope = protocol.event(event, power, imu, reflex, motion, network_state)
-                if not ws or not ws.connected or not ws.send_json(envelope):
-                    fallback.handle(event)
-        await sleep_to_safety_deadline(loop_start, network_state)
+    try:
+        while True:
+            loop_start = now_ms()
+            network_state["media"] = media_worker.snapshot()
+            if previous_loop_start is not None:
+                network_state["local_loop_interval_ms"] = max(
+                    0, ticks_diff(loop_start, previous_loop_start)
+                )
+            previous_loop_start = loop_start
+            if reflex.check():
+                motion.cancel("reflex")
+                reflex.run()
+            motion.tick()
+            event = adapter.poll()
+            if event:
+                media_worker.request_event_boost(ticks_add(now_ms(), MEDIA_EVENT_BOOST_MS))
+                if not safety.can_emit_event(event):
+                    actions.stop()
+                    display.set_face("alert")
+                else:
+                    ws = network_state.get("ws")
+                    envelope = protocol.event(event, power, imu, reflex, motion, network_state)
+                    if not ws or not ws.connected or not ws.send_json(envelope):
+                        fallback.handle(event)
+            await sleep_to_safety_deadline(loop_start, network_state)
+    finally:
+        media_worker.stop()
 
 
 if __name__ == "__main__":

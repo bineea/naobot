@@ -1,16 +1,9 @@
 import json
 
 try:
-    import uasyncio as asyncio
-except ImportError:
-    import asyncio
-
-try:
     import utime as time
 except ImportError:
     import time
-
-from comm.connection_worker import ConnectionWorker
 
 from media.devices import AudioInput, AudioOutput, Camera
 from media.protocol import (
@@ -54,13 +47,6 @@ def ticks_diff(end, start):
     if hasattr(time, "ticks_diff"):
         return time.ticks_diff(end, start)
     return end - start
-
-
-async def sleep_ms(delay_ms):
-    if hasattr(asyncio, "sleep_ms"):
-        await asyncio.sleep_ms(delay_ms)
-    else:
-        await asyncio.sleep(delay_ms / 1000)
 
 
 class VideoScheduler:
@@ -149,7 +135,6 @@ class MediaClient:
         vad=None,
         tts_buffer_limit_bytes=TTS_BUFFER_LIMIT_BYTES,
         tts_playback_timeout_ms=TTS_PLAYBACK_TIMEOUT_MS,
-        connection_worker_factory=ConnectionWorker,
     ):
         self.url = url
         self.device_id = device_id
@@ -160,7 +145,6 @@ class MediaClient:
         self.audio_output = audio_output or AudioOutput()
         self.transport_factory = transport_factory or MediaWebSocket
         self.transport = None
-        self._connection_worker = connection_worker_factory(self._new_transport)
         self.queue = MediaQueue(queue_limit)
         self.vad = vad or EnergyVAD()
         self.tts_buffer_limit_bytes = max(1024, tts_buffer_limit_bytes)
@@ -187,7 +171,25 @@ class MediaClient:
         self._tts_last_progress_ms = None
 
     def connect(self):
-        return self._poll_connection()
+        if self.transport is not None and self.transport.connected:
+            return True
+        transport = None
+        try:
+            transport = self._new_transport()
+            if transport is None or not transport.connect():
+                if transport is not None:
+                    transport.close()
+                return False
+            return self._activate_transport(transport)
+        except Exception as exc:
+            print("media connect error:", exc)
+            if transport is not None:
+                try:
+                    transport.close()
+                except Exception:
+                    pass
+            self._disconnect()
+            return False
 
     def _new_transport(self):
         return self.transport_factory(self.url)
@@ -211,7 +213,7 @@ class MediaClient:
         current_ms = now_ms() if current_ms is None else current_ms
         try:
             if self.transport is None or not self.transport.connected:
-                if not self._poll_connection():
+                if not self.connect():
                     return False
             incoming = self.transport.recv_frame()
             if incoming is not None:
@@ -239,22 +241,6 @@ class MediaClient:
             self._disconnect()
             self._update_state(current_ms)
             return False
-
-    def _poll_connection(self):
-        done, transport = self._connection_worker.poll()
-        if done:
-            if transport is None:
-                self._disconnect()
-                return False
-            return self._activate_transport(transport)
-        self._connection_worker.start()
-        done, transport = self._connection_worker.poll()
-        if not done:
-            return False
-        if transport is None:
-            self._disconnect()
-            return False
-        return self._activate_transport(transport)
 
     def collect(self, current_ms, event_boost=False, audio_flags=0):
         event_flag = FLAG_EVENT_BOOST if event_boost else 0
@@ -414,6 +400,16 @@ class MediaClient:
         self._reset_tts()
         self.vad.reset()
 
+    def close(self):
+        self._disconnect()
+        for device in (self.camera, self.audio_input, self.audio_output):
+            close = getattr(device, "close", None)
+            if close:
+                try:
+                    close()
+                except Exception as exc:
+                    print("media device close error:", exc)
+
 
 def create_media_client(state):
     from config import DEVICE_ID, DEVICE_TOKEN, MEDIA_QUEUE_LIMIT, MEDIA_WS_URL
@@ -426,12 +422,3 @@ def create_media_client(state):
         state=state,
         queue_limit=MEDIA_QUEUE_LIMIT,
     )
-
-
-async def media_loop(state):
-    from config import MEDIA_LOOP_INTERVAL_MS, MEDIA_RECONNECT_DELAY_MS
-
-    client = create_media_client(state)
-    while True:
-        connected = client.step()
-        await sleep_ms(MEDIA_LOOP_INTERVAL_MS if connected else MEDIA_RECONNECT_DELAY_MS)

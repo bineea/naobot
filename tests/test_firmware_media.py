@@ -54,6 +54,7 @@ class FakeCameraModule:
         self.frames = [b"jpeg-a", b"jpeg-b"]
         self.frame_ready = True
         self.capture_calls = 0
+        self.deinit_calls = 0
 
     def init(self, config):
         self.config = dict(config)
@@ -73,6 +74,10 @@ class FakeCameraModule:
     def psram_free(self):
         return 7_654_321
 
+    def deinit(self):
+        self.deinit_calls += 1
+        return True
+
 
 class FakeI2S:
     RX = 1
@@ -86,6 +91,7 @@ class FakeI2S:
         self.kwargs = kwargs
         self.writes = []
         self.irq_handler = None
+        self.deinit_calls = 0
         self.__class__.instances.append(self)
 
     def irq(self, handler):
@@ -102,6 +108,9 @@ class FakeI2S:
     def write(self, payload):
         self.writes.append(bytes(payload))
         return len(payload)
+
+    def deinit(self):
+        self.deinit_calls += 1
 
 
 class FakeTransport:
@@ -781,8 +790,7 @@ def test_media_client_sends_identity_hello_before_binary_media() -> None:
     transport = FakeTransport()
     client = make_client(transport)
 
-    assert client.step(0) is False
-    assert wait_for_media_step(client, start_ms=1)
+    assert client.step(0) is True
 
     hello = json.loads(transport.sent_text[0])
     assert hello == {
@@ -828,7 +836,7 @@ def test_media_client_reconnects_after_disconnect_without_raising() -> None:
     assert state["media_connected"] is True
 
 
-def test_media_step_starts_blocking_connect_off_uasyncio_thread() -> None:
+def test_media_client_connect_runs_inline_for_single_thread_ownership() -> None:
     release_connect = threading.Event()
 
     class BlockingTransport(FakeTransport):
@@ -840,27 +848,28 @@ def test_media_step_starts_blocking_connect_off_uasyncio_thread() -> None:
     transport = BlockingTransport()
     client = make_client(transport)
 
+    timer = threading.Timer(0.02, release_connect.set)
+    timer.start()
     started = time.perf_counter()
-    assert client.step(0) is False
-    elapsed = time.perf_counter() - started
-    release_connect.set()
+    assert client.step(0) is True
+    timer.join()
 
-    assert elapsed < 0.05
+    assert time.perf_counter() - started >= 0.015
 
 
-def test_media_connect_api_never_runs_blocking_transport_inline() -> None:
-    class SlowTransport(FakeTransport):
-        def connect(self):
-            time.sleep(0.1)
-            self.connected = True
-            return True
+def test_media_client_close_releases_camera_and_i2s_once() -> None:
+    camera_module = FakeCameraModule()
+    camera = Camera(camera_module=camera_module)
+    audio_in = AudioInput(i2s_class=FakeI2S, pin_factory=pin_number)
+    audio_out = AudioOutput(i2s_class=FakeI2S, pin_factory=pin_number)
+    client = make_client(FakeTransport(), camera=camera, audio_in=audio_in, audio_out=audio_out)
 
-    client = make_client(SlowTransport())
+    client.close()
+    client.close()
 
-    started = time.perf_counter()
-    assert client.connect() is False
-
-    assert time.perf_counter() - started < 0.05
+    assert camera_module.deinit_calls == 1
+    assert audio_in.i2s is None
+    assert audio_out.i2s is None
 
 
 def test_tts_downlink_keeps_video_but_pauses_audio_until_tts_end() -> None:
@@ -1278,5 +1287,5 @@ def test_readme_reports_recipe_only_and_no_freertos_isolation_claim() -> None:
     assert "未实际执行 C 编译" in readme
     assert "不提供 FreeRTOS 高优先级隔离保证" in readme
     assert "静态结构检查" in readme
-    assert "DNS、TCP 和 WebSocket 握手" in readme
-    assert "硬件、动作和反射对象不会跨线程" in readme
+    assert "DNS/TCP/WebSocket 握手" in readme
+    assert "独立 `MediaRuntimeWorker` 线程" in readme
