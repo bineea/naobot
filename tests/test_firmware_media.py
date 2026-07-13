@@ -521,6 +521,30 @@ def test_media_websocket_validates_accept_and_preserves_upgrade_leftover(monkeyp
     assert bytes(websocket._rx) == leftover
 
 
+def test_media_websocket_handshake_includes_optional_request_headers(monkeypatch) -> None:
+    nonce = b"0123456789abcdef"
+    key = base64.b64encode(nonce).decode()
+    accept = base64.b64encode(
+        hashlib.sha1((key + media_websocket.GUID).encode()).digest()
+    ).decode()
+    response = (
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+    ).encode()
+    sock = ScriptedSocket((response,))
+    websocket = MediaWebSocket(
+        "ws://host:8765/ws/kt2",
+        headers={"X-Naobot-Token": "device-secret"},
+    )
+    websocket.sock = sock
+    monkeypatch.setattr(media_websocket, "_random_bytes", lambda _length: nonce)
+
+    websocket._handshake()
+
+    request = b"".join(sock.sent)
+    assert b"X-Naobot-Token: device-secret\r\n" in request
+
+
 def test_media_websocket_rejects_invalid_accept(monkeypatch) -> None:
     nonce = b"0123456789abcdef"
     response = (

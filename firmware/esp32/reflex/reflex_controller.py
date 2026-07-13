@@ -12,6 +12,7 @@ class ReflexController:
         self.state = "none"
         self.authority = "idle"
         self.last_reflex = None
+        self._active_reflex = None
         self.emergency_stop = False
 
     def request_emergency_stop(self):
@@ -35,6 +36,7 @@ class ReflexController:
         if self.state in ("fall_detected", "recovering", "low_battery"):
             self.state = "recovered"
             self.authority = "idle"
+            self._active_reflex = None
         elif self.state != "recovered":
             self.state = "none"
             self.authority = "idle"
@@ -42,17 +44,21 @@ class ReflexController:
 
     def run(self):
         if self.state == "emergency_stop":
-            self.actions.stop()
-            self.display.set_face("alert")
-            self.last_reflex = "emergency_stop"
+            if self._active_reflex != "emergency_stop":
+                self.actions.stop()
+                self.display.set_face("alert")
+                self.last_reflex = "emergency_stop"
+                self._active_reflex = "emergency_stop"
             return True
         if self.state == "low_battery":
-            if self.last_reflex != "low_battery_sit":
+            if self._active_reflex != "low_battery":
                 self.last_reflex = run_low_battery_reflex(self.actions, self.display, self.buzzer)
+                self._active_reflex = "low_battery"
             return True
         if self.state == "fall_detected":
-            if self.last_reflex != "brace_and_sit":
+            if self._active_reflex != "fall_detected":
                 self.last_reflex = run_fall_reflex(self.actions, self.display, self.buzzer)
+                self._active_reflex = "fall_detected"
             return True
         return False
 

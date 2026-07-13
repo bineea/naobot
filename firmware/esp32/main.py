@@ -14,6 +14,7 @@ from comm.wifi_config import connect_wifi_async
 from config import (
     AGENT_WS_URL,
     BRAIN_HEARTBEAT_TIMEOUT_MS,
+    DEVICE_TOKEN,
     FIRMWARE_HEARTBEAT_INTERVAL_MS,
     MEDIA_EVENT_BOOST_MS,
     SAFETY_LOOP_PERIOD_MS,
@@ -35,7 +36,7 @@ from interaction.local_fallback import LocalFallback
 from media.client import media_loop
 from motion.action_player import ActionPlayer
 from reflex.reflex_controller import ReflexController
-from safety.guard import SafetyGuard
+from safety.guard import MOVEMENT_ACTIONS, SafetyGuard
 
 
 def now_ms():
@@ -180,7 +181,37 @@ def _semantic_actions(payload):
     return action_items
 
 
-def execute_intent(message, actions, safety, protocol, ws, motion=None, reflex=None):
+def _estimated_host_now(state, clock):
+    if not state:
+        return None
+    host_ts = state.get("last_host_ts_ms")
+    local_seen = state.get("last_host_clock_seen_ms")
+    if not isinstance(host_ts, int) or not isinstance(local_seen, int):
+        return None
+    age = ticks_diff(clock(), local_seen)
+    if age < 0 or age > BRAIN_HEARTBEAT_TIMEOUT_MS:
+        return None
+    return host_ts + age
+
+
+def _has_movement(action_list):
+    return any(
+        isinstance(action, dict) and action.get("name") in MOVEMENT_ACTIONS
+        for action in action_list
+    )
+
+
+def execute_intent(
+    message,
+    actions,
+    safety,
+    protocol,
+    ws,
+    motion=None,
+    reflex=None,
+    state=None,
+    clock=now_ms,
+):
     intent_id = message.get("id")
     payload = message.get("payload", {})
     action_list = _semantic_actions(payload)
@@ -197,6 +228,47 @@ def execute_intent(message, actions, safety, protocol, ws, motion=None, reflex=N
             actions.stop()
         ws.send_json(protocol.ack(intent_id))
         return
+
+    if hasattr(safety, "can_accept_payload") and not safety.can_accept_payload(payload):
+        ws.send_json(protocol.error("POLICY_DENIED", "intent contains forbidden fields", intent_id))
+        return
+
+    if reflex and hasattr(reflex, "check"):
+        reflex.check()
+    reflex_state = getattr(reflex, "state", "none") if reflex else "none"
+    if getattr(reflex, "emergency_stop", False) or reflex_state in (
+        "emergency_stop",
+        "fall_detected",
+        "recovering",
+        "fault",
+    ):
+        ws.send_json(protocol.error("REFLEX_ACTIVE", "active reflex rejected intent", intent_id))
+        return
+    if reflex_state == "low_battery" and _has_movement(action_list):
+        ws.send_json(protocol.error("REFLEX_ACTIVE", "low battery rejected movement", intent_id))
+        return
+
+    host_now = _estimated_host_now(state, clock)
+    if _has_movement(action_list) and host_now is None:
+        ws.send_json(
+            protocol.error(
+                "HOST_CLOCK_UNAVAILABLE",
+                "movement requires a recent host heartbeat clock",
+                intent_id,
+            )
+        )
+        return
+    deadline_ms = message.get("deadline_ms")
+    if deadline_ms is not None and host_now is not None:
+        intent_ts = message.get("ts_ms")
+        if (
+            not isinstance(intent_ts, int)
+            or not isinstance(deadline_ms, int)
+            or deadline_ms < 0
+            or host_now > intent_ts + deadline_ms
+        ):
+            ws.send_json(protocol.error("INTENT_EXPIRED", "intent deadline expired", intent_id))
+            return
 
     for action in action_list:
         if not isinstance(action, dict) or not safety.can_execute(action):
@@ -228,9 +300,18 @@ def handle_agent_message(message, actions, safety, protocol, ws, motion=None, re
                 display.show_status("agent online")
     msg_type = message.get("type")
     if msg_type == "heartbeat":
+        payload = message.get("payload", {})
+        host_ts_ms = payload.get("host_ts_ms") if isinstance(payload, dict) else None
+        if (
+            state is not None
+            and payload.get("source") == "host"
+            and isinstance(host_ts_ms, int)
+        ):
+            state["last_host_ts_ms"] = host_ts_ms
+            state["last_host_clock_seen_ms"] = state["last_brain_seen_ms"]
         return
     if msg_type == "intent":
-        execute_intent(message, actions, safety, protocol, ws, motion, reflex)
+        execute_intent(message, actions, safety, protocol, ws, motion, reflex, state)
 
 
 def check_brain_timeout(state, display, motion):
@@ -247,7 +328,7 @@ def check_brain_timeout(state, display, motion):
 
 
 async def network_loop(display, power, imu, actions, safety, protocol, state, motion, reflex):
-    connection_worker = ConnectionWorker(lambda: WebSocketClient(AGENT_WS_URL))
+    connection_worker = ConnectionWorker(lambda: WebSocketClient(AGENT_WS_URL, token=DEVICE_TOKEN))
     while True:
         if not await connect_wifi_async(WIFI_SSID, WIFI_PASSWORD, WIFI_CONNECT_TIMEOUT_MS):
             display.show_status("wifi offline")
@@ -308,6 +389,8 @@ async def main():
         "ws": None,
         "agent_online": False,
         "last_brain_seen_ms": None,
+        "last_host_ts_ms": None,
+        "last_host_clock_seen_ms": None,
         "local_loop_ms": 0,
         "local_loop_interval_ms": 0,
         "local_loop_overrun_ms": 0,

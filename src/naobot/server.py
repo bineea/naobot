@@ -293,6 +293,11 @@ def create_app(
 
     @app.websocket("/ws/kt2")
     async def ws_kt2(websocket: WebSocket) -> None:
+        if settings.device_token:
+            supplied_token = websocket.headers.get("x-naobot-token", "")
+            if not secrets.compare_digest(supplied_token, settings.device_token):
+                await websocket.close(code=1008, reason="invalid device token")
+                return
         await websocket.accept()
         robot_hub.connect(websocket)
         agent.state.agent_connected = True

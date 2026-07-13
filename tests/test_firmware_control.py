@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 FIRMWARE_ROOT = Path(__file__).resolve().parents[1] / "firmware" / "esp32"
 if str(FIRMWARE_ROOT) not in sys.path:
     sys.path.insert(0, str(FIRMWARE_ROOT))
@@ -8,6 +10,7 @@ if str(FIRMWARE_ROOT) not in sys.path:
 from control.motion_controller import MotionController  # noqa: E402
 from motion.action_player import ActionPlayer  # noqa: E402
 from reflex.reflex_controller import ReflexController  # noqa: E402
+from safety.guard import SafetyGuard  # noqa: E402
 
 
 class FakePower:
@@ -84,6 +87,89 @@ def test_reflex_controller_runs_fall_reflex_locally() -> None:
     assert "alert" in buzzer.tones
     assert reflex.status()["control_authority"] == "reflex"
     assert reflex.status()["last_reflex"] == "brace_and_sit"
+
+
+def test_reflex_controller_can_trigger_same_fall_again_after_recovery() -> None:
+    servos = FakeServos()
+    display = FakeDisplay()
+    buzzer = FakeBuzzer()
+    imu = FakeImu(fault=True)
+    actions = ActionPlayer(servos, display, buzzer)
+    reflex = ReflexController(FakePower(), imu, actions, display, buzzer)
+
+    assert reflex.check() and reflex.run()
+    imu.fault = False
+    assert reflex.check() is False
+    assert reflex.last_reflex == "brace_and_sit"
+    imu.fault = True
+    assert reflex.check() and reflex.run()
+
+    assert buzzer.tones.count("alert") == 2
+    assert reflex.last_reflex == "brace_and_sit"
+
+
+def test_reflex_controller_can_trigger_low_battery_again_after_recovery() -> None:
+    servos = FakeServos()
+    display = FakeDisplay()
+    buzzer = FakeBuzzer()
+    power = FakePower(low=True)
+    actions = ActionPlayer(servos, display, buzzer)
+    reflex = ReflexController(power, FakeImu(), actions, display, buzzer)
+
+    assert reflex.check() and reflex.run()
+    power.low = False
+    assert reflex.check() is False
+    power.low = True
+    assert reflex.check() and reflex.run()
+
+    assert buzzer.tones.count("low_battery") == 2
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        {"name": "wave", "args": {"level": 0}},
+        {"name": "wave", "args": {"level": 3}},
+        {"name": "small_step_forward", "args": {"steps": 0}},
+        {"name": "turn_left", "args": {"steps": 4}},
+        {"name": "set_face", "args": {"face": "unknown"}},
+        {"name": "chirp", "args": {"tone": "loud"}},
+        {"name": "set_expression", "args": {"emotion": "happy", "valence": 1.1}},
+        {"name": "set_expression", "args": {"emotion": "happy", "duration_ms": 5001}},
+        {"name": "blink", "args": {"unexpected": True}},
+        {"name": "wave", "args": {"nested": {"servo_id": 1}}},
+        {"name": "set_expression", "args": {"pixels": [[1, 0]]}},
+    ],
+)
+def test_safety_guard_rejects_invalid_parameters_and_recursive_raw_fields(action) -> None:
+    guard = SafetyGuard(FakePower(), FakeImu())
+    assert guard.can_execute(action) is False
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        {"name": "wave", "args": {"level": 2}},
+        {"name": "turn_right", "args": {"steps": 3}},
+        {"name": "set_face", "args": {"face": "happy"}},
+        {
+            "name": "set_expression",
+            "args": {
+                "emotion": "curious",
+                "valence": -1.0,
+                "arousal": 1.0,
+                "eye_open": 0.0,
+                "pupil_offset_x": 1.0,
+                "blink_rate": 0.0,
+                "duration_ms": 5000,
+            },
+        },
+        {"name": "chirp", "args": {"tone": "low_battery"}},
+    ],
+)
+def test_safety_guard_accepts_bounded_parameters(action) -> None:
+    guard = SafetyGuard(FakePower(), FakeImu())
+    assert guard.can_execute(action) is True
 
 
 def test_motion_controller_cancels_running_skill_when_reflex_triggers() -> None:

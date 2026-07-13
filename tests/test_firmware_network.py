@@ -14,6 +14,7 @@ firmware_main = importlib.import_module("main")
 websocket_client = importlib.import_module("comm.websocket_client")
 
 from comm.websocket_client import WebSocketClient, parse_ws_url  # noqa: E402
+from media.websocket import OP_CLOSE, OP_CONTINUATION, OP_PING, OP_TEXT  # noqa: E402
 from motion.action_player import ActionResult  # noqa: E402
 
 
@@ -84,6 +85,14 @@ class FakeMotion:
 
 
 class FakeReflex:
+    def __init__(self, state="none"):
+        self.state = state
+        self.emergency_stop = state == "emergency_stop"
+
+    def request_emergency_stop(self):
+        self.state = "emergency_stop"
+        self.emergency_stop = True
+
     def status(self, motion_state="idle"):
         return {
             "control_authority": "skill",
@@ -91,6 +100,33 @@ class FakeReflex:
             "motion_state": motion_state,
             "last_reflex": None,
         }
+
+
+class PartialSocket:
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+        self.sent = []
+        self.closed = False
+
+    def recv(self, size):
+        if not self.chunks:
+            raise TimeoutError()
+        chunk = self.chunks.pop(0)
+        if len(chunk) > size:
+            self.chunks.insert(0, chunk[size:])
+            chunk = chunk[:size]
+        return chunk
+
+    def send(self, payload):
+        self.sent.append(bytes(payload))
+        return len(payload)
+
+    def close(self):
+        self.closed = True
+
+
+def server_frame(opcode, payload=b"", *, fin=True):
+    return bytes(((0x80 if fin else 0) | opcode, len(payload))) + payload
 
 
 class FakeDisplay:
@@ -156,6 +192,28 @@ def test_websocket_text_frame_is_masked() -> None:
     assert frame[0] == 0x81
     assert frame[1] & 0x80
     assert decode_masked_payload(frame) == b"hello"
+
+
+def test_control_websocket_preserves_partial_frames_and_reassembles_continuations() -> None:
+    raw = (
+        server_frame(OP_TEXT, b'{"type":', fin=False)
+        + server_frame(OP_PING, b"alive")
+        + server_frame(OP_CONTINUATION, b'"heartbeat"}', fin=True)
+        + server_frame(OP_CLOSE, b"\x03\xe8")
+    )
+    sock = PartialSocket((raw[:1], raw[1:7], raw[7:]))
+    websocket = WebSocketClient("ws://host/ws")
+    websocket.sock = sock
+    websocket.connected = True
+
+    assert websocket.recv_json() is None
+    assert websocket.recv_json() is None
+    assert websocket.recv_json() is None
+    assert websocket.recv_json() is None
+    assert websocket.recv_json() == {"type": "heartbeat"}
+    assert websocket.recv_json() is None
+    assert websocket.connected is False
+    assert sock.closed is True
 
 
 def test_random_bytes_uses_byte_sized_getrandbits(monkeypatch) -> None:
@@ -255,6 +313,34 @@ def test_execute_intent_rejects_unsafe_action_without_execution() -> None:
     assert ws.sent[-1]["payload"]["code"] == "POLICY_DENIED"
 
 
+def test_execute_intent_rejects_forbidden_field_anywhere_in_payload() -> None:
+    actions = FakeActions()
+    ws = FakeWs()
+    safety = firmware_main.SafetyGuard(
+        type("Power", (), {"is_low": lambda self: False})(),
+        type("Imu", (), {"is_fault": lambda self: False})(),
+    )
+    message = {
+        "id": "intent-raw",
+        "payload": {
+            "metadata": {"framebuffer": [1, 0]},
+            "actions": [{"name": "set_face", "args": {"face": "happy"}}],
+        },
+    }
+
+    firmware_main.execute_intent(
+        message,
+        actions,
+        safety,
+        firmware_main.FirmwareProtocol("test"),
+        ws,
+        state={},
+    )
+
+    assert actions.executed == []
+    assert ws.sent[-1]["payload"]["code"] == "POLICY_DENIED"
+
+
 def test_execute_intent_reports_execution_failure() -> None:
     actions = FailingActions()
     ws = FakeWs()
@@ -303,9 +389,158 @@ def test_execute_intent_accepts_semantic_payload_with_motion_controller() -> Non
         },
     }
 
-    firmware_main.execute_intent(message, actions, FakeSafety(), protocol, ws, motion=motion)
+    state = {"last_host_ts_ms": 1000, "last_host_clock_seen_ms": 1000}
+    firmware_main.execute_intent(
+        message,
+        actions,
+        FakeSafety(),
+        protocol,
+        ws,
+        motion=motion,
+        state=state,
+        clock=lambda: 1000,
+    )
 
     assert motion.submitted == [message]
+    assert ws.sent[-1]["type"] == "ack"
+
+
+def test_execute_intent_rejects_expired_deadline_using_host_heartbeat_clock() -> None:
+    actions = FakeActions()
+    motion = FakeMotion()
+    ws = FakeWs()
+    message = {
+        "id": "expired",
+        "type": "intent",
+        "ts_ms": 10_000,
+        "deadline_ms": 1_000,
+        "payload": {"skills": [{"name": "wave", "args": {"level": 1}}]},
+    }
+    state = {"last_host_ts_ms": 10_000, "last_host_clock_seen_ms": 500}
+
+    firmware_main.execute_intent(
+        message,
+        actions,
+        FakeSafety(),
+        firmware_main.FirmwareProtocol("test"),
+        ws,
+        motion=motion,
+        state=state,
+        clock=lambda: 1_601,
+    )
+
+    assert motion.submitted == []
+    assert ws.sent[-1]["type"] == "error"
+    assert ws.sent[-1]["payload"]["code"] == "INTENT_EXPIRED"
+
+
+def test_execute_intent_without_host_clock_rejects_motion_but_allows_expression() -> None:
+    protocol = firmware_main.FirmwareProtocol("test")
+    motion = FakeMotion()
+    denied_ws = FakeWs()
+    firmware_main.execute_intent(
+        {"id": "move", "payload": {"skills": [{"name": "wave", "args": {}}]}},
+        FakeActions(),
+        FakeSafety(),
+        protocol,
+        denied_ws,
+        motion=motion,
+        state={},
+    )
+    assert motion.submitted == []
+    assert denied_ws.sent[-1]["payload"]["code"] == "HOST_CLOCK_UNAVAILABLE"
+
+    actions = FakeActions()
+    allowed_ws = FakeWs()
+    firmware_main.execute_intent(
+        {"id": "face", "payload": {"actions": [{"name": "set_face", "args": {"face": "happy"}}]}},
+        actions,
+        FakeSafety(),
+        protocol,
+        allowed_ws,
+        state={},
+    )
+    assert actions.executed == [{"name": "set_face", "args": {"face": "happy"}}]
+    assert allowed_ws.sent[-1]["type"] == "ack"
+
+
+@pytest.mark.parametrize("reflex_state", ["emergency_stop", "fall_detected", "recovering", "fault"])
+def test_execute_intent_rejects_non_stop_before_ack_during_critical_reflex(reflex_state) -> None:
+    actions = FakeActions()
+    ws = FakeWs()
+    firmware_main.execute_intent(
+        {"id": "unsafe-during-reflex", "payload": {"actions": [{"name": "chirp", "args": {}}]}},
+        actions,
+        FakeSafety(),
+        firmware_main.FirmwareProtocol("test"),
+        ws,
+        reflex=FakeReflex(reflex_state),
+        state={},
+    )
+
+    assert actions.executed == []
+    assert ws.sent[-1]["type"] == "error"
+    assert ws.sent[-1]["payload"]["code"] == "REFLEX_ACTIVE"
+
+
+def test_execute_intent_low_battery_rejects_motion_but_allows_chirp() -> None:
+    protocol = firmware_main.FirmwareProtocol("test")
+    motion = FakeMotion()
+    denied_ws = FakeWs()
+    clock_state = {"last_host_ts_ms": 1_000, "last_host_clock_seen_ms": 1_000}
+    firmware_main.execute_intent(
+        {"id": "move-low", "payload": {"skills": [{"name": "wave", "args": {}}]}},
+        FakeActions(),
+        FakeSafety(),
+        protocol,
+        denied_ws,
+        motion=motion,
+        reflex=FakeReflex("low_battery"),
+        state=clock_state,
+        clock=lambda: 1_000,
+    )
+    assert motion.submitted == []
+    assert denied_ws.sent[-1]["payload"]["code"] == "REFLEX_ACTIVE"
+
+    actions = FakeActions()
+    allowed_ws = FakeWs()
+    firmware_main.execute_intent(
+        {"id": "chirp-low", "payload": {"actions": [{"name": "chirp", "args": {}}]}},
+        actions,
+        FakeSafety(),
+        protocol,
+        allowed_ws,
+        reflex=FakeReflex("low_battery"),
+        state={},
+    )
+    assert actions.executed == [{"name": "chirp", "args": {}}]
+    assert allowed_ws.sent[-1]["type"] == "ack"
+
+
+def test_execute_intent_stop_bypasses_expired_deadline_and_active_reflex() -> None:
+    actions = FakeActions()
+    motion = FakeMotion()
+    ws = FakeWs()
+    reflex = FakeReflex("fall_detected")
+    firmware_main.execute_intent(
+        {
+            "id": "stop-now",
+            "ts_ms": 1,
+            "deadline_ms": 1,
+            "payload": {"actions": [{"name": "stop", "args": {}}]},
+        },
+        actions,
+        FakeSafety(allowed=False),
+        firmware_main.FirmwareProtocol("test"),
+        ws,
+        motion=motion,
+        reflex=reflex,
+        state={"last_host_ts_ms": 100_000, "last_host_clock_seen_ms": 0},
+        clock=lambda: 10,
+    )
+
+    assert motion.cancelled is True
+    assert reflex.emergency_stop is True
     assert ws.sent[-1]["type"] == "ack"
 
 
@@ -353,7 +588,7 @@ def test_host_heartbeat_updates_brain_seen_without_action(monkeypatch) -> None:
     monkeypatch.setattr(firmware_main, "now_ms", lambda: 1234)
 
     firmware_main.handle_agent_message(
-        {"type": "heartbeat", "payload": {"source": "host"}},
+        {"type": "heartbeat", "payload": {"source": "host", "host_ts_ms": 987654}},
         actions,
         FakeSafety(),
         protocol,
@@ -363,10 +598,35 @@ def test_host_heartbeat_updates_brain_seen_without_action(monkeypatch) -> None:
     )
 
     assert state["last_brain_seen_ms"] == 1234
+    assert state["last_host_ts_ms"] == 987654
+    assert state["last_host_clock_seen_ms"] == 1234
     assert state["agent_online"] is True
     assert actions.executed == []
     assert ws.sent == []
     assert display.statuses == ["agent online"]
+
+
+def test_non_host_heartbeat_cannot_replace_host_clock_anchor(monkeypatch) -> None:
+    state = {
+        "agent_online": True,
+        "last_brain_seen_ms": 100,
+        "last_host_ts_ms": 50_000,
+        "last_host_clock_seen_ms": 100,
+    }
+    monkeypatch.setattr(firmware_main, "now_ms", lambda: 200)
+
+    firmware_main.handle_agent_message(
+        {"type": "heartbeat", "payload": {"source": "firmware", "host_ts_ms": 999_999}},
+        FakeActions(),
+        FakeSafety(),
+        firmware_main.FirmwareProtocol("test"),
+        FakeWs(),
+        state=state,
+    )
+
+    assert state["last_brain_seen_ms"] == 200
+    assert state["last_host_ts_ms"] == 50_000
+    assert state["last_host_clock_seen_ms"] == 100
 
 
 def test_brain_timeout_cancels_motion_and_marks_offline(monkeypatch) -> None:

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 from starlette.status import HTTP_403_FORBIDDEN
+from starlette.websockets import WebSocketDisconnect
 
 from naobot.agent import NaobotAgent
 from naobot.llm import RuleBasedLLMClient
@@ -280,6 +281,29 @@ def test_robot_websocket_receives_host_heartbeat(tmp_path) -> None:
         assert heartbeat["type"] == "heartbeat"
         assert heartbeat["payload"]["source"] == "host"
         assert "host_ts_ms" in heartbeat["payload"]
+
+
+def test_robot_websocket_requires_device_token_when_configured(tmp_path) -> None:
+    settings = Settings(runtime_dir=tmp_path, device_token="secret-token")
+    agent = NaobotAgent(settings, llm=RuleBasedLLMClient())
+    client = TestClient(create_app(settings, agent, media_service=FakeMediaService()))
+
+    with pytest.raises(WebSocketDisconnect) as missing:
+        with client.websocket_connect("/ws/kt2"):
+            pass
+    assert missing.value.code == 1008
+
+    with pytest.raises(WebSocketDisconnect) as wrong:
+        with client.websocket_connect(
+            "/ws/kt2", headers={"X-Naobot-Token": "wrong-token"}
+        ):
+            pass
+    assert wrong.value.code == 1008
+
+    with client.websocket_connect(
+        "/ws/kt2", headers={"X-Naobot-Token": "secret-token"}
+    ) as websocket:
+        assert websocket.receive_json()["type"] == "heartbeat"
 
 
 def test_host_heartbeat_continues_while_brain_is_thinking(tmp_path) -> None:

@@ -105,6 +105,7 @@ class MediaWebSocket:
         send_chunk_bytes=MEDIA_SOCKET_SEND_CHUNK_BYTES,
         max_rx_bytes=DEFAULT_MAX_RX_BYTES,
         max_message_bytes=DEFAULT_MAX_MESSAGE_BYTES,
+        headers=None,
     ):
         self.url = url
         self.io_timeout_sec = min(io_timeout_sec, 0.01)
@@ -112,6 +113,7 @@ class MediaWebSocket:
         self.send_chunk_bytes = max(1, min(send_chunk_bytes, 1024))
         self.max_rx_bytes = max(128, max_rx_bytes)
         self.max_message_bytes = max(1, max_message_bytes)
+        self.headers = dict(headers or {})
         self.host, self.port, self.path = parse_ws_url(url)
         self.sock = None
         self.connected = False
@@ -157,8 +159,17 @@ class MediaWebSocket:
             + "Upgrade: websocket\r\n"
             + "Connection: Upgrade\r\n"
             + f"Sec-WebSocket-Key: {key}\r\n"
-            + "Sec-WebSocket-Version: 13\r\n\r\n"
+            + "Sec-WebSocket-Version: 13\r\n"
         )
+        for name, value in self.headers.items():
+            name = str(name)
+            value = str(value)
+            if "\r" in name or "\n" in name or ":" in name:
+                raise ValueError("invalid websocket header name")
+            if "\r" in value or "\n" in value:
+                raise ValueError("invalid websocket header value")
+            request += f"{name}: {value}\r\n"
+        request += "\r\n"
         self._send_http(request.encode())
         response = bytearray()
         boundary = -1
