@@ -14,6 +14,7 @@
 - OV2640 默认输出 QVGA JPEG（quality 12），使用两个 PSRAM framebuffer、PSRAM DMA 和 `GRAB_LATEST`。
 - INMP441 与 MAX98357A 均使用 PCM16、单声道、16 kHz I2S；TTS 播放期间暂停摄像头和麦克风上传。
 - `camera`、`machine.I2S` 或相应硬件缺失时，媒体设备标记为 unavailable，50 ms 本地安全循环继续运行。
+- 摄像头先检查可用帧再取 framebuffer；I2S RX 只在 IRQ readiness 后读取；控制接收和媒体 connect/recv/send 使用不超过 10 ms 的单次超时，媒体大帧每次最多发送 1 KiB。
 - 网络不可用时，固件继续使用本地 fallback，不阻塞安全循环。
 - `reflex/` 提供本地反射安全层，低电、跌倒、IMU fault 和急停优先于 Host intent。
 - `control/motion_controller.py` 提供可中断运动调度，运动 skill 可被 stop、低电或姿态异常抢占。
@@ -59,6 +60,8 @@ ESP32 和宿主机需要在同一局域网。先在宿主机运行 `naobot serve
 媒体 socket 连接后首先发送 `media_hello`，其中包含 `device_id`、`token`、`boot_id` 和 QVGA/PCM16 capability。二进制帧头固定为 `>4sBBHIQI`，字段顺序为 `magic, version, kind, flags, sequence, timestamp_ms, payload_length`；kind 1/2/3 分别表示 PCM16 上行、JPEG 上行和 TTS PCM16 下行。视频常态 10 FPS，本地事件后的短窗口为 15 FPS；队列拥塞时先淘汰旧视频，再淘汰非语音音频，不让媒体异常进入控制 socket。
 
 heartbeat 额外报告 `camera_fps`、`audio_state`、`media_queue`、`media_dropped` 和 `psram_free`。
+
+50 ms 安全循环按 deadline 补偿睡眠，并额外记录实际调度间隔和 overrun。当前实现基于 MicroPython `uasyncio` 协作式任务与有界 I/O，不提供 FreeRTOS 高优先级隔离保证；真实硬件驱动、GC 或底层网络栈仍可能引入抖动，必须通过板上 stall probe 验证。
 
 ## 定制 MicroPython 镜像
 
@@ -120,4 +123,4 @@ mpremote connect COM3 soft-reset
 
 ## 硬件验证状态
 
-当前只完成 CPython fake、静态编译和协议测试，尚未在真实 N16R8 44 针板、OV2640、INMP441、MAX98357A 或 CH343 串口链路上验证。首次 bring-up 必须检查 GPIO8/9 共线、摄像头帧稳定性、I2S 声道/幅值、PSRAM 余量、TTS 连续播放以及媒体拥塞时 50 ms 安全循环抖动。
+当前只完成 CPython fake、Python 语法检查、协议测试和构建配方结构验证，未实际执行 C 编译，也未生成真实 `.bin`。尚未在真实 N16R8 44 针板、OV2640、INMP441、MAX98357A 或 CH343 串口链路上验证。首次 bring-up 必须检查 GPIO8/9 共线、摄像头帧稳定性、I2S 声道/幅值、PSRAM 余量、TTS 连续播放以及媒体拥塞时 50 ms 安全循环抖动。

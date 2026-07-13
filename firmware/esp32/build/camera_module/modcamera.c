@@ -4,6 +4,7 @@
 #include "esp_heap_caps.h"
 #include "py/obj.h"
 #include "py/objdict.h"
+#include "py/mpthread.h"
 #include "py/runtime.h"
 
 static int camera_dict_get_int(mp_obj_dict_t *config, qstr key, int default_value) {
@@ -73,7 +74,9 @@ static mp_obj_t camera_deinit(void) {
 static MP_DEFINE_CONST_FUN_OBJ_0(camera_deinit_obj, camera_deinit);
 
 static mp_obj_t camera_capture(void) {
+    MP_THREAD_GIL_EXIT();
     camera_fb_t *frame = esp_camera_fb_get();
+    MP_THREAD_GIL_ENTER();
     if (frame == NULL) {
         return mp_const_none;
     }
@@ -82,6 +85,11 @@ static mp_obj_t camera_capture(void) {
     return payload;
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(camera_capture_obj, camera_capture);
+
+static mp_obj_t camera_available_frames(void) {
+    return mp_obj_new_bool(esp_camera_available_frames());
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(camera_available_frames_obj, camera_available_frames);
 
 static mp_obj_t camera_set_psram_dma(mp_obj_t enabled_in) {
     bool enabled = mp_obj_is_true(enabled_in);
@@ -99,6 +107,7 @@ static const mp_rom_map_elem_t camera_module_globals_table[] = {
     {MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&camera_init_obj)},
     {MP_ROM_QSTR(MP_QSTR_deinit), MP_ROM_PTR(&camera_deinit_obj)},
     {MP_ROM_QSTR(MP_QSTR_capture), MP_ROM_PTR(&camera_capture_obj)},
+    {MP_ROM_QSTR(MP_QSTR_available_frames), MP_ROM_PTR(&camera_available_frames_obj)},
     {MP_ROM_QSTR(MP_QSTR_set_psram_dma), MP_ROM_PTR(&camera_set_psram_dma_obj)},
     {MP_ROM_QSTR(MP_QSTR_psram_free), MP_ROM_PTR(&camera_psram_free_obj)},
     {MP_ROM_QSTR(MP_QSTR_FRAME_QVGA), MP_ROM_INT(FRAMESIZE_QVGA)},

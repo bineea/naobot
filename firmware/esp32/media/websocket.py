@@ -9,6 +9,11 @@ except ImportError:
     import binascii
 
 try:
+    import uhashlib as hashlib
+except ImportError:
+    import hashlib
+
+try:
     import urandom as random
 except ImportError:
     import random
@@ -18,11 +23,30 @@ try:
 except ImportError:
     import time
 
+try:
+    from config import (
+        MEDIA_SOCKET_CONNECT_TIMEOUT_SEC,
+        MEDIA_SOCKET_IO_TIMEOUT_SEC,
+        MEDIA_SOCKET_SEND_CHUNK_BYTES,
+    )
+except ImportError:
+    MEDIA_SOCKET_CONNECT_TIMEOUT_SEC = 0.01
+    MEDIA_SOCKET_IO_TIMEOUT_SEC = 0.01
+    MEDIA_SOCKET_SEND_CHUNK_BYTES = 1024
+
 OP_TEXT = 0x1
 OP_BINARY = 0x2
 OP_CLOSE = 0x8
 OP_PING = 0x9
 OP_PONG = 0xA
+GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+DEFAULT_MAX_RX_BYTES = 256 * 1024 + 64
+
+
+class _ProtocolError(Exception):
+    def __init__(self, close_code=1002):
+        super().__init__("websocket protocol error")
+        self.close_code = close_code
 
 
 def parse_ws_url(url):
@@ -61,22 +85,50 @@ def _b64(data):
     return encoded.strip()
 
 
+def _sha1(data):
+    try:
+        return hashlib.sha1(data).digest()
+    except TypeError:
+        digest = hashlib.sha1()
+        digest.update(data)
+        return digest.digest()
+
+
 class MediaWebSocket:
-    def __init__(self, url, io_timeout_sec=0.02):
+    def __init__(
+        self,
+        url,
+        io_timeout_sec=MEDIA_SOCKET_IO_TIMEOUT_SEC,
+        connect_timeout_sec=MEDIA_SOCKET_CONNECT_TIMEOUT_SEC,
+        send_chunk_bytes=MEDIA_SOCKET_SEND_CHUNK_BYTES,
+        max_rx_bytes=DEFAULT_MAX_RX_BYTES,
+    ):
         self.url = url
-        self.io_timeout_sec = io_timeout_sec
+        self.io_timeout_sec = min(io_timeout_sec, 0.01)
+        self.connect_timeout_sec = min(connect_timeout_sec, 0.01)
+        self.send_chunk_bytes = max(1, min(send_chunk_bytes, 1024))
+        self.max_rx_bytes = max(128, max_rx_bytes)
         self.host, self.port, self.path = parse_ws_url(url)
         self.sock = None
         self.connected = False
         self._rx = bytearray()
+        self._tx_header = None
+        self._tx_payload = None
+        self._tx_mask = None
+        self._tx_offset = 0
+        self._tx_total = 0
+
+    @property
+    def tx_pending(self):
+        return self._tx_header is not None
 
     def connect(self):
-        self.close()
+        self.close(send_close=False)
         try:
             address = socket.getaddrinfo(self.host, self.port)[0][-1]
             self.sock = socket.socket()
             if hasattr(self.sock, "settimeout"):
-                self.sock.settimeout(2)
+                self.sock.settimeout(self.connect_timeout_sec)
             self.sock.connect(address)
             self._handshake()
             if hasattr(self.sock, "settimeout"):
@@ -85,11 +137,12 @@ class MediaWebSocket:
             return True
         except Exception as exc:
             print("media websocket connect failed:", exc)
-            self.close()
+            self.close(send_close=False)
             return False
 
     def _handshake(self):
         key = _b64(_random_bytes(16))
+        expected_accept = _b64(_sha1((key + GUID).encode()))
         request = (
             f"GET {self.path} HTTP/1.1\r\n"
             + f"Host: {self.host}:{self.port}\r\n"
@@ -98,61 +151,152 @@ class MediaWebSocket:
             + f"Sec-WebSocket-Key: {key}\r\n"
             + "Sec-WebSocket-Version: 13\r\n\r\n"
         )
-        self._send_all(request.encode())
-        response = b""
-        while b"\r\n\r\n" not in response and len(response) <= 4096:
-            chunk = self.sock.recv(512)
+        self._send_http(request.encode())
+        response = bytearray()
+        boundary = -1
+        while boundary < 0 and len(response) <= 4096:
+            chunk = self.sock.recv(min(512, 4097 - len(response)))
             if not chunk:
                 break
-            response += chunk
-        if b" 101 " not in response.split(b"\r\n", 1)[0]:
+            response.extend(chunk)
+            boundary = response.find(b"\r\n\r\n")
+        if boundary < 0:
+            raise OSError("incomplete media websocket upgrade")
+        header_end = boundary + 4
+        header = bytes(response[:boundary])
+        lines = header.split(b"\r\n")
+        if not lines or b" 101 " not in lines[0]:
             raise OSError("media websocket upgrade rejected")
+        headers = {}
+        for line in lines[1:]:
+            if b":" in line:
+                name, value = line.split(b":", 1)
+                headers[name.strip().lower()] = value.strip()
+        accept = headers.get(b"sec-websocket-accept", b"")
+        if accept.decode() != expected_accept:
+            raise OSError("invalid websocket accept")
+        self._rx.extend(response[header_end:])
 
     def send_text(self, text):
         if not isinstance(text, bytes):
             text = text.encode()
-        return self._send_frame(text, OP_TEXT)
+        return self._queue_and_start(text, OP_TEXT)
 
     def send_binary(self, payload):
-        return self._send_frame(payload, OP_BINARY)
+        return self._queue_and_start(payload, OP_BINARY)
 
-    def _send_frame(self, payload, opcode):
+    def _queue_and_start(self, payload, opcode):
+        if not self.connected or self.sock is None or self.tx_pending:
+            return False
+        self._prepare_tx(payload, opcode)
+        self._tx_offset = 0
+        return self.flush_tx_chunk()
+
+    def _prepare_tx(self, payload, opcode):
+        payload = bytes(payload)
+        length = len(payload)
+        mask = _random_bytes(4)
+        header = bytearray([0x80 | opcode])
+        if length < 126:
+            header.append(0x80 | length)
+        elif length < 65536:
+            header.extend((0x80 | 126, (length >> 8) & 0xFF, length & 0xFF))
+        else:
+            header.append(0x80 | 127)
+            for shift in range(56, -1, -8):
+                header.append((length >> shift) & 0xFF)
+        header.extend(mask)
+        self._tx_header = bytes(header)
+        self._tx_payload = payload
+        self._tx_mask = mask
+        self._tx_total = len(header) + length
+
+    def flush_tx_chunk(self):
+        if not self.tx_pending:
+            return True
         if not self.connected or self.sock is None:
             return False
+        chunk = self._tx_chunk()
         try:
-            self._send_all(self._encode_frame(payload, opcode))
-            return True
-        except Exception:
-            self.close()
+            count = self.sock.send(chunk)
+        except OSError as exc:
+            if self._is_temporary_receive_error(exc):
+                return True
+            self.close(send_close=False)
             return False
+        if not count:
+            self.close(send_close=False)
+            return False
+        self._tx_offset += count
+        if self._tx_offset >= self._tx_total:
+            self._clear_tx()
+        return True
+
+    def _tx_chunk(self):
+        remaining = min(self.send_chunk_bytes, self._tx_total - self._tx_offset)
+        chunk = bytearray()
+        header_length = len(self._tx_header)
+        if self._tx_offset < header_length:
+            header_end = min(header_length, self._tx_offset + remaining)
+            chunk.extend(self._tx_header[self._tx_offset:header_end])
+            remaining -= header_end - self._tx_offset
+        if remaining:
+            payload_start = max(0, self._tx_offset - header_length)
+            payload_end = payload_start + remaining
+            chunk.extend(
+                self._tx_payload[index] ^ self._tx_mask[index % 4]
+                for index in range(payload_start, payload_end)
+            )
+        return bytes(chunk)
+
+    def _clear_tx(self):
+        self._tx_header = None
+        self._tx_payload = None
+        self._tx_mask = None
+        self._tx_offset = 0
+        self._tx_total = 0
 
     def recv_frame(self):
         if not self.connected or self.sock is None:
             return None
         try:
-            chunk = self.sock.recv(4096)
-            if chunk:
-                self._rx.extend(chunk)
-            else:
-                self.close()
+            frame = self._parse_frame()
+            if frame is None:
+                remaining = self.max_rx_bytes - len(self._rx)
+                if remaining <= 0:
+                    raise _ProtocolError(1009)
+                try:
+                    chunk = self.sock.recv(min(4096, remaining))
+                    if chunk:
+                        self._rx.extend(chunk)
+                    else:
+                        self.close(send_close=False)
+                        return None
+                except OSError as exc:
+                    if not self._is_temporary_receive_error(exc):
+                        self.close(send_close=False)
+                    return None
+                frame = self._parse_frame()
+            if frame is None:
                 return None
-        except OSError as exc:
-            if not self._is_temporary_receive_error(exc):
-                self.close()
+            opcode, payload = frame
+            if opcode == OP_CLOSE:
+                self._send_control_now(OP_CLOSE, payload or b"\x03\xe8")
+                self.close(send_close=False)
                 return None
-        frame = self._parse_frame()
-        if frame is None:
-            return None
-        opcode, payload = frame
-        if opcode == OP_CLOSE:
-            self.close()
-            return None
-        if opcode == OP_PING:
-            self._send_frame(payload, OP_PONG)
-            return None
-        if opcode in (OP_TEXT, OP_BINARY):
+            if opcode == OP_PING:
+                self._send_control_now(OP_PONG, payload)
+                return None
+            if opcode == OP_PONG:
+                return None
             return opcode, payload
-        return None
+        except _ProtocolError as exc:
+            self._close_with_code(exc.close_code)
+            return None
+        except Exception as exc:
+            print("media websocket recv failed:", exc)
+            self.close(send_close=False)
+            return None
 
     @staticmethod
     def _is_temporary_receive_error(exc):
@@ -164,9 +308,19 @@ class MediaWebSocket:
     def _parse_frame(self):
         if len(self._rx) < 2:
             return None
-        opcode = self._rx[0] & 0x0F
-        masked = bool(self._rx[1] & 0x80)
-        payload_length = self._rx[1] & 0x7F
+        first, second = self._rx[0], self._rx[1]
+        fin = bool(first & 0x80)
+        rsv = first & 0x70
+        opcode = first & 0x0F
+        masked = bool(second & 0x80)
+        payload_length = second & 0x7F
+        if rsv or masked or not fin:
+            raise _ProtocolError(1002)
+        if opcode not in (OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG):
+            raise _ProtocolError(1002)
+        is_control = opcode >= 0x8
+        if is_control and payload_length >= 126:
+            raise _ProtocolError(1002)
         offset = 2
         if payload_length == 126:
             if len(self._rx) < 4:
@@ -180,24 +334,22 @@ class MediaWebSocket:
             for value in self._rx[2:10]:
                 payload_length = (payload_length << 8) | value
             offset = 10
-        mask = None
-        if masked:
-            if len(self._rx) < offset + 4:
-                return None
-            mask = self._rx[offset : offset + 4]
-            offset += 4
+        if payload_length > self.max_rx_bytes - offset:
+            raise _ProtocolError(1009)
         frame_end = offset + payload_length
         if len(self._rx) < frame_end:
             return None
         payload = bytes(self._rx[offset:frame_end])
         del self._rx[:frame_end]
-        if mask:
-            payload = bytes(payload[index] ^ mask[index % 4] for index in range(payload_length))
+        if opcode == OP_CLOSE and len(payload) == 1:
+            raise _ProtocolError(1002)
         return opcode, payload
 
     def _encode_frame(self, payload, opcode=OP_TEXT):
         payload = bytes(payload)
         length = len(payload)
+        if opcode >= 0x8 and length > 125:
+            raise ValueError("websocket control frame too large")
         mask = _random_bytes(4)
         frame = bytearray([0x80 | opcode])
         if length < 126:
@@ -212,20 +364,40 @@ class MediaWebSocket:
         frame.extend(bytes(payload[index] ^ mask[index % 4] for index in range(length)))
         return bytes(frame)
 
-    def _send_all(self, data):
-        if hasattr(self.sock, "sendall"):
-            self.sock.sendall(data)
-            return
-        sent = 0
-        while sent < len(data):
-            count = self.sock.send(data[sent:])
+    def _send_http(self, data):
+        offset = 0
+        while offset < len(data):
+            end = min(len(data), offset + self.send_chunk_bytes)
+            count = self.sock.send(data[offset:end])
             if not count:
                 raise OSError("media socket send failed")
-            sent += count
+            offset += count
 
-    def close(self):
+    def _send_control_now(self, opcode, payload=b""):
+        if self.sock is None:
+            return False
+        try:
+            frame = self._encode_frame(payload, opcode)
+            offset = 0
+            while offset < len(frame):
+                count = self.sock.send(frame[offset : offset + self.send_chunk_bytes])
+                if not count:
+                    return False
+                offset += count
+            return True
+        except Exception:
+            return False
+
+    def _close_with_code(self, code):
+        self._send_control_now(OP_CLOSE, bytes(((code >> 8) & 0xFF, code & 0xFF)))
+        self.close(send_close=False)
+
+    def close(self, send_close=True):
+        if send_close and self.connected:
+            self._send_control_now(OP_CLOSE, b"\x03\xe8")
         self.connected = False
         self._rx = bytearray()
+        self._clear_tx()
         if self.sock is not None:
             try:
                 self.sock.close()

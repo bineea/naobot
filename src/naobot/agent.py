@@ -65,6 +65,11 @@ class NaobotAgent:
         self.state.reflex_state = payload.get("reflex_state", self.state.reflex_state)
         self.state.motion_state = payload.get("motion_state", self.state.motion_state)
         self.state.last_reflex = payload.get("last_reflex", self.state.last_reflex)
+        self.state.camera_fps = int(payload.get("camera_fps", self.state.camera_fps))
+        self.state.audio_state = str(payload.get("audio_state", self.state.audio_state))
+        self.state.media_queue = int(payload.get("media_queue", self.state.media_queue))
+        self.state.media_dropped = int(payload.get("media_dropped", self.state.media_dropped))
+        self.state.psram_free = int(payload.get("psram_free", self.state.psram_free))
 
     async def handle_robot_message(self, envelope: Envelope) -> Envelope | None:
         self.observe_robot_message(envelope)

@@ -69,6 +69,8 @@ class Camera:
         if not self.available:
             return None
         try:
+            if hasattr(self.module, "available_frames") and not self.module.available_frames():
+                return None
             payload = self.module.capture()
             return bytes(payload) if payload else None
         except Exception as exc:
@@ -93,6 +95,7 @@ class AudioInput:
             pin_factory = pin_factory or loaded_pin
         self.i2s = None
         self.available = False
+        self._ready = False
         self.chunk_bytes = chunk_bytes
         self.last_error = None
         if i2s_class is None or pin_factory is None:
@@ -109,13 +112,17 @@ class AudioInput:
                 rate=PCM_SAMPLE_RATE_HZ,
                 ibuf=I2S_BUFFER_BYTES,
             )
+            if not hasattr(self.i2s, "irq"):
+                raise RuntimeError("I2S non-blocking readiness unavailable")
+            self.i2s.irq(self._mark_ready)
             self.available = True
         except Exception as exc:
             self.last_error = exc
 
     def read_chunk(self):
-        if not self.available or self.i2s is None:
+        if not self.available or self.i2s is None or not self._ready:
             return None
+        self._ready = False
         buffer = bytearray(self.chunk_bytes)
         try:
             count = self.i2s.readinto(buffer)
@@ -127,6 +134,9 @@ class AudioInput:
             self.available = False
             return None
 
+    def _mark_ready(self, _i2s):
+        self._ready = True
+
 
 class AudioOutput:
     def __init__(self, i2s_class=None, pin_factory=None):
@@ -136,6 +146,7 @@ class AudioOutput:
             pin_factory = pin_factory or loaded_pin
         self.i2s = None
         self.available = False
+        self._ready = False
         self.last_error = None
         if i2s_class is None or pin_factory is None:
             return
@@ -151,16 +162,23 @@ class AudioOutput:
                 rate=PCM_SAMPLE_RATE_HZ,
                 ibuf=I2S_BUFFER_BYTES,
             )
+            if not hasattr(self.i2s, "irq"):
+                raise RuntimeError("I2S non-blocking readiness unavailable")
+            self.i2s.irq(self._mark_ready)
             self.available = True
         except Exception as exc:
             self.last_error = exc
 
     def write(self, payload):
-        if not self.available or self.i2s is None:
+        if not self.available or self.i2s is None or not self._ready:
             return 0
+        self._ready = False
         try:
             return self.i2s.write(payload) or 0
         except Exception as exc:
             self.last_error = exc
             self.available = False
             return 0
+
+    def _mark_ready(self, _i2s):
+        self._ready = True

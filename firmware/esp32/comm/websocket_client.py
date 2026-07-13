@@ -21,8 +21,9 @@ except ImportError:
     import time
 
 try:
-    from config import WS_SOCKET_TIMEOUT_SEC
+    from config import WS_CONNECT_TIMEOUT_SEC, WS_SOCKET_TIMEOUT_SEC
 except ImportError:
+    WS_CONNECT_TIMEOUT_SEC = 2
     WS_SOCKET_TIMEOUT_SEC = 1
 
 
@@ -97,9 +98,11 @@ class WebSocketClient:
             addr = socket.getaddrinfo(self.host, self.port)[0][-1]
             self.sock = socket.socket()
             if hasattr(self.sock, "settimeout"):
-                self.sock.settimeout(WS_SOCKET_TIMEOUT_SEC)
+                self.sock.settimeout(WS_CONNECT_TIMEOUT_SEC)
             self.sock.connect(addr)
             self._handshake()
+            if hasattr(self.sock, "settimeout"):
+                self.sock.settimeout(WS_SOCKET_TIMEOUT_SEC)
             self.connected = True
             print("websocket connected:", self.url)
             return True

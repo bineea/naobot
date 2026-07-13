@@ -8,6 +8,11 @@ try:
 except ImportError:
     import time
 
+try:
+    import uasyncio as asyncio
+except ImportError:
+    import asyncio
+
 
 _wlan = None
 
@@ -61,6 +66,37 @@ def connect_wifi(ssid, password, timeout_ms=12000):
             print("wifi connected:", wlan.ifconfig())
             return True
         _sleep_ms(250)
+
+    print("wifi connect timeout")
+    return False
+
+
+async def connect_wifi_async(ssid, password, timeout_ms=12000, sleeper=None):
+    if not ssid or ssid == "YOUR_WIFI":
+        print("wifi not configured")
+        return False
+    wlan = get_wlan()
+    if not wlan:
+        print("network module unavailable")
+        return False
+    wlan.active(True)
+    if wlan.isconnected():
+        print("wifi already connected:", wlan.ifconfig())
+        return True
+
+    print("wifi connecting:", ssid)
+    wlan.connect(ssid, password)
+    start = _ticks_ms()
+    while _ticks_diff(_ticks_ms(), start) < timeout_ms:
+        if wlan.isconnected():
+            print("wifi connected:", wlan.ifconfig())
+            return True
+        if sleeper is not None:
+            await sleeper(50)
+        elif hasattr(asyncio, "sleep_ms"):
+            await asyncio.sleep_ms(50)
+        else:
+            await asyncio.sleep(0.05)
 
     print("wifi connect timeout")
     return False

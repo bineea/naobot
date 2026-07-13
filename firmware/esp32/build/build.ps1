@@ -52,4 +52,4 @@ make -C (Join-Path $MicroPythonDir "ports/esp32") `
     USER_C_MODULES=$UserModule `
     all
 
-Write-Host "构建流程完成；请自行检查 ports/esp32/build-ESP32_GENERIC_S3-SPIRAM_OCT/。"
+Write-Host "构建流程完成；请自行检查 ports/esp32/build-N16R8_44PIN-SPIRAM_OCT/。"

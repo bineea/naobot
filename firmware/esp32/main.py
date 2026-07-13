@@ -9,12 +9,13 @@ except ImportError:
     import time
 
 from comm.websocket_client import WebSocketClient
-from comm.wifi_config import connect_wifi
+from comm.wifi_config import connect_wifi_async
 from config import (
     AGENT_WS_URL,
     BRAIN_HEARTBEAT_TIMEOUT_MS,
     FIRMWARE_HEARTBEAT_INTERVAL_MS,
     MEDIA_EVENT_BOOST_MS,
+    SAFETY_LOOP_PERIOD_MS,
     SESSION_ID,
     WIFI_CONNECT_TIMEOUT_MS,
     WIFI_PASSWORD,
@@ -61,6 +62,22 @@ async def sleep_ms(ms):
         await asyncio.sleep(ms / 1000)
 
 
+async def sleep_to_safety_deadline(
+    loop_start_ms,
+    state,
+    clock=now_ms,
+    sleeper=sleep_ms,
+    period_ms=SAFETY_LOOP_PERIOD_MS,
+):
+    work_ms = max(0, ticks_diff(clock(), loop_start_ms))
+    delay_ms = max(0, period_ms - work_ms)
+    state["local_loop_ms"] = work_ms
+    state["local_loop_overrun_ms"] = max(0, work_ms - period_ms)
+    if delay_ms:
+        await sleeper(delay_ms)
+    return delay_ms
+
+
 class FirmwareProtocol:
     def __init__(self, session_id):
         self.session_id = session_id
@@ -89,6 +106,8 @@ class FirmwareProtocol:
             "battery_pct": power.battery_pct,
             "posture": imu.read_posture(),
             "local_loop_ms": state.get("local_loop_ms", 0),
+            "local_loop_interval_ms": state.get("local_loop_interval_ms", 0),
+            "local_loop_overrun_ms": state.get("local_loop_overrun_ms", 0),
             "agent_online": state.get("agent_online", False),
             "camera_fps": media_state.get("camera_fps", 0),
             "audio_state": media_state.get("audio_state", "unavailable"),
@@ -219,7 +238,7 @@ def check_brain_timeout(state, display, motion):
 
 async def network_loop(display, power, imu, actions, safety, protocol, state, motion, reflex):
     while True:
-        if not connect_wifi(WIFI_SSID, WIFI_PASSWORD, WIFI_CONNECT_TIMEOUT_MS):
+        if not await connect_wifi_async(WIFI_SSID, WIFI_PASSWORD, WIFI_CONNECT_TIMEOUT_MS):
             display.show_status("wifi offline")
             await sleep_ms(WS_RECONNECT_DELAY_MS)
             continue
@@ -279,6 +298,8 @@ async def main():
         "agent_online": False,
         "last_brain_seen_ms": None,
         "local_loop_ms": 0,
+        "local_loop_interval_ms": 0,
+        "local_loop_overrun_ms": 0,
         "media": media_state,
     }
 
@@ -287,8 +308,14 @@ async def main():
     asyncio.create_task(network_loop(display, power, imu, actions, safety, protocol, network_state, motion, reflex))
     asyncio.create_task(media_loop(media_state))
 
+    previous_loop_start = None
     while True:
         loop_start = now_ms()
+        if previous_loop_start is not None:
+            network_state["local_loop_interval_ms"] = max(
+                0, ticks_diff(loop_start, previous_loop_start)
+            )
+        previous_loop_start = loop_start
         if reflex.check():
             motion.cancel("reflex")
             reflex.run()
@@ -304,8 +331,7 @@ async def main():
                 envelope = protocol.event(event, power, imu, reflex, motion, network_state)
                 if not ws or not ws.connected or not ws.send_json(envelope):
                     fallback.handle(event)
-        network_state["local_loop_ms"] = ticks_diff(now_ms(), loop_start)
-        await sleep_ms(50)
+        await sleep_to_safety_deadline(loop_start, network_state)
 
 
 if __name__ == "__main__":
