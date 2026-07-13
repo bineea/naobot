@@ -223,6 +223,10 @@ class MediaClient:
                 self._reset_tts()
             elif self._speaking:
                 self._drain_tts_chunk(current_ms)
+                event_boost = ticks_diff(self.state.get("event_boost_until_ms", 0), current_ms) > 0
+                self.collect(current_ms, event_boost=event_boost)
+                if not getattr(self.transport, "tx_pending", False):
+                    self.flush_one()
             else:
                 event_boost = ticks_diff(self.state.get("event_boost_until_ms", 0), current_ms) > 0
                 self.collect(current_ms, event_boost=event_boost)
@@ -253,8 +257,6 @@ class MediaClient:
         return self._activate_transport(transport)
 
     def collect(self, current_ms, event_boost=False, audio_flags=0):
-        if self._speaking:
-            return
         event_flag = FLAG_EVENT_BOOST if event_boost else 0
         if self.camera.available and self.scheduler.should_capture(current_ms, event_boost):
             payload = self.camera.capture()
@@ -269,6 +271,9 @@ class MediaClient:
                     )
                 )
                 self._camera_frames += 1
+        if self._speaking:
+            self._update_state(current_ms)
+            return
         payload = self.audio_input.read_chunk()
         if payload:
             audio_flags |= self.vad.process(payload)

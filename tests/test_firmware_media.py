@@ -839,7 +839,7 @@ def test_media_connect_api_never_runs_blocking_transport_inline() -> None:
     assert time.perf_counter() - started < 0.05
 
 
-def test_tts_downlink_pauses_uploads_but_resumes_after_tts_end() -> None:
+def test_tts_downlink_keeps_video_but_pauses_audio_until_tts_end() -> None:
     transport = FakeTransport()
     camera_module = FakeCameraModule()
     output = AudioOutput(i2s_class=FakeI2S, pin_factory=pin_number)
@@ -853,7 +853,11 @@ def test_tts_downlink_pauses_uploads_but_resumes_after_tts_end() -> None:
     client.handle_incoming(OP_TEXT, b'{"kind":"tts_start"}')
     client.collect(0, event_boost=False)
     assert client.state["audio_state"] == "speaking"
-    assert len(client.queue) == 0
+    queued_during_tts = list(client.queue._items)
+    assert [frame.kind for frame in queued_during_tts] == [KIND_JPEG]
+    assert client.step(100) is True
+    assert camera_module.capture_calls == 2
+    assert all(frame.kind != KIND_AUDIO_PCM16 for frame in client.queue._items)
 
     tts_payload = b"t" * 2048
     tts = MediaFrame(KIND_TTS_PCM16, timestamp_ms=1, sequence=1, payload=tts_payload).encode()
@@ -868,9 +872,10 @@ def test_tts_downlink_pauses_uploads_but_resumes_after_tts_end() -> None:
     assert output.i2s.writes == [tts_payload[:1024], tts_payload[1024:]]
 
     client.handle_incoming(OP_TEXT, b'{"kind":"tts_end"}')
-    client.collect(100, event_boost=False)
+    client.audio_input.i2s.trigger_ready()
+    client.collect(200, event_boost=False)
     assert client.state["audio_state"] == "listening"
-    assert len(client.queue) > 0
+    assert [frame.kind for frame in client.queue._items] == [KIND_AUDIO_PCM16]
 
 
 def test_tts_new_start_and_disconnect_reset_playback_atomically() -> None:
