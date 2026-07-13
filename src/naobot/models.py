@@ -120,6 +120,24 @@ class LLMDecision(BaseModel):
     skills: list[SkillIntent] = Field(default_factory=list)
     actions: list[Action] = Field(default_factory=list)
     memory_suggestion: dict[str, Any] = Field(default_factory=lambda: {"type": "none"})
+    confidence: float = 1.0
+    needs_team: bool = False
+    escalation_reason: str | None = None
+
+
+class BrainInput(BaseModel):
+    event: dict[str, Any]
+    person_id: str | None = None
+    transcript: str = ""
+    vision_summary: str = ""
+    media_refs: list[str] = Field(default_factory=list)
+
+
+class RouteDecision(BaseModel):
+    mode: Literal["single", "team", "deterministic"] = "single"
+    score: int = 0
+    reasons: list[str] = Field(default_factory=list)
+    self_escalated: bool = False
 
 
 class SoulConfig(BaseModel):

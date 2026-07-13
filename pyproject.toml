@@ -9,8 +9,10 @@ description = "KT2 LLM 桌面智能机器人软件 MVP"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "aiosqlite>=0.21.0",
   "agentscope==2.0.4",
   "click>=8.4.1",
+  "cryptography>=49.0.0",
   "fastapi>=0.128.0",
   "httpx>=0.28.0",
   "jinja2>=3.1.0",
