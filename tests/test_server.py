@@ -1,10 +1,24 @@
 import asyncio
+import sys
 import threading
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+from starlette.status import HTTP_403_FORBIDDEN
 
 from naobot.agent import NaobotAgent
 from naobot.llm import RuleBasedLLMClient
+from naobot.media.backends import (
+    OpenAICompatibleASR,
+    OpenAICompatibleTTS,
+    OpenAICompatibleVisionProvider,
+)
+from naobot.media.service import (
+    LocalVisionSummaryProvider,
+    MediaService,
+    NullASRProvider,
+    NullTTSProvider,
+)
 from naobot.models import Envelope, LLMDecision, MessageType
 from naobot.server import create_app
 from naobot.settings import Settings
@@ -102,6 +116,7 @@ def test_dashboard_contains_brain_runtime_observability(tmp_path) -> None:
     assert 'id="mediaHealth"' in html
     assert 'id="currentPerson"' in html
     assert 'id="peopleList"' in html
+    assert "innerHTML" not in html
 
 
 def test_debug_event_touch_head(tmp_path) -> None:
@@ -247,3 +262,122 @@ def test_people_management_apis_delegate_to_media_service(tmp_path) -> None:
     assert media_service.reset_calls == ["person-1"]
     assert media_service.delete_calls == ["person-1"]
     assert media_service.cancelled is True
+
+
+def test_people_management_requires_token_when_device_token_configured(tmp_path) -> None:
+    settings = Settings(runtime_dir=tmp_path, device_token="secret-token")
+    agent = NaobotAgent(settings, llm=RuleBasedLLMClient())
+    media_service = FakeMediaService()
+    client = TestClient(create_app(settings, agent, media_service=media_service))
+
+    assert client.get("/api/status").status_code == 200
+    assert client.get("/api/people").status_code == HTTP_403_FORBIDDEN
+    assert client.post("/api/people/person-1/runtime/reset").status_code == HTTP_403_FORBIDDEN
+    assert client.delete("/api/people/person-1").status_code == HTTP_403_FORBIDDEN
+    assert client.post("/api/people/enrollment/cancel").status_code == HTTP_403_FORBIDDEN
+
+    headers = {"Authorization": "Bearer secret-token"}
+    assert client.get("/api/people", headers=headers).status_code == 200
+    assert client.post("/api/people/person-1/runtime/reset", headers=headers).status_code == 200
+    assert client.delete("/api/people/person-1", headers=headers).status_code == 200
+    assert client.post(
+        "/api/people/enrollment/cancel",
+        headers={"X-Naobot-Token": "secret-token"},
+    ).status_code == 200
+
+
+def test_dashboard_token_field_exists_without_embedding_token_in_html(tmp_path) -> None:
+    settings = Settings(runtime_dir=tmp_path, device_token="secret-token")
+    agent = NaobotAgent(settings, llm=RuleBasedLLMClient())
+    client = TestClient(create_app(settings, agent, media_service=FakeMediaService()))
+
+    html = client.get("/").text
+
+    assert 'type="password"' in html
+    assert "secret-token" not in html
+    assert "X-Naobot-Token" in html
+
+
+def test_create_app_default_media_service_assembles_configured_backends(tmp_path) -> None:
+    settings = Settings(
+        runtime_dir=tmp_path,
+        asr_endpoint="https://asr.example.com/v1",
+        asr_model="asr-1",
+        tts_endpoint="https://tts.example.com/v1",
+        tts_model="tts-1",
+        vision_endpoint="https://vision.example.com/v1",
+        vision_model="vision-1",
+    )
+    app = create_app(settings, NaobotAgent(settings, llm=RuleBasedLLMClient()))
+    media_service = app.state.media_service
+
+    assert isinstance(media_service, MediaService)
+    assert isinstance(media_service.asr, OpenAICompatibleASR)
+    assert isinstance(media_service.tts, OpenAICompatibleTTS)
+    assert isinstance(media_service.vision, OpenAICompatibleVisionProvider)
+    assert media_service.status()["provider_status"]["status"] == "degraded"
+
+
+def test_create_app_default_media_service_uses_local_fallbacks_when_cloud_not_configured(tmp_path) -> None:
+    settings = Settings(runtime_dir=tmp_path)
+    app = create_app(settings, NaobotAgent(settings, llm=RuleBasedLLMClient()))
+    media_service = app.state.media_service
+
+    assert isinstance(media_service.asr, NullASRProvider)
+    assert isinstance(media_service.tts, NullTTSProvider)
+    assert isinstance(media_service.vision, LocalVisionSummaryProvider)
+    assert media_service.status()["provider_status"]["status"] == "degraded"
+
+
+def test_create_app_uses_local_asr_when_model_without_endpoint(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    class FakeLocalASR:
+        async def transcribe(self, _frames):
+            raise NotImplementedError
+
+    monkeypatch.setattr("naobot.media.service.FasterWhisperASR", lambda model_name: FakeLocalASR())
+    settings = Settings(runtime_dir=tmp_path, asr_model="base")
+    app = create_app(settings, NaobotAgent(settings, llm=RuleBasedLLMClient()))
+
+    assert app.state.media_service.asr.__class__.__name__ == "FakeLocalASR"
+
+
+def test_sherpa_tts_uses_official_config_objects(monkeypatch, tmp_path) -> None:
+    built = {}
+
+    class Config:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def validate(self):
+            return True
+
+    class OfflineTts:
+        def __init__(self, config):
+            built["config"] = config
+
+    fake_module = SimpleNamespace(
+        OfflineTts=OfflineTts,
+        OfflineTtsConfig=Config,
+        OfflineTtsModelConfig=Config,
+        OfflineTtsVitsModelConfig=Config,
+    )
+    monkeypatch.setitem(sys.modules, "sherpa_onnx", fake_module)
+    settings = Settings(
+        runtime_dir=tmp_path,
+        sherpa_onnx_model_path="model.onnx",
+        sherpa_onnx_tokens_path="tokens.txt",
+        sherpa_onnx_lexicon_path="lexicon.txt",
+        sherpa_onnx_rule_fsts="number.fst",
+    )
+
+    engine = MediaService._build_sherpa_engine(settings)
+
+    assert isinstance(engine, OfflineTts)
+    config = built["config"]
+    assert config.kwargs["rule_fsts"] == "number.fst"
+    vits = config.kwargs["model"].kwargs["vits"]
+    assert vits.kwargs["model"] == "model.onnx"
+    assert vits.kwargs["tokens"] == "tokens.txt"

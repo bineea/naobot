@@ -68,6 +68,21 @@ class MediaPipeline:
     def update_connection(self, connected: bool) -> None:
         self._connected = connected
 
+    def reset_stream(self) -> None:
+        """设备重启或媒体链路重建时清空依赖设备相对时间戳的状态。"""
+        self._video_window = TimestampWindow(
+            self.video_window_ms,
+            lambda frame: frame.timestamp_ms,
+        )
+        self._audio_window = TimestampWindow(
+            self.audio_window_ms,
+            lambda chunk: chunk.frame.timestamp_ms,
+        )
+        self._video_queue = MediaQueue()
+        self._audio_queue = MediaQueue()
+        self._listening = False
+        self._speaking = False
+
     def update_session(
         self,
         session_id: str | None,

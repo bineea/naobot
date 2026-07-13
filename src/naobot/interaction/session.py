@@ -37,10 +37,24 @@ class InteractionSession:
         self._resume_listening_at_ms: int | None = None
 
     def activate_from_wake_word(self, *, now_ms: int, person_id: str | None) -> bool:
+        if self._active:
+            now_ms = self._monotonic_now(now_ms)
+            self._last_activity_ms = now_ms
+            self._session_trigger = "wake_word"
+            if person_id is not None:
+                self._person_id = person_id
+            return True
         self._activate(now_ms=now_ms, person_id=person_id, trigger="wake_word")
         return True
 
     def activate_from_touch(self, *, now_ms: int, person_id: str | None) -> bool:
+        if self._active:
+            now_ms = self._monotonic_now(now_ms)
+            self._last_activity_ms = now_ms
+            self._session_trigger = "touch"
+            if person_id is not None:
+                self._person_id = person_id
+            return True
         self._activate(now_ms=now_ms, person_id=person_id, trigger="touch")
         return True
 

@@ -63,7 +63,9 @@ class InteractionOrchestrator:
                 now_ms=now_ms,
                 person_id=snapshot.person_id,
             )
-        elif not snapshot.active and wake.greeting_detected:
+        elif snapshot.active:
+            self.session.mark_activity(now_ms=now_ms)
+        elif wake.greeting_detected:
             self.session.activate_from_greeting(now_ms=now_ms, person_id=None)
         else:
             self.session.mark_activity(now_ms=now_ms)

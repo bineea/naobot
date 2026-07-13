@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import json
 import os
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -19,9 +21,16 @@ from ..settings import Settings
 from .backends import (
     ASRProvider,
     ASRResult,
+    FasterWhisperASR,
     IdentityProvider,
     IdentityResult,
     MediaBackendError,
+    OpenAICompatibleASR,
+    OpenAICompatibleTTS,
+    OpenAICompatibleVisionProvider,
+    OpenCVMediaPipeIdentityFacade,
+    OpenWakeWordDetector,
+    SherpaOnnxTTS,
     TTSProvider,
     TTSResult,
     VisionProvider,
@@ -104,6 +113,8 @@ class EnrollmentManager:
         if not transcript:
             return None
         if self._is_enrollment_request(transcript):
+            if turn.event.payload.get("person_id"):
+                return self._set_result("rejected", reason="only unknown person can enroll")
             if not (self.settings.data_key or os.getenv("NAOBOT_DATA_KEY")):
                 return self._set_result("rejected", reason="data key 未配置")
             if not single_person:
@@ -146,15 +157,20 @@ class EnrollmentManager:
             return self._set_result("rejected", reason="identity provider 不支持 embedding")
         embedding = create_embedding(frames)
         person_id = new_id("person")
-        await self.persistence.upsert_person(person_id, metadata={"source": "enrollment"})
-        await self.repository.upsert_embedding(person_id, embedding, model_name="identity")
-        for frame in frames:
-            await self.repository.add_sample(
-                person_id,
-                frame.payload,
-                media_type="image/jpeg",
-                sha256=hashlib.sha256(frame.payload).hexdigest(),
-            )
+        await self.persistence.enroll_person_atomic(
+            person_id=person_id,
+            embedding=embedding,
+            model_name="identity",
+            metadata={"source": "enrollment"},
+            samples=[
+                {
+                    "sample_bytes": frame.payload,
+                    "media_type": "image/jpeg",
+                    "sha256": hashlib.sha256(frame.payload).hexdigest(),
+                }
+                for frame in frames
+            ],
+        )
         self._pending = None
         return self._set_result("completed", person_id=person_id)
 
@@ -227,7 +243,6 @@ class MediaHub:
         self._send_lock = asyncio.Lock()
 
     async def connect(self, websocket: WebSocket) -> None:
-        await websocket.accept()
         self.websocket = websocket
 
     def disconnect(self, websocket: WebSocket) -> None:
@@ -241,7 +256,6 @@ class MediaHub:
             try:
                 await self.websocket.send_json(payload)
             except (RuntimeError, WebSocketDisconnect):
-                self.websocket = None
                 return False
             return True
 
@@ -252,7 +266,6 @@ class MediaHub:
             try:
                 await self.websocket.send_bytes(payload)
             except (RuntimeError, WebSocketDisconnect):
-                self.websocket = None
                 return False
             return True
 
@@ -274,9 +287,11 @@ class MediaService:
         persistence: RuntimePersistence | None = None,
         enrollment_manager: EnrollmentManager | None = None,
         provider_health: dict[str, ProviderHealth] | None = None,
+        clock: Callable[[], int] | None = None,
     ) -> None:
         self.settings = settings
         self.agent = agent
+        self._clock = clock or now_ms
         self.session = session or InteractionSession(
             session_idle_ms=settings.session_idle_ms,
             tts_resume_delay_ms=settings.tts_resume_delay_ms,
@@ -287,11 +302,35 @@ class MediaService:
             video_queue_limit=settings.media_video_queue_limit,
             audio_queue_limit=settings.media_audio_queue_limit,
         )
-        self.wake_word = wake_word or NullWakeWordProvider()
-        self.identity = identity or NullIdentityProvider()
-        self.asr = asr or NullASRProvider()
-        self.vision = vision or LocalVisionSummaryProvider(self.identity)
-        self.tts = tts or NullTTSProvider()
+        if all(provider is None for provider in (wake_word, identity, asr, vision, tts)):
+            providers = self._build_default_providers(settings)
+            self.wake_word = providers.wake_word
+            self.identity = providers.identity
+            self.asr = providers.asr
+            self.vision = providers.vision
+            self.tts = providers.tts
+            resolved_health = providers.health
+        else:
+            self.wake_word = wake_word or NullWakeWordProvider()
+            self.identity = identity or NullIdentityProvider()
+            self.asr = asr or NullASRProvider()
+            self.vision = vision or LocalVisionSummaryProvider(self.identity)
+            self.tts = tts or NullTTSProvider()
+            resolved_health = provider_health or {
+                "wake_word": ProviderHealth("wake_word", True, "local"),
+                "identity": ProviderHealth("identity", True, "local"),
+                "asr": ProviderHealth(
+                    "asr",
+                    not isinstance(self.asr, NullASRProvider),
+                    "cloud",
+                ),
+                "vision": ProviderHealth("vision", True, "local"),
+                "tts": ProviderHealth(
+                    "tts",
+                    not isinstance(self.tts, NullTTSProvider),
+                    "cloud",
+                ),
+            }
         self.runtime_registry = runtime_registry or getattr(
             agent,
             "runtime_registry",
@@ -317,13 +356,7 @@ class MediaService:
             vision=self.vision,
             tts=self.tts,
         )
-        self.provider_health = provider_health or {
-            "wake_word": ProviderHealth("wake_word", True, "local"),
-            "identity": ProviderHealth("identity", True, "local"),
-            "asr": ProviderHealth("asr", not isinstance(self.asr, NullASRProvider), "cloud"),
-            "vision": ProviderHealth("vision", True, "local"),
-            "tts": ProviderHealth("tts", not isinstance(self.tts, NullTTSProvider), "cloud"),
-        }
+        self.provider_health = resolved_health
         self.hub = MediaHub()
         self.robot_hub = None
         self.dashboard_hub = None
@@ -334,20 +367,32 @@ class MediaService:
         self._audio_turn: list[MediaFrame] = []
         self._connections = 0
         self._current_boot_id: str | None = None
+        self._connection_lock = asyncio.Lock()
 
     def attach(self, *, robot_hub, dashboard_hub=None) -> None:
         self.robot_hub = robot_hub
         self.dashboard_hub = dashboard_hub
 
     async def handle_websocket(self, websocket: WebSocket) -> None:
-        await self.hub.connect(websocket)
-        self._connections += 1
-        self.pipeline.update_connection(True)
+        await websocket.accept()
+        worker: asyncio.Task | None = None
+        async with self._connection_lock:
+            if self.hub.websocket is not None:
+                await websocket.close(code=1013)
+                return
+            await self.hub.connect(websocket)
+            self._connections += 1
+            self.pipeline.update_connection(True)
         try:
             hello = await self._receive_hello(websocket)
             self._current_boot_id = str(hello.get("boot_id") or "")
+            self.pipeline.reset_stream()
+            self._audio_turn.clear()
+            while not self._frame_queue.empty():
+                self._frame_queue.get_nowait()
             await self.hub.send_json({"kind": "media_ready", "boot_id": self._current_boot_id})
-            self._worker = asyncio.create_task(self._frame_worker())
+            worker = asyncio.create_task(self._frame_worker())
+            self._worker = worker
             while True:
                 message = await websocket.receive()
                 if message["type"] == "websocket.disconnect":
@@ -368,10 +413,11 @@ class MediaService:
         except WebSocketDisconnect:
             pass
         finally:
-            if self._worker is not None:
-                self._worker.cancel()
-                await asyncio.gather(self._worker, return_exceptions=True)
-            self._worker = None
+            if worker is not None:
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+            if self._worker is worker:
+                self._worker = None
             self.hub.disconnect(websocket)
             self._connections = max(0, self._connections - 1)
             self.pipeline.update_connection(self._connections > 0)
@@ -450,7 +496,7 @@ class MediaService:
             await self._send_media_error("INVALID_CONTROL_JSON", "控制消息必须为对象")
             return
         kind = str(payload.get("kind") or "")
-        current_ms = now_ms()
+        current_ms = self._clock()
         if kind == "touch_head":
             self.orchestrator.observe_touch(now_ms=current_ms, person_id=payload.get("person_id"))
             session_id = self.session.snapshot(now_ms=current_ms).session_id or "visitor-touch"
@@ -476,10 +522,15 @@ class MediaService:
     async def _frame_worker(self) -> None:
         while True:
             frame = await self._frame_queue.get()
-            await self._handle_frame(frame)
+            try:
+                await self._handle_frame(frame)
+            except MediaBackendError as exc:
+                await self._send_media_error("MEDIA_BACKEND_ERROR", str(exc))
+            except Exception as exc:
+                await self._send_media_error("MEDIA_WORKER_ERROR", f"{type(exc).__name__}: {exc}")
 
     async def _handle_frame(self, frame: MediaFrame) -> None:
-        current_ms = frame.timestamp_ms or now_ms()
+        current_ms = self._clock()
         if frame.kind.name == "JPEG":
             await self.orchestrator.observe_video([frame], now_ms=current_ms)
             return
@@ -490,12 +541,13 @@ class MediaService:
         self._audio_turn.append(frame)
         if not frame.is_end_of_utterance:
             return
+        audio_turn = list(self._audio_turn)
+        self._audio_turn.clear()
         turn = await self.orchestrator.complete_turn(
-            audio_frames=list(self._audio_turn),
+            audio_frames=audio_turn,
             video_frames=self.pipeline.video_window()[-5:],
             now_ms=current_ms,
         )
-        self._audio_turn.clear()
         if turn is None:
             return
         turn.event.priority = 6 if any(item.event_boosted for item in turn.audio_frames) else 3
@@ -545,7 +597,7 @@ class MediaService:
         except MediaBackendError as exc:
             await self._send_media_error("TTS_ERROR", str(exc))
         finally:
-            self.orchestrator.finish_tts(now_ms=now_ms())
+            self.orchestrator.finish_tts(now_ms=self._clock())
 
     async def _speak_intent_text(self, intent: Envelope, current_ms: int) -> None:
         text = str(intent.payload.get("text") or "")
@@ -555,3 +607,130 @@ class MediaService:
 
     async def _send_media_error(self, code: str, message: str) -> None:
         await self.hub.send_json({"kind": "media_error", "code": code, "message": message})
+
+    @staticmethod
+    def _build_default_providers(settings: Settings) -> MediaProviders:
+        if settings.wake_model_path:
+            try:
+                wake_word: WakeWordProvider = OpenWakeWordDetector(
+                    model_factory=lambda: importlib.import_module("openwakeword").Model()
+                )
+                wake_health = ProviderHealth("wake_word", True, "local")
+            except RuntimeError:
+                wake_word = NullWakeWordProvider()
+                wake_health = ProviderHealth("wake_word", False, "local")
+        else:
+            wake_word = NullWakeWordProvider()
+            wake_health = ProviderHealth("wake_word", False, "local")
+
+        if settings.identity_model_path:
+            try:
+                identity = OpenCVMediaPipeIdentityFacade()
+                identity_health = ProviderHealth("identity", True, "local")
+            except RuntimeError:
+                identity = NullIdentityProvider()
+                identity_health = ProviderHealth("identity", False, "local")
+        else:
+            identity = NullIdentityProvider()
+            identity_health = ProviderHealth("identity", False, "local")
+
+        if settings.asr_endpoint and settings.asr_model:
+            asr: ASRProvider = OpenAICompatibleASR(
+                endpoint=settings.asr_endpoint,
+                model=settings.asr_model,
+                api_key=settings.asr_api_key,
+            )
+            asr_health = ProviderHealth("asr", True, "cloud")
+        elif settings.asr_model:
+            try:
+                asr = FasterWhisperASR(model_name=settings.asr_model)
+                asr_health = ProviderHealth("asr", True, "local")
+            except RuntimeError:
+                asr = NullASRProvider()
+                asr_health = ProviderHealth("asr", False, "local")
+        else:
+            asr = NullASRProvider()
+            asr_health = ProviderHealth("asr", False, "local")
+
+        if settings.vision_endpoint and settings.vision_model:
+            vision: VisionProvider = OpenAICompatibleVisionProvider(
+                endpoint=settings.vision_endpoint,
+                model=settings.vision_model,
+                api_key=settings.vision_api_key,
+            )
+            vision_health = ProviderHealth("vision", True, "cloud")
+        else:
+            vision = LocalVisionSummaryProvider(identity)
+            vision_health = ProviderHealth(
+                "vision",
+                not isinstance(identity, NullIdentityProvider),
+                "local",
+            )
+
+        if settings.tts_endpoint and settings.tts_model:
+            tts: TTSProvider = OpenAICompatibleTTS(
+                endpoint=settings.tts_endpoint,
+                model=settings.tts_model,
+                api_key=settings.tts_api_key,
+                voice=settings.tts_voice,
+            )
+            tts_health = ProviderHealth("tts", True, "cloud")
+        elif settings.sherpa_onnx_model_path and settings.sherpa_onnx_tokens_path:
+            try:
+                tts = SherpaOnnxTTS(
+                    engine_factory=lambda: MediaService._build_sherpa_engine(settings)
+                )
+                tts_health = ProviderHealth("tts", True, "local")
+            except RuntimeError:
+                tts = NullTTSProvider()
+                tts_health = ProviderHealth("tts", False, "local")
+        else:
+            tts = NullTTSProvider()
+            tts_health = ProviderHealth("tts", False, "local")
+
+        return MediaProviders(
+            wake_word=wake_word,
+            identity=identity,
+            asr=asr,
+            vision=vision,
+            tts=tts,
+            health={
+                "wake_word": wake_health,
+                "identity": identity_health,
+                "asr": asr_health,
+                "vision": vision_health,
+                "tts": tts_health,
+            },
+        )
+
+    @staticmethod
+    def _build_sherpa_engine(settings: Settings):
+        module = importlib.import_module("sherpa_onnx")
+        required = (
+            "OfflineTts",
+            "OfflineTtsConfig",
+            "OfflineTtsModelConfig",
+            "OfflineTtsVitsModelConfig",
+        )
+        if not all(hasattr(module, name) for name in required):
+            raise MediaBackendError("Sherpa local TTS 自动装配不可用。")
+        vits = module.OfflineTtsVitsModelConfig(
+            model=settings.sherpa_onnx_model_path,
+            tokens=settings.sherpa_onnx_tokens_path,
+            lexicon=settings.sherpa_onnx_lexicon_path or "",
+            data_dir=settings.sherpa_onnx_data_dir or "",
+        )
+        model = module.OfflineTtsModelConfig(
+            vits=vits,
+            provider="cpu",
+            num_threads=settings.sherpa_onnx_num_threads,
+            debug=False,
+        )
+        config = module.OfflineTtsConfig(
+            model=model,
+            rule_fsts=settings.sherpa_onnx_rule_fsts or "",
+            max_num_sentences=1,
+        )
+        if hasattr(config, "validate") and not config.validate():
+            raise MediaBackendError("Sherpa local TTS 配置无效。")
+        return module.OfflineTts(config)

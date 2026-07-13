@@ -44,6 +44,11 @@ class Settings:
     wake_model_path: str | None = None
     identity_model_path: str | None = None
     sherpa_onnx_model_path: str | None = None
+    sherpa_onnx_tokens_path: str | None = None
+    sherpa_onnx_lexicon_path: str | None = None
+    sherpa_onnx_data_dir: str | None = None
+    sherpa_onnx_rule_fsts: str | None = None
+    sherpa_onnx_num_threads: int = 2
     data_key: str | None = None
 
     @classmethod
@@ -97,6 +102,11 @@ class Settings:
             wake_model_path=os.getenv("NAOBOT_WAKE_MODEL_PATH"),
             identity_model_path=os.getenv("NAOBOT_IDENTITY_MODEL_PATH"),
             sherpa_onnx_model_path=os.getenv("NAOBOT_SHERPA_ONNX_MODEL_PATH"),
+            sherpa_onnx_tokens_path=os.getenv("NAOBOT_SHERPA_ONNX_TOKENS_PATH"),
+            sherpa_onnx_lexicon_path=os.getenv("NAOBOT_SHERPA_ONNX_LEXICON_PATH"),
+            sherpa_onnx_data_dir=os.getenv("NAOBOT_SHERPA_ONNX_DATA_DIR"),
+            sherpa_onnx_rule_fsts=os.getenv("NAOBOT_SHERPA_ONNX_RULE_FSTS"),
+            sherpa_onnx_num_threads=int(os.getenv("NAOBOT_SHERPA_ONNX_NUM_THREADS", "2")),
             data_key=os.getenv("NAOBOT_DATA_KEY"),
         )
 

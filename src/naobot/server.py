@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from pydantic import ValidationError
 
@@ -128,6 +129,25 @@ def create_app(
     app.state.robot_hub = robot_hub
     app.state.media_service = media_service
 
+    def _is_loopback_client(request: Request) -> bool:
+        host = request.client.host if request.client is not None else ""
+        return host in {"127.0.0.1", "::1", "localhost", "testclient"}
+
+    def _require_people_api_auth(request: Request) -> None:
+        if settings.device_token is None:
+            if _is_loopback_client(request):
+                return
+            raise HTTPException(status_code=403, detail={"code": "FORBIDDEN"})
+        auth_header = request.headers.get("Authorization", "")
+        candidate = ""
+        if auth_header.startswith("Bearer "):
+            candidate = auth_header[7:]
+        if not candidate:
+            candidate = request.headers.get("X-Naobot-Token", "")
+        if candidate and secrets.compare_digest(candidate, settings.device_token):
+            return
+        raise HTTPException(status_code=403, detail={"code": "FORBIDDEN"})
+
     @app.get("/", response_class=HTMLResponse)
     async def index() -> str:
         html_path = Path(__file__).with_name("web") / "index.html"
@@ -144,21 +164,25 @@ def create_app(
         return status
 
     @app.get("/api/people")
-    async def api_people() -> list[dict[str, Any]]:
+    async def api_people(request: Request) -> list[dict[str, Any]]:
+        _require_people_api_auth(request)
         return await media_service.list_people()
 
     @app.post("/api/people/{person_id}/runtime/reset")
-    async def api_reset_person_runtime(person_id: str) -> dict[str, str]:
+    async def api_reset_person_runtime(person_id: str, request: Request) -> dict[str, str]:
+        _require_people_api_auth(request)
         await media_service.reset_person_runtime(person_id)
         return {"status": "reset"}
 
     @app.delete("/api/people/{person_id}")
-    async def api_delete_person(person_id: str) -> dict[str, str]:
+    async def api_delete_person(person_id: str, request: Request) -> dict[str, str]:
+        _require_people_api_auth(request)
         await media_service.delete_person(person_id)
         return {"status": "deleted"}
 
     @app.post("/api/people/enrollment/cancel")
-    async def api_cancel_enrollment() -> dict[str, Any]:
+    async def api_cancel_enrollment(request: Request) -> dict[str, Any]:
+        _require_people_api_auth(request)
         result = await media_service.cancel_enrollment()
         return result if isinstance(result, dict) else {"status": "cancelled"}
 

@@ -11,9 +11,10 @@
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
     .panel { background: #fff; border: 1px solid #d8dee4; border-radius: 6px; padding: 14px; }
     .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-    button { border: 1px solid #c7ced6; background: #fff; padding: 8px 12px; border-radius: 4px; cursor: pointer; }
+    button, input { border: 1px solid #c7ced6; background: #fff; padding: 8px 12px; border-radius: 4px; }
+    button { cursor: pointer; }
     button.danger { color: #b42318; border-color: #f5c2c0; }
-    code, pre { background: #0f1720; color: #d7f7d0; border-radius: 6px; padding: 10px; display: block; overflow: auto; }
+    pre { background: #0f1720; color: #d7f7d0; border-radius: 6px; padding: 10px; display: block; overflow: auto; }
     ul { list-style: none; padding: 0; margin: 0; }
     li + li { margin-top: 10px; }
     .meta { color: #52606d; font-size: 14px; }
@@ -22,6 +23,13 @@
 <body>
   <main>
     <h1>naobot Dashboard</h1>
+    <div class="panel" style="margin-bottom: 16px;">
+      <div class="row">
+        <label for="manageToken">管理 Token</label>
+        <input id="manageToken" type="password" autocomplete="off" />
+        <button id="saveTokenButton" type="button">保存</button>
+      </div>
+    </div>
     <div class="grid">
       <section class="panel">
         <h2>媒体健康</h2>
@@ -36,7 +44,7 @@
         <h2>注册状态</h2>
         <div id="enrollmentState">-</div>
         <div class="row" style="margin-top: 10px;">
-          <button onclick="cancelEnrollment()">取消注册</button>
+          <button id="cancelEnrollmentButton" type="button">取消注册</button>
         </div>
       </section>
     </div>
@@ -53,12 +61,26 @@
   </main>
 
   <script>
-    let people = [];
+    const MANAGE_TOKEN_KEY = 'naobot.manageToken';
+    const peopleList = document.getElementById('peopleList');
+    const tokenInput = document.getElementById('manageToken');
+    tokenInput.value = sessionStorage.getItem(MANAGE_TOKEN_KEY) || '';
+
+    function authHeaders() {
+      const token = sessionStorage.getItem(MANAGE_TOKEN_KEY) || '';
+      return token ? { 'X-Naobot-Token': token } : {};
+    }
+
+    async function fetchJson(url, options = {}) {
+      const response = await fetch(url, options);
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      return await response.json();
+    }
 
     async function refresh() {
-      const status = await (await fetch('/api/status')).json();
-      people = await (await fetch('/api/people')).json();
-
+      const status = await fetchJson('/api/status');
       const media = status.media || {};
       document.getElementById('mediaHealth').textContent =
         `conn=${media.connections ?? 0} fps=${media.fps ?? 0} queue=${media.queue ?? 0} dropped=${media.dropped ?? 0} listening=${media.listening ? 'yes' : 'no'} speaking=${media.speaking ? 'yes' : 'no'}`;
@@ -66,32 +88,79 @@
       document.getElementById('sessionTrigger').textContent = media.session_trigger || '-';
       document.getElementById('enrollmentState').textContent = media.enrollment?.state || '-';
       document.getElementById('statusDump').textContent = JSON.stringify(status, null, 2);
-      document.getElementById('peopleList').innerHTML = people.map(person => `
-        <li class="panel">
-          <div><strong>${person.display_name || person.person_id}</strong></div>
-          <div class="meta">${person.person_id}</div>
-          <div class="row" style="margin-top: 10px;">
-            <button onclick="resetRuntime('${person.person_id}')">Reset Runtime</button>
-            <button class="danger" onclick="deletePerson('${person.person_id}')">Delete</button>
-          </div>
-        </li>
-      `).join('');
+
+      try {
+        const people = await fetchJson('/api/people', { headers: authHeaders() });
+        renderPeople(people);
+      } catch (_error) {
+        renderPeople([]);
+      }
     }
 
-    async function resetRuntime(personId) {
-      await fetch(`/api/people/${personId}/runtime/reset`, { method: 'POST' });
-      await refresh();
+    function renderPeople(people) {
+      while (peopleList.firstChild) {
+        peopleList.removeChild(peopleList.firstChild);
+      }
+      for (const person of people) {
+        const item = document.createElement('li');
+        item.className = 'panel';
+
+        const title = document.createElement('div');
+        const strong = document.createElement('strong');
+        strong.textContent = person.display_name || person.person_id;
+        title.appendChild(strong);
+
+        const meta = document.createElement('div');
+        meta.className = 'meta';
+        meta.textContent = person.person_id;
+
+        const actions = document.createElement('div');
+        actions.className = 'row';
+        actions.style.marginTop = '10px';
+
+        const resetButton = document.createElement('button');
+        resetButton.type = 'button';
+        resetButton.textContent = 'Reset Runtime';
+        resetButton.addEventListener('click', async () => {
+          await fetch(`/api/people/${person.person_id}/runtime/reset`, {
+            method: 'POST',
+            headers: authHeaders(),
+          });
+          await refresh();
+        });
+
+        const deleteButton = document.createElement('button');
+        deleteButton.type = 'button';
+        deleteButton.className = 'danger';
+        deleteButton.textContent = 'Delete';
+        deleteButton.addEventListener('click', async () => {
+          await fetch(`/api/people/${person.person_id}`, {
+            method: 'DELETE',
+            headers: authHeaders(),
+          });
+          await refresh();
+        });
+
+        actions.appendChild(resetButton);
+        actions.appendChild(deleteButton);
+        item.appendChild(title);
+        item.appendChild(meta);
+        item.appendChild(actions);
+        peopleList.appendChild(item);
+      }
     }
 
-    async function deletePerson(personId) {
-      await fetch(`/api/people/${personId}`, { method: 'DELETE' });
-      await refresh();
-    }
+    document.getElementById('saveTokenButton').addEventListener('click', () => {
+      sessionStorage.setItem(MANAGE_TOKEN_KEY, tokenInput.value);
+    });
 
-    async function cancelEnrollment() {
-      await fetch('/api/people/enrollment/cancel', { method: 'POST' });
+    document.getElementById('cancelEnrollmentButton').addEventListener('click', async () => {
+      await fetch('/api/people/enrollment/cancel', {
+        method: 'POST',
+        headers: authHeaders(),
+      });
       await refresh();
-    }
+    });
 
     const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/dashboard');
     ws.onmessage = () => refresh();

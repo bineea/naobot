@@ -106,6 +106,12 @@ class RuntimePersistence:
         self._initialized = False
         self._init_lock = None
 
+    def _fernet(self) -> Fernet:
+        key = self.settings.data_key or os.getenv("NAOBOT_DATA_KEY")
+        if not key:
+            raise RuntimeError("NAOBOT_DATA_KEY 未配置，拒绝写入敏感人脸数据。")
+        return Fernet(key.encode("utf-8"))
+
     async def initialize(self) -> None:
         if self._initialized:
             return
@@ -427,6 +433,87 @@ class RuntimePersistence:
                 await db.rollback()
                 raise
 
+    async def enroll_person_atomic(
+        self,
+        *,
+        person_id: str,
+        embedding: list[float],
+        model_name: str,
+        samples: list[dict[str, Any]],
+        display_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if len(samples) != 5:
+            raise ValueError("enrollment requires exactly 5 samples")
+        fernet = self._fernet()
+        await self.initialize()
+        now = _utc_now()
+        embedding_ciphertext = fernet.encrypt(
+            json.dumps({"embedding": embedding}, ensure_ascii=False).encode("utf-8")
+        )
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA foreign_keys=ON")
+            await db.execute("BEGIN")
+            try:
+                await db.execute(
+                    """
+                    INSERT INTO people(person_id, display_name, metadata_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(person_id) DO UPDATE SET
+                        display_name = COALESCE(excluded.display_name, people.display_name),
+                        metadata_json = excluded.metadata_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        person_id,
+                        display_name,
+                        json.dumps(metadata or {}, ensure_ascii=False),
+                        now,
+                        now,
+                    ),
+                )
+                await db.execute(
+                    """
+                    INSERT INTO face_embeddings(
+                        robot_id, person_id, model_name, embedding_ciphertext, version, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, 1, ?)
+                    ON CONFLICT(robot_id, person_id, model_name) DO UPDATE SET
+                        embedding_ciphertext = excluded.embedding_ciphertext,
+                        updated_at = excluded.updated_at,
+                        version = face_embeddings.version + 1
+                    """,
+                    (
+                        self.settings.robot_id,
+                        person_id,
+                        model_name,
+                        embedding_ciphertext,
+                        now,
+                    ),
+                )
+                for sample in samples:
+                    ciphertext = fernet.encrypt(bytes(sample["sample_bytes"]))
+                    await db.execute(
+                        """
+                        INSERT INTO face_samples(
+                            robot_id, person_id, media_type, sha256, sample_ciphertext, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            self.settings.robot_id,
+                            person_id,
+                            sample["media_type"],
+                            sample["sha256"],
+                            ciphertext,
+                            now,
+                        ),
+                    )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+
 
 class FaceDataRepository:
     def __init__(self, settings: Settings, persistence: RuntimePersistence | None = None) -> None:
@@ -434,10 +521,7 @@ class FaceDataRepository:
         self.persistence = persistence or RuntimePersistence(settings)
 
     def _fernet(self) -> Fernet:
-        key = self.settings.data_key or os.getenv("NAOBOT_DATA_KEY")
-        if not key:
-            raise RuntimeError("NAOBOT_DATA_KEY 未配置，拒绝写入敏感人脸数据。")
-        return Fernet(key.encode("utf-8"))
+        return self.persistence._fernet()
 
     async def upsert_embedding(
         self,

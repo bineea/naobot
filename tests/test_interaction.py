@@ -149,6 +149,18 @@ def test_session_idle_timeout_and_half_duplex_resume() -> None:
     assert session.snapshot(now_ms=40_001).active is False
 
 
+def test_touch_keeps_existing_session_id_when_session_already_active() -> None:
+    session = InteractionSession(session_idle_ms=30_000, tts_resume_delay_ms=200)
+    session.activate_from_wake_word(now_ms=1_000, person_id=None)
+
+    before = session.snapshot(now_ms=1_000).session_id
+    session.activate_from_touch(now_ms=1_100, person_id=None)
+    after = session.snapshot(now_ms=1_100).session_id
+
+    assert before == after
+    assert session.snapshot(now_ms=1_100).session_trigger == "touch"
+
+
 def test_session_gate_uses_monotonic_now_ms() -> None:
     session = InteractionSession(session_idle_ms=30_000, tts_resume_delay_ms=200)
     session.activate_from_touch(now_ms=10_000, person_id=None)
@@ -278,6 +290,34 @@ async def test_orchestrator_exposes_completed_turn_without_raw_jpeg_in_event_pay
     assert turn.event.payload["vision_summary"] == "用户拿着盒子"
     assert "jpeg-1" not in str(turn.event.payload)
     assert len(turn.vision_blocks) == 3
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_does_not_reactivate_session_on_followup_wakeword() -> None:
+    orchestrator = InteractionOrchestrator(
+        settings=Settings(),
+        pipeline=MediaPipeline(),
+        session=InteractionSession(),
+        wake_word=SpyWakeWordProvider(triggered=True),
+        identity=SpyIdentityProvider(person_id=None, eye_contact_ms=0),
+        asr=SpyASRProvider(transcript="确认"),
+        vision=SpyVisionProvider(summary="检测到单人"),
+        tts=SpyTTSProvider(),
+    )
+
+    await orchestrator.observe_audio(
+        [MediaFrame.audio_pcm16(b"wake", timestamp_ms=100, sequence=1, flags=1)],
+        now_ms=10_000,
+    )
+    first_session = orchestrator.session.snapshot(now_ms=10_000).session_id
+
+    await orchestrator.observe_audio(
+        [MediaFrame.audio_pcm16(b"confirm", timestamp_ms=120, sequence=2, flags=3)],
+        now_ms=10_200,
+    )
+    second_session = orchestrator.session.snapshot(now_ms=10_200).session_id
+
+    assert first_session == second_session
 
 
 def test_local_media_adapters_fail_with_clear_runtime_error_when_optional_deps_missing(
