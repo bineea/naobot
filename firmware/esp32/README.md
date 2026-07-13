@@ -12,7 +12,8 @@
 - `main.py` 会尝试连接 WiFi 和 Host WebSocket；当前只支持明文 `ws://`，不支持 `wss://`。
 - `media/` 使用独立 `/ws/media` WebSocket、独立队列和独立重连状态；控制 WebSocket 不承载二进制媒体。
 - OV2640 默认输出 QVGA JPEG（quality 12），使用两个 PSRAM framebuffer、PSRAM DMA 和 `GRAB_LATEST`。
-- INMP441 与 MAX98357A 均使用 PCM16、单声道、16 kHz I2S；TTS 播放期间暂停摄像头和麦克风上传。
+- INMP441 与 MAX98357A 均使用 PCM16、单声道、16 kHz I2S；固件能量 VAD 设置 speech/end-of-utterance flags，Host 只在固件未标注时用本地 VAD 兜底。
+- 音频是半双工：TTS 播放期间只暂停麦克风上传，摄像头继续按常态 10 FPS/事件窗口 15 FPS 上传；固件收到 `tts_end` 且排空播放缓冲后立即恢复麦克风，Host 会在 TTS 完成后再等待默认 200 ms 才恢复 listening。当前没有 AEC 或 barge-in。
 - `camera`、`machine.I2S` 或相应硬件缺失时，媒体设备标记为 unavailable，50 ms 本地安全循环继续运行。
 - 摄像头先检查可用帧再取 framebuffer；I2S RX 只在 IRQ readiness 后读取；控制接收和媒体 connect/recv/send 使用不超过 10 ms 的单次超时，媒体大帧每次最多发送 1 KiB。
 - 网络不可用时，固件继续使用本地 fallback，不阻塞安全循环。
@@ -61,7 +62,7 @@ ESP32 和宿主机需要在同一局域网。先在宿主机运行 `naobot serve
 
 heartbeat 额外报告 `camera_fps`、`audio_state`、`media_queue`、`media_dropped` 和 `psram_free`。
 
-50 ms 安全循环按 deadline 补偿睡眠，并额外记录实际调度间隔和 overrun。控制与媒体连接由独立 MicroPython `_thread` worker 执行 DNS、TCP 和 WebSocket 握手，完成后才把 socket transport 交回 `uasyncio`；硬件、动作和反射对象不会跨线程。当前实现仍不提供 FreeRTOS 高优先级隔离保证；真实硬件驱动、GC、线程调度或底层网络栈仍可能引入抖动，必须通过板上 stall probe 验证。
+50 ms 安全循环按 deadline 补偿睡眠，并额外记录实际调度间隔和 overrun。控制 client 与媒体 client 各自拥有独立 `ConnectionWorker`；两个 worker 分别在 MicroPython `_thread` 中执行 DNS、TCP 和 WebSocket 握手，完成后才把 socket transport 交回 `uasyncio`。硬件、动作和反射对象不会跨线程，媒体连接失败也不能改变反射控制权。当前实现仍不提供 FreeRTOS 高优先级隔离保证；真实硬件驱动、GC、线程调度或底层网络栈仍可能引入抖动，必须通过板上 stall probe 验证。
 
 ## 定制 MicroPython 镜像
 
@@ -123,4 +124,4 @@ mpremote connect COM3 soft-reset
 
 ## 硬件验证状态
 
-当前只完成 CPython fake、Python 语法检查、协议测试和构建配方静态结构检查，未实际执行 C 编译，也未生成真实 `.bin`。尚未在真实 N16R8 44 针板、OV2640、INMP441、MAX98357A 或 CH343 串口链路上验证。首次 bring-up 必须检查 GPIO8/9 共线、摄像头帧稳定性、I2S 声道/幅值、PSRAM 余量、TTS 连续播放以及媒体拥塞时 50 ms 安全循环抖动。
+当前只完成 CPython fake、Python 语法检查、协议测试和构建配方静态结构检查，未实际执行 C 编译，也未生成项目定制真实 `.bin`。仓库 generic bin 不含定制 `camera` 模块。尚未在真实 N16R8 44 针板、OV2640、INMP441、MAX98357A、PSRAM、舵机或 CH343 串口链路上验证，30 分钟硬件指标也未执行。首次 bring-up 必须检查 GPIO8/9 共线、摄像头 10/15 FPS、I2S 声道/幅值、PSRAM 余量、半双工排空恢复、TTS 连续播放、connection worker 重连以及媒体拥塞时 50 ms 安全循环抖动；指标门槛见 `docs/product/roadmap.md`。

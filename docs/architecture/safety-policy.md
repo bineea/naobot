@@ -1,69 +1,55 @@
 # 安全策略
 
-## 默认策略
+## 控制优先级
 
-naobot 安全策略采用默认拒绝。所有动作、技能和参数化表情必须来自白名单，并经过 `PolicyGuard` 校验。
-
-LLM 不拥有直接动作控制权。L3 AgentScope Brain 只允许输出 `goal`、`text`、`expression`、`skills`、`memory_suggestion`；L2 `BehaviorRuntime` 才能把语义字段确定性编译为兼容 actions。任何来自 LLM 的 `actions` 都视为非法或不可信输入，不参与执行。
-
-控制优先级：
+naobot 默认拒绝，低层控制权不能被高层覆盖：
 
 ```text
 急停 > 反射安全 > 小脑姿态控制 > 固件技能 > Host/LLM intent > Routine/idle
 ```
 
-## 动作白名单
+L3 只输出 `goal/text/expression/skills/memory_suggestion`；L2 `BehaviorRuntime` 忽略 LLM `actions`，确定性生成兼容动作并通过 `PolicyGuard`。固件再次校验并保留最终拒绝权。
 
-- `set_face`
-- `set_expression`
-- `blink`
-- `wave`
-- `small_step_forward`
-- `turn_left`
-- `turn_right`
-- `gentle_nudge`
-- `sit`
-- `chirp`
-- `sleep`
-- `stop`
+## 动作与 LLM 边界
 
-## 拒绝规则
+- 白名单为 `set_face`、`set_expression`、`blink`、`wave`、`small_step_forward`、`turn_left`、`turn_right`、`gentle_nudge`、`sit`、`chirp`、`sleep`、`stop`。
+- 未知动作、裸硬件字段、危险关键词、越界表情、过长持续时间、过期 intent、低电运动和异常姿态运动一律拒绝。
+- MPU6050 缺失或读取失败按 `unknown` 处理；`fallen`/`unknown` 时禁止位移动作。
+- AgentScope Toolkit 为空，不提供 shell、文件、Python、MCP、硬件工具或任意代码执行。
+- 自动路由 `score >= 4` 才直接组队；单 Agent `needs_team=true` 或 `confidence < 0.65` 可升级。团队最多三专家加负责人，安全事件绝不组队。
+- 单 Agent 6 秒、团队 15 秒、最多 4 轮；未配置、超时、异常或非法输出进入 fallback，fallback 仍经过 L2 和 `PolicyGuard`。
 
-- 未知动作拒绝。
-- 含裸硬件字段或危险关键词的动作拒绝。
-- 未授权技能、越界表情参数或过长表情持续时间拒绝。
-- 过期 intent 拒绝。
-- 低电状态下位移动作拒绝。
-- fault 或异常姿态下位移动作拒绝。
-- MPU6050 缺失或读取失败时，固件姿态视为 `unknown`，按异常姿态处理。
-- 未确认 Memory 不进入长期记忆。
-- 未确认 Routine 不自动启用。
+## 会话与媒体隐私
 
-## LLM 边界
+- 唤醒词、短问候、摸头或持续目光激活会话之前，不调用 cloud ASR/TTS/vision provider，也不调用 Agent。
+- 视频 10 秒、音频 15 秒和时序摘要仅保存在 RAM 窗口；原始短期媒体不写文件、不写 SQLite、不写日志。
+- Agent runtime 持久化前必须把 base64/URL 媒体清洗为摘要与 SHA-256。
+- 未知人员使用隔离的 visitor runtime，只在内存存在，连接结束时销毁；不能复用已识别人员上下文。
+- 身份注册仅接受未知单人，要求 5 张样本、口头确认和摸头确认；没有 `NAOBOT_DATA_KEY` 时必须拒绝注册。
+- Fernet 只加密人脸 embedding 和这 5 张注册样本。`naobot.db` 不是全数据库加密，people 元数据、conversation session 和 Agent runtime state 是普通 SQLite 内容。
+- 未确认 Memory 不进入长期记忆；未确认 Routine 不启用。
 
-- LLM 只能生成文本、goal、参数化表情、白名单技能和待确认记忆建议。
-- LLM 不能生成、要求执行或绕过 L2 编译的 `actions`。
-- LLM 不能直接控制舵机角度、PWM、servo id 或其他裸硬件字段。
-- AgentScope Brain 使用 `agentscope==2.0.4` Agent 和 OpenAI-compatible 模型，空 `Toolkit`，不提供 shell、文件、Python、MCP、硬件工具或任意代码执行能力。
-- LLM 未配置、调用失败、超时、异常或返回非法格式时，宿主机使用规则 fallback。
-- fallback 不绕过 `PolicyGuard`。
-- 复杂请求最多由 3 个专家 agent 给出建议，再由产品负责人 agent 收敛；安全事件禁止组队，以降低延迟和冲突风险。
-- 单次大脑推理默认 4 秒超时，ReAct 最多 4 轮。
+## People API 鉴权
 
-## Dashboard 边界
+- `GET /api/people`、`POST /api/people/{person_id}/runtime/reset`、`DELETE /api/people/{person_id}` 和 `POST /api/people/enrollment/cancel` 都执行鉴权。
+- 配置 `NAOBOT_DEVICE_TOKEN` 时，客户端必须提供 `Authorization: Bearer <token>` 或 `X-Naobot-Token`；比较使用恒定时间函数。
+- 未配置 token 时只允许 loopback；非本机请求返回 403。People 页面或 API 不得成为绕过身份确认和删除审计的入口。
 
-- Dashboard 只提供状态、动作测试、急停、Soul、Memory、Routine 和诊断日志。
-- Dashboard 不提供 Blockly、脚本编辑器、终端、任意代码执行或底层舵机控制。
+## 传输与音频限制
 
-## 固件边界
+- 固件当前只支持明文 `ws://`，不支持 `wss://`。同一局域网中的监听、伪造、中间人和 token 泄露风险仍存在；部署时应使用受信任隔离网络、限制 Host 监听地址并保护 device token。
+- 已实现音频半双工，不是全双工音频：TTS 期间只暂停麦克风上行，摄像头继续按 10/15 FPS 上传；固件排空后恢复麦克风，Host 再等待 200 ms。AEC 与 barge-in 未实现，不得在文档或产品承诺中宣称完成。
+- 媒体坏帧、队列溢出、TTS/provider 异常、媒体断线或分片错误只影响媒体状态；不能发送运动 intent、改变 `control_authority` 或覆盖反射。
 
-- 固件是最后一道安全线。
-- 固件反射层拥有最高控制权，Host/LLM intent 不能覆盖急停、低电、跌倒、IMU fault 或硬件保护。
-- 即使宿主机失联或协议异常，固件也要保持本地降级、动作限幅和安全停止。
-- Host 心跳超时后，固件必须停止当前 Host skill，进入本地自治或 fallback；反射安全仍保持最高优先级。
-- 固件执行 intent 时优先使用 `skills`/`expression` 等语义字段；仅在缺少语义字段时使用兼容 `actions`，避免重复执行同一行为。
-- 固件中 MPU6050 姿态为 `fallen` 或 `unknown` 时，禁止运动动作，只允许表情、提示音、休眠、急停等低风险动作。
-- 固件执行层必须与 Host 白名单动作对齐；未实现或执行失败的动作必须返回 `error`，不能回假 `ack`。
-- 固件不保存长期记忆，不调用 LLM，不实现图形化编程。
-- 未实现力反馈、电流检测、触觉或边缘检测前，不启用默认夹持/抓住桌边反射。
+## 固件最终安全线
 
+- 固件反射始终优先于 Host intent、媒体、TTS 和网络重连。
+- Host 心跳超时后取消 Host skill，进入本地自治；反射仍可执行。
+- 语义 `skills/expression` 优先于兼容 `actions`，避免重复动作。
+- 动作未实现或执行失败必须返回 `error`，不能回假 `ack`。
+- 固件不保存长期记忆、不调用 LLM、不实现 Dashboard/Blockly，也不把硬件对象交给连接 worker 线程。
+- 未实现力反馈、电流检测、触觉或边缘检测前，不启用夹持或桌边反射。
+
+## 硬件事实边界
+
+CPython fake、协议测试、Python 语法检查和静态构建配方不等于硬件安全验收。当前没有真实 C 编译、项目定制 bin、N16R8、OV2640、I2S、PSRAM、CH343、舵机或 30 分钟稳定性实测记录；在记录产生前必须维持“未验收”状态。

@@ -1,37 +1,44 @@
 # 路线图
 
-## Phase 0：软件 MVP
+## 当前基线：软件实现已完成
 
-- Host Agent、FastAPI Dashboard、模拟器、协议模型、安全策略、Memory、Routine、固件骨架可用。
-- AgentScope Brain 运行时可用：`agentscope==2.0.4`、OpenAI-compatible 模型、空 Toolkit、4 秒超时、4 轮上限、fallback 可观察。
-- L2 BehaviorRuntime 可用：确定性编译 `goal/text/expression/skills/memory_suggestion`，忽略 LLM `actions`，通过 `PolicyGuard` 生成兼容 actions。
-- WebSocket 接入有界优先级事件队列，默认容量 32；Host heartbeat 每 2 秒独立于推理发送。
-- 通过自动化测试验证核心安全边界。
-- 不要求真实 ESP32 和舵机现场验证。
+以下能力已在当前 HEAD 实现，并有自动化测试覆盖；这里的“完成”仅指 CPython、MicroPython fake、协议和静态构建配方层面，不代表真实 N16R8 硬件验收：
 
-## Phase 1：硬件 bring-up
+- AgentScope Brain 使用 `agentscope==2.0.4`、OpenAI-compatible 模型和空 Toolkit；单 Agent 默认 `6s`、团队默认 `15s`、ReAct 最多 4 轮，失败统一进入可观察 fallback。
+- 自动路由按多目标、冲突、身份/记忆、时序视觉、歧义和长文本累计评分，`score >= 4` 进入团队；单 Agent 返回 `needs_team=true` 或 `confidence < 0.65` 时升级。
+- 团队固定为情绪、行为、安全三位专家并行给建议，由产品负责人收敛；安全事件走确定性 fallback，不启动团队。
+- 已识别人员的 AgentScope runtime 以 SQLite WAL 持久化；访客 runtime 只在内存中存在并在媒体连接结束时销毁。
+- 控制 `/ws/kt2` 与媒体 `/ws/media` 分离；媒体有 hello/token、24 字节二进制帧、限长、队列淘汰、TTS 下行、WebSocket 分片接收和错误隔离测试。
+- 自然交互支持唤醒词、短问候、触摸和持续目光激活；视频常态 10 FPS、事件窗口 15 FPS，音频由固件能量 VAD 标志和 Host 本地 VAD 兜底。
+- 音频半双工已实现：TTS 期间仅暂停麦克风上传，摄像头继续保持 10/15 FPS；固件排空 TTS 后恢复麦克风，Host 在 TTS 完成后再等待 200 ms 恢复监听。AEC 与 barge-in 未实现。
+- People 注册使用未知单人、最近 5 张人脸、口头确认和摸头确认；People API 支持列表、runtime 重置、删除和取消注册，并执行 token/本机鉴权。
+- `runtime/naobot.db` 使用 SQLite WAL；只有人脸 embedding 和注册时 5 张样本用 Fernet 加密，未实现全数据库加密。
+- Host 事件队列容量默认 32，高优先级优先且同优先级 FIFO；Host heartbeat 每 2 秒独立发送。
+- 控制/媒体协议、runtime、身份注册、加密范围、People API、优先级队列、半双工和固件连接 worker 均有自动化测试。
 
-- 确认 ESP32 型号、引脚、屏幕、触摸、电源检测、IMU、舵机接线。
-- 将固件 stub 替换为真实驱动。
-- 完成安全姿态、急停、低电和跌倒降级实测。
-- 验证语义字段优先于兼容 actions 的固件执行策略，避免同一 intent 在真实硬件上重复执行。
+## 下一阶段：N16R8 硬件验收待办
 
-## Phase 2：互动体验
+以下项目尚未执行，不得从软件测试或构建配方推断为已通过：
 
-- 扩展事件种类和 Soul 表达。
-- 增加可解释的 routine 推荐和确认流程。
-- 优化 Dashboard 的状态可视化与诊断日志。
+- 在真实 ESP32-S3 N16R8 44 针板上构建并烧录 MicroPython `v1.28.0` + `esp32-camera v2.1.6` 定制固件。
+- 验证 CH343 下载/日志/REPL、16 MB Flash、8 MB Octal PSRAM、GPIO8/9 共线和电源稳定性。
+- 验证 OV2640 QVGA JPEG、INMP441 PCM16 16 kHz 输入、MAX98357A TTS 输出、OLED、MPU6050、触摸和四路舵机。
+- 实测反射优先级、急停、低电、跌倒、IMU fault、失联降级、动作中断和语义字段优先于兼容 `actions`。
+- 实测控制与媒体各自 `_thread` 连接 worker 不破坏 50 ms 本地安全循环。
 
-## Phase 1A-1D：分层自治控制
+## 30 分钟硬件稳定性门槛（未执行）
 
-- Phase 1A：反射安全层，固件本地处理跌倒、低电、急停和 IMU fault。
-- Phase 1B：可中断运动控制，运动动作支持 tick/cancel 和安全抢占。
-- Phase 1C：参数化表情，Host 输出 expression，固件 renderer 负责限幅绘制。
-- Phase 1D：Host 语义行为层，LLM 输出 goal + expression + skills，并保留 actions 兼容。
+一次验收必须在同一台真实 N16R8 上连续运行 30 分钟并保留日志，目标如下：
 
-## Phase 3：多 agent 工程化
+- 0 次崩溃、watchdog reset、非计划重启、PSRAM 分配失败和 CH343 串口中断。
+- 控制 heartbeat 间隔保持 2 秒，不能出现超过 7 秒且未触发离线降级的空窗；控制与媒体异常互不拖垮。
+- `local_loop_interval_ms` 的 P99 不超过 75 ms，最大值不超过 100 ms；记录所有 `local_loop_overrun_ms > 0` 样本。
+- 常态视频平均 9-11 FPS；触摸等本地事件后的 boost 窗口平均 13-17 FPS。
+- 完成至少 30 轮语音输入/TTS 输出；TTS 期间无麦克风上行但摄像头继续 10/15 FPS，排空后固件恢复麦克风，Host 在 200 ms 后恢复监听；无语音帧乱序或不可恢复的 TTS 卡死。
+- 完成至少 10 次断网/重连或服务重启注入；本地反射始终可用，重连后控制与媒体状态恢复。
 
-- 使用 `docs/agents/` 模板让架构、开发、测试、评审 agent 并行协作。
-- 对每个功能建立 PRD -> 任务 -> 测试 -> 评审 -> ADR 的闭环。
-- 增加文档一致性检查和安全回归检查。
+## 后续体验与工程化
 
+- 扩展事件种类、Soul 表达和可解释 routine 推荐，但继续保持人工确认与动作白名单。
+- 优化 Dashboard 状态、People 管理和媒体诊断，不把 Dashboard 变成编程 IDE。
+- 对每个跨模块能力保持 PRD、ADR、协议、测试和硬件验收记录同步。
