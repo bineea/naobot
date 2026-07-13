@@ -9,6 +9,7 @@ import httpx
 import pytest
 from agentscope.message import DataBlock
 
+from naobot.media import buffers
 from naobot.media.backends import (
     ASRResult,
     CosineIdentityMatcher,
@@ -87,6 +88,53 @@ class FakeSherpaEngine:
     def generate(self, text: str):
         self.calls.append(text)
         return {"samples": [1, -1, 2]}
+
+
+def test_media_ingress_queue_prioritizes_eou_over_old_jpeg_and_non_speech_audio() -> None:
+    queue_type = getattr(buffers, "MediaIngressQueue", None)
+    assert queue_type is not None, "MediaIngressQueue 尚未实现"
+    queue = queue_type(maxsize=3)
+    queue.put_nowait(MediaFrame.jpeg(b"jpeg", timestamp_ms=1, sequence=1))
+    queue.put_nowait(
+        MediaFrame.audio_pcm16(b"silence", timestamp_ms=2, sequence=2, flags=0)
+    )
+    queue.put_nowait(
+        MediaFrame.audio_pcm16(b"speech", timestamp_ms=3, sequence=3, flags=1)
+    )
+
+    assert queue.put_nowait(
+        MediaFrame.audio_pcm16(b"eou", timestamp_ms=4, sequence=4, flags=2)
+    )
+    assert queue.put_nowait(
+        MediaFrame.audio_pcm16(b"speech-2", timestamp_ms=5, sequence=5, flags=1)
+    )
+    assert [queue.get_nowait().sequence for _ in range(3)] == [3, 4, 5]
+    assert queue.dropped == {
+        "total": 2,
+        "by_kind": {"JPEG": 1, "AUDIO_PCM16": 1},
+        "by_reason": {
+            "evicted_oldest_jpeg": 1,
+            "evicted_oldest_non_speech_audio": 1,
+        },
+    }
+
+
+def test_media_ingress_queue_rejects_new_jpeg_when_only_speech_and_eou_are_queued() -> None:
+    queue_type = getattr(buffers, "MediaIngressQueue", None)
+    assert queue_type is not None, "MediaIngressQueue 尚未实现"
+    queue = queue_type(maxsize=2)
+    queue.put_nowait(
+        MediaFrame.audio_pcm16(b"speech", timestamp_ms=1, sequence=1, flags=1)
+    )
+    queue.put_nowait(MediaFrame.audio_pcm16(b"eou", timestamp_ms=2, sequence=2, flags=2))
+
+    assert queue.put_nowait(MediaFrame.jpeg(b"new", timestamp_ms=3, sequence=3)) is False
+    assert [queue.get_nowait().sequence for _ in range(2)] == [1, 2]
+    assert queue.dropped == {
+        "total": 1,
+        "by_kind": {"JPEG": 1},
+        "by_reason": {"queue_full_protected": 1},
+    }
 
 
 def test_media_frame_roundtrip_and_strict_decode() -> None:

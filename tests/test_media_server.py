@@ -22,6 +22,7 @@ from naobot.media.backends import (
     VisionResult,
     WakeWordResult,
 )
+from naobot.media.buffers import MediaIngressQueue
 from naobot.media.protocol import MediaFrame, MediaFrameKind, MediaHello
 from naobot.media.service import MediaHub, MediaService
 from naobot.models import Envelope, MessageType
@@ -106,6 +107,14 @@ class FakeTTS:
         return TTSResult(audio=b"\x01\x00\x02\x00", media_type="audio/pcm")
 
 
+class BytesTTS:
+    def __init__(self, audio: bytes) -> None:
+        self.audio = audio
+
+    async def synthesize(self, _text: str):
+        return TTSResult(audio=self.audio, media_type="audio/pcm")
+
+
 class SequenceASR:
     def __init__(self, transcripts):
         self.transcripts = list(transcripts)
@@ -151,6 +160,34 @@ class CountingAgent:
 
     async def create_intent(self, event, media_blocks=None):
         self.calls += 1
+        return Envelope(
+            type=MessageType.INTENT,
+            session_id=event.session_id,
+            payload={"text": ""},
+        )
+
+
+class BlockingAgent(CountingAgent):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def create_intent(self, event, media_blocks=None):
+        self.calls += 1
+        if self.calls > 1:
+            return Envelope(
+                type=MessageType.INTENT,
+                session_id=event.session_id,
+                payload={"text": ""},
+            )
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
         return Envelope(
             type=MessageType.INTENT,
             session_id=event.session_id,
@@ -402,6 +439,131 @@ async def test_concurrent_authenticated_connections_allow_exactly_one(tmp_path) 
     await asyncio.gather(*tasks)
 
 
+def test_media_status_reports_ingress_queue_depth_and_drop_breakdown(tmp_path) -> None:
+    settings = Settings(
+        runtime_dir=tmp_path,
+        media_video_queue_limit=1,
+        media_audio_queue_limit=1,
+    )
+    _client, _agent, service, _llm, _asr = make_media_client(tmp_path, settings=settings)
+
+    assert isinstance(service._frame_queue, MediaIngressQueue)
+    assert service._frame_queue.put_nowait(
+        MediaFrame.audio_pcm16(b"speech", timestamp_ms=1, sequence=1, flags=1)
+    )
+    assert service._frame_queue.put_nowait(
+        MediaFrame.audio_pcm16(b"eou", timestamp_ms=2, sequence=2, flags=2)
+    )
+    assert not service._frame_queue.put_nowait(
+        MediaFrame.jpeg(b"jpeg", timestamp_ms=3, sequence=3)
+    )
+
+    assert service.status()["queue"] == 2
+    assert service.status()["dropped"] == {
+        "total": 1,
+        "by_kind": {"JPEG": 1},
+        "by_reason": {"queue_full_protected": 1},
+    }
+
+
+@pytest.mark.asyncio
+async def test_slow_agent_does_not_block_ingress_and_disconnect_cleans_workers(tmp_path) -> None:
+    settings = Settings(
+        runtime_dir=tmp_path,
+        media_video_queue_limit=4,
+        media_audio_queue_limit=8,
+        local_vad_enabled=False,
+    )
+    agent = BlockingAgent()
+    service = MediaService(
+        settings=settings,
+        agent=agent,
+        wake_word=FakeWakeWord(),
+        identity=FakeIdentity(),
+        asr=FakeASR(),
+        vision=FakeVision(),
+        tts=FakeTTS(),
+    )
+    websocket = ControlledMediaWebSocket(valid_media_hello("slow-agent"))
+    handler = asyncio.create_task(
+        service.handle_websocket(websocket)  # type: ignore[arg-type]
+    )
+    await asyncio.wait_for(websocket.outcome.wait(), timeout=0.5)
+
+    try:
+        websocket.incoming.put_nowait(
+            {
+                "type": "websocket.receive",
+                "bytes": MediaFrame.audio_pcm16(
+                    b"wake", timestamp_ms=1, sequence=1, flags=1
+                ).encode(),
+            }
+        )
+        websocket.incoming.put_nowait(
+            {
+                "type": "websocket.receive",
+                "bytes": MediaFrame.audio_pcm16(
+                    b"eou", timestamp_ms=2, sequence=2, flags=3
+                ).encode(),
+            }
+        )
+        await asyncio.wait_for(agent.started.wait(), timeout=0.5)
+
+        websocket.incoming.put_nowait(
+            {
+                "type": "websocket.receive",
+                "bytes": MediaFrame.jpeg(
+                    b"new-jpeg", timestamp_ms=3, sequence=3
+                ).encode(),
+            }
+        )
+        websocket.incoming.put_nowait(
+            {
+                "type": "websocket.receive",
+                "bytes": MediaFrame.audio_pcm16(
+                    b"speech", timestamp_ms=4, sequence=4, flags=1
+                ).encode(),
+            }
+        )
+        websocket.incoming.put_nowait(
+            {
+                "type": "websocket.receive",
+                "bytes": MediaFrame.audio_pcm16(
+                    b"eou-2", timestamp_ms=5, sequence=5, flags=3
+                ).encode(),
+            }
+        )
+
+        async def second_turn_was_observed() -> None:
+            while True:
+                turn_queue = getattr(service, "_turn_queue", None)
+                if (
+                    service.pipeline.video_window()
+                    and service.pipeline.video_window()[-1].sequence == 3
+                    and turn_queue is not None
+                    and turn_queue.qsize() == 1
+                ):
+                    return
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(second_turn_was_observed(), timeout=0.5)
+
+        websocket.disconnect()
+        await asyncio.wait_for(handler, timeout=0.5)
+
+        assert agent.cancelled.is_set()
+        assert getattr(service, "_frame_worker_task", None) is None
+        assert getattr(service, "_turn_worker_task", None) is None
+        assert service._frame_queue.empty()
+        assert service._turn_queue.empty()
+        assert service._audio_turn == []
+    finally:
+        if not handler.done():
+            agent.release.set()
+            websocket.disconnect()
+            await asyncio.gather(handler, return_exceptions=True)
+
+
 def test_media_turn_streams_tts_and_forwards_intent(tmp_path) -> None:
     client, agent, _service, llm, _asr = make_media_client(tmp_path)
 
@@ -439,6 +601,90 @@ def test_media_turn_streams_tts_and_forwards_intent(tmp_path) -> None:
     assert tts_frame.kind == MediaFrameKind.TTS_PCM16
     assert llm.media_blocks_seen is not None
     assert "jpeg-1" not in str(agent.logs)
+
+
+@pytest.mark.asyncio
+async def test_large_tts_is_chunked_sequenced_and_paced(tmp_path, monkeypatch) -> None:
+    settings = Settings(runtime_dir=tmp_path)
+    session = InteractionSession()
+    session.activate_from_touch(now_ms=1_000, person_id=None)
+    service = MediaService(
+        settings=settings,
+        agent=CountingAgent(),
+        session=session,
+        wake_word=QuietWakeWord(),
+        identity=PassiveIdentity(),
+        asr=FakeASR(),
+        vision=FakeVision(),
+        tts=BytesTTS(b"x" * (70 * 1024)),
+        clock=StepClock(1_000),
+    )
+    sent = []
+    sleeps = []
+
+    async def capture_json(payload):
+        sent.append(("json", payload))
+        return True
+
+    async def capture_binary(payload):
+        sent.append(("binary", MediaFrame.decode(payload)))
+        return True
+
+    async def capture_sleep(delay):
+        sleeps.append(delay)
+
+    service.hub.send_json = capture_json  # type: ignore[method-assign]
+    service.hub.send_binary = capture_binary  # type: ignore[method-assign]
+    monkeypatch.setattr("naobot.media.service.asyncio.sleep", capture_sleep)
+
+    await service._speak_control_text("长语音", 1_000)
+
+    frames = [payload for kind, payload in sent if kind == "binary"]
+    assert sent[0] == ("json", {"kind": "tts_start", "text": "长语音"})
+    assert sent[-1] == ("json", {"kind": "tts_end"})
+    assert len(frames) == 9
+    assert all(frame.kind == MediaFrameKind.TTS_PCM16 for frame in frames)
+    assert all(len(frame.payload) <= 8_192 for frame in frames)
+    assert [frame.sequence for frame in frames] == list(range(len(frames)))
+    assert sleeps == [pytest.approx(8_192 / 32_000)] * (len(frames) - 1)
+
+
+@pytest.mark.asyncio
+async def test_empty_tts_still_sends_start_then_end(tmp_path) -> None:
+    session = InteractionSession()
+    session.activate_from_touch(now_ms=1_000, person_id=None)
+    service = MediaService(
+        settings=Settings(runtime_dir=tmp_path),
+        agent=CountingAgent(),
+        session=session,
+        wake_word=QuietWakeWord(),
+        identity=PassiveIdentity(),
+        asr=FakeASR(),
+        vision=FakeVision(),
+        tts=BytesTTS(b""),
+        clock=StepClock(1_000),
+    )
+    sent_json = []
+    sent_binary = []
+
+    async def capture_json(payload):
+        sent_json.append(payload)
+        return True
+
+    async def capture_binary(payload):
+        sent_binary.append(payload)
+        return True
+
+    service.hub.send_json = capture_json  # type: ignore[method-assign]
+    service.hub.send_binary = capture_binary  # type: ignore[method-assign]
+
+    await service._speak_control_text("空语音", 1_000)
+
+    assert sent_json == [
+        {"kind": "tts_start", "text": "空语音"},
+        {"kind": "tts_end"},
+    ]
+    assert sent_binary == []
 
 
 def test_media_flood_does_not_block_kt2_heartbeat_and_bad_frame_only_returns_media_error(tmp_path) -> None:

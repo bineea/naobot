@@ -43,12 +43,16 @@ from .backends import (
     WakeWordProvider,
     WakeWordResult,
 )
+from .buffers import MediaIngressQueue
 from .pipeline import MediaPipeline
 from .protocol import MediaFrame
 
 MEDIA_FLAG_SPEECH = 0x1
 MEDIA_FLAG_END_OF_UTTERANCE = 0x2
 MEDIA_FLAG_EVENT_BOOST = 0x4
+TTS_CHUNK_BYTES = 8_192
+PCM16_BYTES_PER_SECOND = 32_000
+MEDIA_TURN_QUEUE_CAPACITY = 4
 
 
 class EmbeddingIdentityProvider(Protocol):
@@ -84,6 +88,13 @@ class PendingEnrollment:
     expires_at_ms: int
     awaiting_touch: bool = False
     recent_video_frames: list[MediaFrame] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class MediaTurnSnapshot:
+    audio_frames: list[MediaFrame]
+    video_frames: list[MediaFrame]
+    now_ms: int
 
 
 class EnrollmentManager:
@@ -385,10 +396,15 @@ class MediaService:
         self.hub = MediaHub()
         self.robot_hub = None
         self.dashboard_hub = None
-        self._frame_queue: asyncio.Queue[MediaFrame] = asyncio.Queue(
+        self._frame_queue = MediaIngressQueue(
             maxsize=max(1, settings.media_audio_queue_limit + settings.media_video_queue_limit)
         )
+        self._turn_queue: asyncio.Queue[MediaTurnSnapshot] = asyncio.Queue(
+            maxsize=MEDIA_TURN_QUEUE_CAPACITY
+        )
         self._worker: asyncio.Task | None = None
+        self._frame_worker_task: asyncio.Task | None = None
+        self._turn_worker_task: asyncio.Task | None = None
         self._audio_turn: list[MediaFrame] = []
         self._connections = 0
         self._current_boot_id: str | None = None
@@ -402,7 +418,8 @@ class MediaService:
 
     async def handle_websocket(self, websocket: WebSocket) -> None:
         await websocket.accept()
-        worker: asyncio.Task | None = None
+        frame_worker: asyncio.Task | None = None
+        turn_worker: asyncio.Task | None = None
         registered = False
         try:
             hello = await self._receive_hello(websocket)
@@ -417,11 +434,14 @@ class MediaService:
             self._current_boot_id = str(hello.get("boot_id") or "")
             self.pipeline.reset_stream()
             self._audio_turn.clear()
-            while not self._frame_queue.empty():
-                self._frame_queue.get_nowait()
+            self._frame_queue.clear()
+            self._clear_turn_queue()
             await self.hub.send_json({"kind": "media_ready", "boot_id": self._current_boot_id})
-            worker = asyncio.create_task(self._frame_worker())
-            self._worker = worker
+            frame_worker = asyncio.create_task(self._frame_worker(), name="media-frame-worker")
+            turn_worker = asyncio.create_task(self._turn_worker(), name="media-turn-worker")
+            self._worker = frame_worker
+            self._frame_worker_task = frame_worker
+            self._turn_worker_task = turn_worker
             while True:
                 message = await websocket.receive()
                 if message["type"] == "websocket.disconnect":
@@ -432,10 +452,7 @@ class MediaService:
                     except ValueError as exc:
                         await self._send_media_error("INVALID_MEDIA_FRAME", str(exc))
                         continue
-                    try:
-                        self._frame_queue.put_nowait(frame)
-                    except asyncio.QueueFull:
-                        await self._send_media_error("MEDIA_QUEUE_FULL", "媒体队列已满")
+                    self._frame_queue.put_nowait(frame)
                     continue
                 if "text" in message:
                     await self._handle_control_json(message["text"])
@@ -443,11 +460,22 @@ class MediaService:
             pass
         finally:
             if registered:
-                if worker is not None:
+                workers = [
+                    worker for worker in (frame_worker, turn_worker) if worker is not None
+                ]
+                for worker in workers:
                     worker.cancel()
-                    await asyncio.gather(worker, return_exceptions=True)
-                if self._worker is worker:
+                if workers:
+                    await asyncio.gather(*workers, return_exceptions=True)
+                if self._worker is frame_worker:
                     self._worker = None
+                if self._frame_worker_task is frame_worker:
+                    self._frame_worker_task = None
+                if self._turn_worker_task is turn_worker:
+                    self._turn_worker_task = None
+                self._frame_queue.clear()
+                self._clear_turn_queue()
+                self._audio_turn.clear()
                 await self._destroy_tracked_guest_runtime()
                 async with self._connection_lock:
                     self.hub.disconnect(websocket)
@@ -479,7 +507,7 @@ class MediaService:
             "connections": self._connections,
             "fps": stats["video_fps"],
             "queue": self._frame_queue.qsize(),
-            "dropped": stats["media_dropped"],
+            "dropped": self._frame_queue.dropped,
             "listening": stats["listening"],
             "speaking": stats["speaking"],
             "current_person": stats["current_person"],
@@ -568,23 +596,43 @@ class MediaService:
         while True:
             frame = await self._frame_queue.get()
             try:
-                await self._handle_frame(frame)
+                snapshot = await self._observe_frame(frame)
+                if snapshot is not None:
+                    try:
+                        self._turn_queue.put_nowait(snapshot)
+                    except asyncio.QueueFull:
+                        await self._send_media_error("MEDIA_TURN_QUEUE_FULL", "对话队列已满")
             except MediaBackendError as exc:
                 await self._send_media_error("MEDIA_BACKEND_ERROR", str(exc))
             except Exception as exc:
                 await self._send_media_error("MEDIA_WORKER_ERROR", f"{type(exc).__name__}: {exc}")
 
+    async def _turn_worker(self) -> None:
+        while True:
+            snapshot = await self._turn_queue.get()
+            try:
+                await self._process_turn(snapshot)
+            except MediaBackendError as exc:
+                await self._send_media_error("MEDIA_BACKEND_ERROR", str(exc))
+            except Exception as exc:
+                await self._send_media_error("MEDIA_TURN_WORKER_ERROR", f"{type(exc).__name__}: {exc}")
+
     async def _handle_frame(self, frame: MediaFrame) -> None:
+        snapshot = await self._observe_frame(frame)
+        if snapshot is not None:
+            await self._process_turn(snapshot)
+
+    async def _observe_frame(self, frame: MediaFrame) -> MediaTurnSnapshot | None:
         current_ms = self._clock()
         await self._sync_guest_runtime(current_ms)
         if frame.kind.name == "JPEG":
             await self._ensure_identity_cache()
             await self.orchestrator.observe_video([frame], now_ms=current_ms)
             await self._sync_guest_runtime(current_ms)
-            return
+            return None
         if frame.kind.name != "AUDIO_PCM16":
             await self._send_media_error("INVALID_MEDIA_KIND", f"不支持的媒体帧类型 {frame.kind.name}")
-            return
+            return None
         if self.vad is not None:
             frame = self.vad.annotate(frame)
         await self.orchestrator.observe_audio([frame], now_ms=current_ms)
@@ -593,15 +641,22 @@ class MediaService:
             self._audio_turn.append(frame)
             self._audio_turn = self._audio_turn[-self.settings.media_audio_queue_limit :]
         if not frame.is_end_of_utterance:
-            return
+            return None
         audio_turn = list(self._audio_turn)
         self._audio_turn.clear()
         if not audio_turn:
-            return
-        turn = await self.orchestrator.complete_turn(
+            return None
+        return MediaTurnSnapshot(
             audio_frames=audio_turn,
             video_frames=self.pipeline.video_window()[-5:],
             now_ms=current_ms,
+        )
+
+    async def _process_turn(self, snapshot: MediaTurnSnapshot) -> None:
+        turn = await self.orchestrator.complete_turn(
+            audio_frames=snapshot.audio_frames,
+            video_frames=snapshot.video_frames,
+            now_ms=snapshot.now_ms,
         )
         if turn is None:
             return
@@ -609,19 +664,26 @@ class MediaService:
         enrollment = await self.enrollment.observe_turn(
             turn,
             single_person=turn.single_person,
-            recent_video_frames=self.pipeline.video_window()[-5:],
-            now_ms=current_ms,
+            recent_video_frames=snapshot.video_frames,
+            now_ms=snapshot.now_ms,
         )
         if enrollment is not None:
             if enrollment["status"] == "pending":
-                await self._speak_control_text("请先口头说确认，再摸摸我的头。", current_ms)
+                await self._speak_control_text("请先口头说确认，再摸摸我的头。", snapshot.now_ms)
             await self.hub.send_json({"kind": "enrollment", **enrollment})
             if enrollment["status"] != "awaiting_touch":
                 return
         intent = await self.agent.create_intent(turn.event, media_blocks=turn.vision_blocks)
         if self.robot_hub is not None:
             await self.robot_hub.send_intent(intent)
-        await self._speak_intent_text(intent, current_ms)
+        await self._speak_intent_text(intent, snapshot.now_ms)
+
+    def _clear_turn_queue(self) -> None:
+        while True:
+            try:
+                self._turn_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
 
     async def _ensure_identity_cache(self) -> None:
         if self._identity_cache_loaded:
@@ -680,13 +742,20 @@ class MediaService:
             if audio is None:
                 return
             await self.hub.send_json({"kind": "tts_start", "text": text})
-            await self.hub.send_binary(
-                MediaFrame.tts_pcm16(
-                    audio.audio,
-                    timestamp_ms=current_ms,
-                    sequence=0,
-                ).encode()
-            )
+            chunks = [
+                audio.audio[offset : offset + TTS_CHUNK_BYTES]
+                for offset in range(0, len(audio.audio), TTS_CHUNK_BYTES)
+            ]
+            for sequence, chunk in enumerate(chunks):
+                if sequence:
+                    await asyncio.sleep(len(chunks[sequence - 1]) / PCM16_BYTES_PER_SECOND)
+                await self.hub.send_binary(
+                    MediaFrame.tts_pcm16(
+                        chunk,
+                        timestamp_ms=current_ms,
+                        sequence=sequence,
+                    ).encode()
+                )
             await self.hub.send_json({"kind": "tts_end"})
         except MediaBackendError as exc:
             await self._send_media_error("TTS_ERROR", str(exc))

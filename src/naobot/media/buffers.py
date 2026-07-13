@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections import deque
+import asyncio
+from collections import Counter, deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Generic, TypeVar
@@ -74,3 +75,76 @@ class MediaQueue(Generic[T]):
 
     def __len__(self) -> int:
         return len(self._items)
+
+
+class MediaIngressQueue:
+    def __init__(self, maxsize: int) -> None:
+        if maxsize <= 0:
+            raise ValueError("maxsize must be positive")
+        self.maxsize = maxsize
+        self._items: deque[MediaFrame] = deque()
+        self._available = asyncio.Event()
+        self._dropped_by_kind: Counter[str] = Counter()
+        self._dropped_by_reason: Counter[str] = Counter()
+
+    @property
+    def dropped(self) -> dict[str, object]:
+        return {
+            "total": sum(self._dropped_by_kind.values()),
+            "by_kind": dict(self._dropped_by_kind),
+            "by_reason": dict(self._dropped_by_reason),
+        }
+
+    def put_nowait(self, frame: MediaFrame) -> bool:
+        if len(self._items) >= self.maxsize:
+            dropped = self._drop_first(lambda item: item.kind.name == "JPEG")
+            reason = "evicted_oldest_jpeg"
+            if dropped is None:
+                dropped = self._drop_first(
+                    lambda item: item.kind.name == "AUDIO_PCM16"
+                    and not item.is_speech
+                    and not item.is_end_of_utterance
+                )
+                reason = "evicted_oldest_non_speech_audio"
+            if dropped is None:
+                self._record_drop(frame, "queue_full_protected")
+                return False
+            self._record_drop(dropped, reason)
+        self._items.append(frame)
+        self._available.set()
+        return True
+
+    async def get(self) -> MediaFrame:
+        while not self._items:
+            self._available.clear()
+            await self._available.wait()
+        return self.get_nowait()
+
+    def get_nowait(self) -> MediaFrame:
+        if not self._items:
+            raise asyncio.QueueEmpty
+        frame = self._items.popleft()
+        if not self._items:
+            self._available.clear()
+        return frame
+
+    def qsize(self) -> int:
+        return len(self._items)
+
+    def empty(self) -> bool:
+        return not self._items
+
+    def clear(self) -> None:
+        self._items.clear()
+        self._available.clear()
+
+    def _drop_first(self, predicate: Callable[[MediaFrame], bool]) -> MediaFrame | None:
+        for index, item in enumerate(self._items):
+            if predicate(item):
+                del self._items[index]
+                return item
+        return None
+
+    def _record_drop(self, frame: MediaFrame, reason: str) -> None:
+        self._dropped_by_kind[frame.kind.name] += 1
+        self._dropped_by_reason[reason] += 1
