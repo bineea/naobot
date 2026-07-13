@@ -28,6 +28,7 @@ class NaobotAgent:
         self.llm = self.brain  # 兼容现有注入和测试入口。
         self.logs: list[dict] = []
         self.last_intent: Envelope | None = None
+        self._host_heartbeat_seq = 0
 
     def log(self, kind: str, data: dict) -> None:
         self.logs.append({"ts_ms": now_ms(), "kind": kind, "data": data})
@@ -35,7 +36,8 @@ class NaobotAgent:
 
     def update_state_from_envelope(self, envelope: Envelope) -> None:
         payload = envelope.payload
-        self._mark_robot_seen(envelope)
+        received_ms = now_ms()
+        self._mark_robot_seen(received_ms)
         if envelope.type == MessageType.EVENT:
             self.state.last_event = payload.get("name")
             self.state.battery_pct = int(payload.get("battery_pct", self.state.battery_pct))
@@ -50,13 +52,16 @@ class NaobotAgent:
             self.state.posture = payload.get("posture", self.state.posture)
             self._update_control_state(payload)
             if envelope.type == MessageType.HEARTBEAT:
-                self.state.last_heartbeat_ms = envelope.ts_ms
+                self.state.last_heartbeat_ms = received_ms
                 self.state.heartbeat_seq = envelope.seq
+                self.state.remote_heartbeat_ts_ms = envelope.ts_ms
+                if "uptime_ms" in payload:
+                    self.state.remote_uptime_ms = int(payload["uptime_ms"])
             if payload.get("mode"):
                 self.state.mode = RobotMode(payload["mode"])
 
-    def _mark_robot_seen(self, envelope: Envelope) -> None:
-        self.state.last_robot_seen_ms = envelope.ts_ms
+    def _mark_robot_seen(self, received_ms: int) -> None:
+        self.state.last_robot_seen_ms = received_ms
         self.state.agent_connected = True
         self.state.link_state = "connected"
 
@@ -143,9 +148,11 @@ class NaobotAgent:
             self.state.link_state = "connected"
 
     def host_heartbeat(self) -> Envelope:
+        self._host_heartbeat_seq = (self._host_heartbeat_seq + 1) & 0xFFFFFFFF
         return Envelope(
             type=MessageType.HEARTBEAT,
             id=new_id("host_hb"),
+            seq=self._host_heartbeat_seq,
             priority=1,
             payload={
                 "source": "host",

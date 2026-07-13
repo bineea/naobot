@@ -104,6 +104,8 @@ class RobotState(BaseModel):
     last_heartbeat_ms: int | None = None
     heartbeat_age_ms: int | None = None
     heartbeat_seq: int = 0
+    remote_heartbeat_ts_ms: int | None = None
+    remote_uptime_ms: int | None = None
     camera_fps: int = Field(default=0, ge=0)
     audio_state: str = "unavailable"
     media_queue: int = Field(default=0, ge=0)

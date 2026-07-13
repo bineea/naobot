@@ -67,7 +67,9 @@ async def test_low_battery_event_does_not_emit_movement(tmp_path) -> None:
     assert "wave" not in names
 
 
-def test_heartbeat_updates_control_state(tmp_path) -> None:
+def test_heartbeat_updates_control_state_with_host_receive_time(tmp_path, monkeypatch) -> None:
+    host_receive_ms = 1_753_000_000_000
+    monkeypatch.setattr("naobot.agent.now_ms", lambda: host_receive_ms)
     agent = NaobotAgent(Settings(runtime_dir=tmp_path, robot_heartbeat_timeout_ms=7000), llm=RuleBasedLLMClient())
     heartbeat = Envelope(
         type=MessageType.HEARTBEAT,
@@ -75,6 +77,7 @@ def test_heartbeat_updates_control_state(tmp_path) -> None:
         ts_ms=1_000,
         payload={
             "source": "firmware",
+            "uptime_ms": 900,
             "battery_pct": 70,
             "posture": "upright",
             "control_authority": "reflex",
@@ -93,14 +96,16 @@ def test_heartbeat_updates_control_state(tmp_path) -> None:
 
     agent.update_state_from_envelope(heartbeat)
 
-    agent.refresh_link_state(current_ms=2_000)
+    agent.refresh_link_state(current_ms=host_receive_ms + 1_000)
 
     assert agent.state.link_state == "connected"
     assert agent.state.agent_connected is True
-    assert agent.state.last_robot_seen_ms == 1_000
-    assert agent.state.last_heartbeat_ms == 1_000
+    assert agent.state.last_robot_seen_ms == host_receive_ms
+    assert agent.state.last_heartbeat_ms == host_receive_ms
     assert agent.state.heartbeat_age_ms == 1_000
     assert agent.state.heartbeat_seq == 9
+    assert agent.state.remote_heartbeat_ts_ms == 1_000
+    assert agent.state.remote_uptime_ms == 900
     assert agent.state.control_authority == "reflex"
     assert agent.state.reflex_state == "fall_detected"
     assert agent.state.motion_state == "cancelled"
@@ -121,7 +126,24 @@ def test_heartbeat_updates_control_state(tmp_path) -> None:
     assert agent.status()["robot"]["local_loop_overrun_ms"] == 3
 
 
-def test_robot_link_becomes_stale_after_heartbeat_timeout(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "message_type",
+    [MessageType.EVENT, MessageType.STATUS, MessageType.ACK, MessageType.ERROR],
+)
+def test_robot_messages_refresh_last_seen_using_host_time(tmp_path, monkeypatch, message_type) -> None:
+    host_receive_ms = 1_753_000_000_000
+    monkeypatch.setattr("naobot.agent.now_ms", lambda: host_receive_ms)
+    agent = NaobotAgent(Settings(runtime_dir=tmp_path), llm=RuleBasedLLMClient())
+    envelope = Envelope(type=message_type, ts_ms=1_000, payload={})
+
+    agent.update_state_from_envelope(envelope)
+
+    assert agent.state.last_robot_seen_ms == host_receive_ms
+    assert agent.state.link_state == "connected"
+
+
+def test_robot_link_becomes_stale_after_heartbeat_timeout(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("naobot.agent.now_ms", lambda: 1_000)
     agent = NaobotAgent(Settings(runtime_dir=tmp_path, robot_heartbeat_timeout_ms=7000), llm=RuleBasedLLMClient())
     heartbeat = Envelope(type=MessageType.HEARTBEAT, ts_ms=1_000, payload={"source": "firmware"})
 
@@ -142,6 +164,17 @@ def test_host_heartbeat_payload_contains_brain_state(tmp_path) -> None:
     assert heartbeat.payload["source"] == "host"
     assert heartbeat.payload["last_intent_id"] == "int_test"
     assert heartbeat.payload["agent_mode"] == agent.state.mode
+
+
+def test_host_heartbeat_sequence_increments_per_agent_instance(tmp_path) -> None:
+    agent = NaobotAgent(Settings(runtime_dir=tmp_path), llm=RuleBasedLLMClient())
+
+    first = agent.host_heartbeat()
+    second = agent.host_heartbeat()
+    recreated_agent = NaobotAgent(Settings(runtime_dir=tmp_path), llm=RuleBasedLLMClient())
+
+    assert [first.seq, second.seq] == [1, 2]
+    assert recreated_agent.host_heartbeat().seq == 1
 
 
 def test_observe_robot_message_updates_state_without_running_brain(tmp_path) -> None:
