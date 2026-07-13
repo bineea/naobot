@@ -3,6 +3,7 @@ import sys
 import threading
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 from starlette.status import HTTP_403_FORBIDDEN
 
@@ -364,26 +365,63 @@ def test_people_management_apis_delegate_to_media_service(tmp_path) -> None:
     assert media_service.cancelled is True
 
 
-def test_people_management_requires_token_when_device_token_configured(tmp_path) -> None:
+@pytest.mark.parametrize(
+    ("method", "path", "payload", "headers"),
+    [
+        ("GET", "/api/status", None, {"Authorization": "Bearer secret-token"}),
+        (
+            "POST",
+            "/api/actions/test",
+            {"name": "blink", "args": {}},
+            {"X-Naobot-Token": "secret-token"},
+        ),
+        (
+            "PUT",
+            "/api/soul",
+            {"name": "鉴权测试"},
+            {"Authorization": "Bearer secret-token"},
+        ),
+        ("GET", "/api/memory", None, {"X-Naobot-Token": "secret-token"}),
+        (
+            "POST",
+            "/api/debug/event",
+            {
+                "type": "event",
+                "seq": 1,
+                "session_id": "api-auth",
+                "payload": {"name": "touch_head", "battery_pct": 80, "posture": "upright"},
+            },
+            {"Authorization": "Bearer secret-token"},
+        ),
+        ("GET", "/api/people", None, {"X-Naobot-Token": "secret-token"}),
+    ],
+    ids=["status", "action", "soul", "memory", "debug", "people"],
+)
+def test_management_api_requires_token_when_device_token_configured(
+    tmp_path,
+    method: str,
+    path: str,
+    payload: dict | None,
+    headers: dict[str, str],
+) -> None:
     settings = Settings(runtime_dir=tmp_path, device_token="secret-token")
     agent = NaobotAgent(settings, llm=RuleBasedLLMClient())
     media_service = FakeMediaService()
     client = TestClient(create_app(settings, agent, media_service=media_service))
 
-    assert client.get("/api/status").status_code == 200
-    assert client.get("/api/people").status_code == HTTP_403_FORBIDDEN
-    assert client.post("/api/people/person-1/runtime/reset").status_code == HTTP_403_FORBIDDEN
-    assert client.delete("/api/people/person-1").status_code == HTTP_403_FORBIDDEN
-    assert client.post("/api/people/enrollment/cancel").status_code == HTTP_403_FORBIDDEN
+    assert client.request(method, path, json=payload).status_code == HTTP_403_FORBIDDEN
+    assert client.request(method, path, json=payload, headers=headers).status_code == 200
 
-    headers = {"Authorization": "Bearer secret-token"}
-    assert client.get("/api/people", headers=headers).status_code == 200
-    assert client.post("/api/people/person-1/runtime/reset", headers=headers).status_code == 200
-    assert client.delete("/api/people/person-1", headers=headers).status_code == 200
-    assert client.post(
-        "/api/people/enrollment/cancel",
-        headers={"X-Naobot-Token": "secret-token"},
-    ).status_code == 200
+
+def test_management_api_without_device_token_only_allows_loopback(tmp_path) -> None:
+    settings = Settings(runtime_dir=tmp_path)
+    agent = NaobotAgent(settings, llm=RuleBasedLLMClient())
+    app = create_app(settings, agent, media_service=FakeMediaService())
+
+    assert TestClient(app).get("/api/status").status_code == 200
+    remote_client = TestClient(app, client=("192.0.2.1", 50000))
+    assert remote_client.get("/").status_code == 200
+    assert remote_client.get("/api/status").status_code == HTTP_403_FORBIDDEN
 
 
 def test_dashboard_token_field_exists_without_embedding_token_in_html(tmp_path) -> None:
@@ -396,6 +434,15 @@ def test_dashboard_token_field_exists_without_embedding_token_in_html(tmp_path) 
     assert 'type="password"' in html
     assert "secret-token" not in html
     assert "X-Naobot-Token" in html
+    assert html.count("fetch(") == 1
+    assert "fetch(url, { ...options, headers: authHeaders(options.headers) })" in html
+    save_token_handler = html.split("byId('saveTokenButton').addEventListener", 1)[1].split(
+        "byId('cancelEnrollmentButton').addEventListener", 1
+    )[0]
+    assert "sessionStorage.setItem" in save_token_handler
+    assert "await refreshStatus();" in save_token_handler
+    assert "localStorage" not in html
+    assert "console." not in html
 
 
 def test_create_app_default_media_service_assembles_configured_backends(tmp_path) -> None:

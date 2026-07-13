@@ -681,7 +681,7 @@
     }
 
     async function fetchJson(url, options = {}) {
-      const response = await fetch(url, options);
+      const response = await fetch(url, { ...options, headers: authHeaders(options.headers) });
       if (!response.ok) {
         let detail = '';
         try {
@@ -939,7 +939,7 @@
     async function loadPeople() {
       const list = byId('peopleList');
       try {
-        const people = await fetchJson('/api/people', { headers: authHeaders() });
+        const people = await fetchJson('/api/people');
         clearElement(list);
         people.forEach((person) => {
           const displayName = person.display_name || person.person_id || 'unknown';
@@ -949,7 +949,6 @@
             const url = personUrl(person.person_id, '/runtime/reset');
             await runButtonAction(button, 'Resetting...', 'Runtime 已重置', () => fetchJson(url, {
               method: 'POST',
-              headers: authHeaders(),
             }));
           }));
           actions.appendChild(createButton('Delete', 'button danger', async (event) => {
@@ -960,7 +959,6 @@
             const url = personUrl(person.person_id);
             await runButtonAction(button, 'Deleting...', '人物已删除', () => fetchJson(url, {
               method: 'DELETE',
-              headers: authHeaders(),
             }));
           }));
           list.appendChild(record);
@@ -1080,13 +1078,13 @@
     byId('saveTokenButton').addEventListener('click', async (event) => {
       await runButtonAction(event.currentTarget, '保存中...', '管理 Token 已保存到当前会话', async () => {
         sessionStorage.setItem(MANAGE_TOKEN_KEY, tokenInput.value);
-      });
+        await refreshStatus();
+      }, false);
     });
 
     byId('cancelEnrollmentButton').addEventListener('click', async (event) => {
       await runButtonAction(event.currentTarget, '取消中...', '人物注册已取消', () => fetchJson('/api/people/enrollment/cancel', {
         method: 'POST',
-        headers: authHeaders(),
       }));
     });
 
