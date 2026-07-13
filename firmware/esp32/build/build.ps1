@@ -1,0 +1,55 @@
+param(
+    [string]$Workspace = (Join-Path $PSScriptRoot "_work"),
+    [switch]$Clean
+)
+
+$ErrorActionPreference = "Stop"
+$MicroPythonTag = "v1.28.0"
+$MicroPythonCommit = "2b0015629f67fd186f980079b2e696ad0bc7343c"
+$Esp32CameraTag = "v2.1.6"
+$Esp32CameraCommit = "2ac69a6f1749694804f5196e63fa1f79800b74bf"
+$MicroPythonDir = Join-Path $Workspace "micropython"
+$CameraDir = Join-Path $MicroPythonDir "ports/esp32/components/esp32-camera"
+
+if ($Clean -and (Test-Path -LiteralPath $Workspace)) {
+    $resolvedRoot = [IO.Path]::GetFullPath($PSScriptRoot)
+    $resolvedWorkspace = [IO.Path]::GetFullPath($Workspace)
+    if (-not $resolvedWorkspace.StartsWith($resolvedRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Clean 仅允许删除 build 目录内的工作区。"
+    }
+    Remove-Item -LiteralPath $resolvedWorkspace -Recurse -Force
+}
+
+New-Item -ItemType Directory -Force -Path $Workspace | Out-Null
+if (-not (Test-Path -LiteralPath $MicroPythonDir)) {
+    git clone --filter=blob:none --no-checkout https://github.com/micropython/micropython.git $MicroPythonDir
+}
+git -C $MicroPythonDir fetch --depth 1 origin "refs/tags/$MicroPythonTag"
+git -C $MicroPythonDir checkout --detach $MicroPythonCommit
+
+if (-not (Test-Path -LiteralPath $CameraDir)) {
+    git clone --filter=blob:none --no-checkout https://github.com/espressif/esp32-camera.git $CameraDir
+}
+git -C $CameraDir fetch --depth 1 origin "refs/tags/$Esp32CameraTag"
+git -C $CameraDir checkout --detach $Esp32CameraCommit
+
+$actualMicroPython = git -C $MicroPythonDir rev-parse HEAD
+$actualCamera = git -C $CameraDir rev-parse HEAD
+if ($actualMicroPython -ne $MicroPythonCommit -or $actualCamera -ne $Esp32CameraCommit) {
+    throw "上游源码提交校验失败。"
+}
+
+$Manifest = (Resolve-Path (Join-Path $PSScriptRoot "manifest.py")).Path
+$UserModule = (Resolve-Path (Join-Path $PSScriptRoot "camera_module/micropython.cmake")).Path
+$BoardDir = (Resolve-Path (Join-Path $PSScriptRoot "N16R8_44PIN")).Path
+
+make -C (Join-Path $MicroPythonDir "ports/esp32") submodules
+make -C (Join-Path $MicroPythonDir "mpy-cross")
+make -C (Join-Path $MicroPythonDir "ports/esp32") `
+    BOARD_DIR=$BoardDir `
+    BOARD_VARIANT=SPIRAM_OCT `
+    FROZEN_MANIFEST=$Manifest `
+    USER_C_MODULES=$UserModule `
+    all
+
+Write-Host "构建流程完成；请自行检查 ports/esp32/build-ESP32_GENERIC_S3-SPIRAM_OCT/。"

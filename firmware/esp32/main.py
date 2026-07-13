@@ -14,6 +14,7 @@ from config import (
     AGENT_WS_URL,
     BRAIN_HEARTBEAT_TIMEOUT_MS,
     FIRMWARE_HEARTBEAT_INTERVAL_MS,
+    MEDIA_EVENT_BOOST_MS,
     SESSION_ID,
     WIFI_CONNECT_TIMEOUT_MS,
     WIFI_PASSWORD,
@@ -29,6 +30,7 @@ from hardware.servo import ServoBank
 from hardware.touch import TouchInputs
 from interaction.event_adapter import EventAdapter
 from interaction.local_fallback import LocalFallback
+from media.client import media_loop
 from motion.action_player import ActionPlayer
 from reflex.reflex_controller import ReflexController
 from safety.guard import SafetyGuard
@@ -44,6 +46,12 @@ def ticks_diff(end, start):
     if hasattr(time, "ticks_diff"):
         return time.ticks_diff(end, start)
     return end - start
+
+
+def ticks_add(start, delta):
+    if hasattr(time, "ticks_add"):
+        return time.ticks_add(start, delta)
+    return start + delta
 
 
 async def sleep_ms(ms):
@@ -73,13 +81,20 @@ class FirmwareProtocol:
         }
 
     def robot_payload(self, power, imu, reflex=None, motion=None, state=None):
+        state = state or {}
+        media_state = state.get("media", state)
         payload = {
             "source": "firmware",
             "uptime_ms": now_ms(),
             "battery_pct": power.battery_pct,
             "posture": imu.read_posture(),
-            "local_loop_ms": (state or {}).get("local_loop_ms", 0),
-            "agent_online": (state or {}).get("agent_online", False),
+            "local_loop_ms": state.get("local_loop_ms", 0),
+            "agent_online": state.get("agent_online", False),
+            "camera_fps": media_state.get("camera_fps", 0),
+            "audio_state": media_state.get("audio_state", "unavailable"),
+            "media_queue": media_state.get("media_queue", 0),
+            "media_dropped": media_state.get("media_dropped", 0),
+            "psram_free": media_state.get("psram_free", 0),
         }
         if reflex:
             motion_state = motion.motion_state if motion else "idle"
@@ -258,11 +273,19 @@ async def main():
     fallback = LocalFallback(display, actions)
     adapter = EventAdapter(touch, imu, power)
     protocol = FirmwareProtocol(SESSION_ID)
-    network_state = {"ws": None, "agent_online": False, "last_brain_seen_ms": None, "local_loop_ms": 0}
+    media_state = {}
+    network_state = {
+        "ws": None,
+        "agent_online": False,
+        "last_brain_seen_ms": None,
+        "local_loop_ms": 0,
+        "media": media_state,
+    }
 
     display.set_face("idle")
     print("naobot firmware booted; agent:", AGENT_WS_URL)
     asyncio.create_task(network_loop(display, power, imu, actions, safety, protocol, network_state, motion, reflex))
+    asyncio.create_task(media_loop(media_state))
 
     while True:
         loop_start = now_ms()
@@ -272,6 +295,7 @@ async def main():
         motion.tick()
         event = adapter.poll()
         if event:
+            media_state["event_boost_until_ms"] = ticks_add(now_ms(), MEDIA_EVENT_BOOST_MS)
             if not safety.can_emit_event(event):
                 actions.stop()
                 display.set_face("alert")
