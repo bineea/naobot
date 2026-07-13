@@ -391,6 +391,21 @@ def test_camera_skips_fb_get_until_driver_reports_frame_ready() -> None:
     assert module.capture_calls == 1
 
 
+def test_camera_recovers_after_one_transient_capture_error() -> None:
+    class FlakyCameraModule(FakeCameraModule):
+        def capture(self):
+            self.capture_calls += 1
+            if self.capture_calls == 1:
+                raise OSError("temporary camera fault")
+            return b"recovered-jpeg"
+
+    camera = Camera(camera_module=FlakyCameraModule())
+
+    assert camera.capture() is None
+    assert camera.available is True
+    assert camera.capture() == b"recovered-jpeg"
+
+
 def test_media_devices_degrade_safely_without_micropython_modules() -> None:
     camera = Camera(camera_module=None)
     audio_in = AudioInput(i2s_class=None, pin_factory=None)
@@ -441,6 +456,26 @@ def test_i2s_devices_use_pcm16_mono_16khz_and_fixed_pins() -> None:
     tx.trigger_ready()
     assert audio_out.write(b"pcm16") == 5
     assert tx.writes == [b"pcm16"]
+
+
+def test_audio_input_recovers_after_one_transient_read_error() -> None:
+    class FlakyI2S(FakeI2S):
+        def __init__(self, bus_id, **kwargs):
+            super().__init__(bus_id, **kwargs)
+            self.read_calls = 0
+
+        def readinto(self, buffer):
+            self.read_calls += 1
+            if self.read_calls == 1:
+                raise OSError("temporary i2s fault")
+            return super().readinto(buffer)
+
+    audio = AudioInput(i2s_class=FlakyI2S, pin_factory=pin_number)
+    audio.i2s.trigger_ready()
+    assert audio.read_chunk() is None
+    assert audio.available is True
+    audio.i2s.trigger_ready()
+    assert audio.read_chunk() == b"\x01\x02" * 320
 
 
 def test_video_scheduler_runs_at_normal_and_event_fps() -> None:

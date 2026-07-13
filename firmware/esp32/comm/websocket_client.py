@@ -20,6 +20,7 @@ from media import websocket as websocket_protocol
 
 OP_TEXT = websocket_protocol.OP_TEXT
 MediaWebSocket = websocket_protocol.MediaWebSocket
+MAX_CONTROL_FLUSH_CHUNKS = 4
 
 
 def parse_ws_url(url):
@@ -61,9 +62,14 @@ class WebSocketClient(MediaWebSocket):
     def send_json(self, payload):
         if not self.send_text(json.dumps(payload)):
             return False
-        while self.tx_pending:
+        for _ in range(MAX_CONTROL_FLUSH_CHUNKS):
+            if not self.tx_pending:
+                break
+            previous_offset = self._tx_offset
             if not self.flush_tx_chunk():
                 return False
+            if self._tx_offset == previous_offset:
+                break
         return self.connected
 
     def recv_json(self):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
@@ -113,6 +114,19 @@ class RuntimePersistence:
         self.db_path = Path(settings.runtime_dir) / "naobot.db"
         self._initialized = False
         self._init_lock = None
+        self._person_locks: dict[str, asyncio.Lock] = {}
+        self._deleted_people: set[str] = set()
+        self._person_generations: dict[str, int] = {}
+
+    def _person_lock_for(self, person_id: str) -> asyncio.Lock:
+        lock = self._person_locks.get(person_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._person_locks[person_id] = lock
+        return lock
+
+    def person_generation(self, person_id: str) -> int:
+        return self._person_generations.get(person_id, 0)
 
     def _fernet(self) -> Fernet:
         key = self.settings.data_key or os.getenv("NAOBOT_DATA_KEY")
@@ -276,8 +290,6 @@ class RuntimePersistence:
         if self._initialized:
             return
         if self._init_lock is None:
-            import asyncio
-
             self._init_lock = asyncio.Lock()
         async with self._init_lock:
             if self._initialized:
@@ -341,6 +353,17 @@ class RuntimePersistence:
         metadata: dict[str, Any] | None = None,
     ) -> None:
         await self.initialize()
+        async with self._person_lock_for(person_id):
+            await self._upsert_person(person_id, display_name=display_name, metadata=metadata)
+            self._deleted_people.discard(person_id)
+
+    async def _upsert_person(
+        self,
+        person_id: str,
+        *,
+        display_name: str | None,
+        metadata: dict[str, Any] | None,
+    ) -> None:
         now = _utc_now()
         async with aiosqlite.connect(self.db_path) as db:
             if metadata is None:
@@ -437,50 +460,66 @@ class RuntimePersistence:
             return None
         return AgentState.model_validate_json(row[0])
 
-    async def save_agent_runtime(self, person_id: str, agent_role: str, state: AgentState) -> int:
+    async def save_agent_runtime(
+        self,
+        person_id: str,
+        agent_role: str,
+        state: AgentState,
+        *,
+        expected_generation: int | None = None,
+    ) -> int:
         await self.initialize()
-        await self.upsert_person(person_id, metadata=None)
-        await self.upsert_session(
-            state.session_id,
-            person_id=person_id,
-            is_guest=False,
-            status="active",
-        )
-        scrubbed_payload = scrub_agent_state_for_storage(state)
-        state_json = json.dumps(scrubbed_payload, ensure_ascii=False)
-        now = _utc_now()
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                """
-                INSERT INTO agent_runtimes(robot_id, person_id, agent_role, state_json, version, updated_at)
-                VALUES (?, ?, ?, ?, 1, ?)
-                ON CONFLICT(robot_id, person_id, agent_role) DO UPDATE SET
-                    state_json = excluded.state_json,
-                    updated_at = excluded.updated_at,
-                    version = agent_runtimes.version + 1
-                """,
-                (self.settings.robot_id, person_id, agent_role, state_json, now),
+        async with self._person_lock_for(person_id):
+            if person_id in self._deleted_people or (
+                expected_generation is not None
+                and expected_generation != self.person_generation(person_id)
+            ):
+                return 0
+            await self._upsert_person(person_id, display_name=None, metadata=None)
+            await self.upsert_session(
+                state.session_id,
+                person_id=person_id,
+                is_guest=False,
+                status="active",
             )
-            async with db.execute(
-                """
-                SELECT version
-                FROM agent_runtimes
-                WHERE robot_id = ? AND person_id = ? AND agent_role = ?
-                """,
-                (self.settings.robot_id, person_id, agent_role),
-            ) as cursor:
-                row = await cursor.fetchone()
-            await db.commit()
-        return int(row[0]) if row else 1
+            scrubbed_payload = scrub_agent_state_for_storage(state)
+            state_json = json.dumps(scrubbed_payload, ensure_ascii=False)
+            now = _utc_now()
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    """
+                    INSERT INTO agent_runtimes(
+                        robot_id, person_id, agent_role, state_json, version, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, 1, ?)
+                    ON CONFLICT(robot_id, person_id, agent_role) DO UPDATE SET
+                        state_json = excluded.state_json,
+                        updated_at = excluded.updated_at,
+                        version = agent_runtimes.version + 1
+                    """,
+                    (self.settings.robot_id, person_id, agent_role, state_json, now),
+                )
+                async with db.execute(
+                    """
+                    SELECT version
+                    FROM agent_runtimes
+                    WHERE robot_id = ? AND person_id = ? AND agent_role = ?
+                    """,
+                    (self.settings.robot_id, person_id, agent_role),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                await db.commit()
+            return int(row[0]) if row else 1
 
     async def delete_person_runtime(self, person_id: str) -> None:
         await self.initialize()
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "DELETE FROM agent_runtimes WHERE robot_id = ? AND person_id = ?",
-                (self.settings.robot_id, person_id),
-            )
-            await db.commit()
+        async with self._person_lock_for(person_id):
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    "DELETE FROM agent_runtimes WHERE robot_id = ? AND person_id = ?",
+                    (self.settings.robot_id, person_id),
+                )
+                await db.commit()
 
     async def list_people(self) -> list[dict[str, Any]]:
         await self.initialize()
@@ -555,36 +594,66 @@ class RuntimePersistence:
 
     async def delete_person(self, person_id: str) -> None:
         await self.initialize()
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("PRAGMA foreign_keys=ON")
-            await db.execute("BEGIN")
-            try:
-                await db.execute(
-                    "DELETE FROM face_samples WHERE robot_id = ? AND person_id = ?",
-                    (self.settings.robot_id, person_id),
-                )
-                await db.execute(
-                    "DELETE FROM face_embeddings WHERE robot_id = ? AND person_id = ?",
-                    (self.settings.robot_id, person_id),
-                )
-                await db.execute(
-                    "DELETE FROM conversation_sessions WHERE robot_id = ? AND person_id = ?",
-                    (self.settings.robot_id, person_id),
-                )
-                await db.execute(
-                    "DELETE FROM agent_runtimes WHERE robot_id = ? AND person_id = ?",
-                    (self.settings.robot_id, person_id),
-                )
-                await db.execute(
-                    "DELETE FROM people WHERE robot_id = ? AND person_id = ?",
-                    (self.settings.robot_id, person_id),
-                )
-                await db.commit()
-            except Exception:
-                await db.rollback()
-                raise
+        async with self._person_lock_for(person_id):
+            was_deleted = person_id in self._deleted_people
+            self._deleted_people.add(person_id)
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("PRAGMA foreign_keys=ON")
+                await db.execute("BEGIN")
+                try:
+                    await db.execute(
+                        "DELETE FROM face_samples WHERE robot_id = ? AND person_id = ?",
+                        (self.settings.robot_id, person_id),
+                    )
+                    await db.execute(
+                        "DELETE FROM face_embeddings WHERE robot_id = ? AND person_id = ?",
+                        (self.settings.robot_id, person_id),
+                    )
+                    await db.execute(
+                        "DELETE FROM conversation_sessions WHERE robot_id = ? AND person_id = ?",
+                        (self.settings.robot_id, person_id),
+                    )
+                    await db.execute(
+                        "DELETE FROM agent_runtimes WHERE robot_id = ? AND person_id = ?",
+                        (self.settings.robot_id, person_id),
+                    )
+                    await db.execute(
+                        "DELETE FROM people WHERE robot_id = ? AND person_id = ?",
+                        (self.settings.robot_id, person_id),
+                    )
+                    await db.commit()
+                    self._person_generations[person_id] = (
+                        self.person_generation(person_id) + 1
+                    )
+                except Exception:
+                    await db.rollback()
+                    if not was_deleted:
+                        self._deleted_people.discard(person_id)
+                    raise
 
     async def enroll_person_atomic(
+        self,
+        *,
+        person_id: str,
+        embedding: list[float],
+        model_name: str,
+        samples: list[dict[str, Any]],
+        display_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        await self.initialize()
+        async with self._person_lock_for(person_id):
+            await self._enroll_person_atomic(
+                person_id=person_id,
+                embedding=embedding,
+                model_name=model_name,
+                samples=samples,
+                display_name=display_name,
+                metadata=metadata,
+            )
+            self._deleted_people.discard(person_id)
+
+    async def _enroll_person_atomic(
         self,
         *,
         person_id: str,

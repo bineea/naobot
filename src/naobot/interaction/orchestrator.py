@@ -124,6 +124,9 @@ class InteractionOrchestrator:
         audio_frames: Sequence[MediaFrame],
         video_frames: Sequence[MediaFrame],
         now_ms: int,
+        session_id: str | None = None,
+        person_id: str | None = None,
+        session_trigger: str | None = None,
     ) -> CompletedTurn | None:
         self.pipeline.update_connection(True)
         for frame in audio_frames:
@@ -131,23 +134,33 @@ class InteractionOrchestrator:
         for frame in video_frames:
             self.pipeline.push_video_frame(frame)
 
-        snapshot = self.session.snapshot(now_ms=now_ms)
-        if not snapshot.active or not snapshot.listening:
-            self._sync_stats(now_ms=now_ms)
-            return None
+        bound_to_ingress_session = session_id is not None
+        if not bound_to_ingress_session:
+            snapshot = self.session.snapshot(now_ms=now_ms)
+            if not snapshot.active or not snapshot.listening:
+                self._sync_stats(now_ms=now_ms)
+                return None
+            session_id = snapshot.session_id or "visitor-session"
+            person_id = snapshot.person_id
+            session_trigger = snapshot.session_trigger
 
         asr_result = await self.asr.transcribe(audio_frames)
         vision_result = await self.vision.summarize(video_frames)
         identity_result = await asyncio.to_thread(self.identity.identify, video_frames)
-        if self._switch_known_person(
-            current_person_id=snapshot.person_id,
-            detected_person_id=identity_result.person_id,
-            now_ms=now_ms,
-        ):
-            snapshot = self.session.snapshot(now_ms=now_ms)
-        self.session.mark_activity(now_ms=now_ms)
+        if not bound_to_ingress_session:
+            if self._switch_known_person(
+                current_person_id=person_id,
+                detected_person_id=identity_result.person_id,
+                now_ms=now_ms,
+            ):
+                snapshot = self.session.snapshot(now_ms=now_ms)
+                session_id = snapshot.session_id or "visitor-session"
+                person_id = snapshot.person_id
+                session_trigger = snapshot.session_trigger
+            self.session.mark_activity(now_ms=now_ms)
         self.pipeline.set_last_transcript(asr_result.transcript)
-        self._sync_stats(now_ms=now_ms)
+        if not bound_to_ingress_session:
+            self._sync_stats(now_ms=now_ms)
 
         media_refs = [
             f"media://jpeg/{index + 1}/{frame.sequence}-{frame.timestamp_ms}"
@@ -155,7 +168,6 @@ class InteractionOrchestrator:
         ]
         vision_blocks = build_vision_input_blocks([frame.payload for frame in video_frames[:3]])
 
-        session_id = snapshot.session_id or "visitor-session"
         return CompletedTurn(
             event=Envelope(
                 type=MessageType.EVENT,
@@ -163,10 +175,10 @@ class InteractionOrchestrator:
                 payload={
                     "name": "user_utterance",
                     "transcript": asr_result.transcript,
-                    "person_id": snapshot.person_id,
+                    "person_id": person_id,
                     "vision_summary": vision_result.summary,
                     "media_refs": media_refs,
-                    "session_trigger": snapshot.session_trigger,
+                    "session_trigger": session_trigger,
                 },
             ),
             vision_blocks=vision_blocks,

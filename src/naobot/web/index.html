@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" href="data:,">
   <title>naobot Dashboard</title>
   <style>
     :root {
@@ -1078,6 +1079,7 @@
     byId('saveTokenButton').addEventListener('click', async (event) => {
       await runButtonAction(event.currentTarget, '保存中...', '管理 Token 已保存到当前会话', async () => {
         sessionStorage.setItem(MANAGE_TOKEN_KEY, tokenInput.value);
+        connectDashboardSocket();
         await refreshStatus();
       }, false);
     });
@@ -1088,19 +1090,35 @@
       }));
     });
 
+    let dashboardSocket;
+
     function connectDashboardSocket() {
       const protocol = location.protocol === 'https:' ? 'wss://' : 'ws://';
+      const token = sessionStorage.getItem(MANAGE_TOKEN_KEY) || '';
+      const query = token ? `?token=${encodeURIComponent(token)}` : '';
+      if (dashboardSocket) {
+        dashboardSocket.close();
+      }
       let socket;
       try {
-        socket = new WebSocket(`${protocol}${location.host}/ws/dashboard`);
+        socket = new WebSocket(`${protocol}${location.host}/ws/dashboard${query}`);
+        dashboardSocket = socket;
       } catch (error) {
         setOperationStatus('error', `WebSocket 连接失败: ${errorMessage(error)}`);
         return;
       }
       socket.onopen = () => setOperationStatus('success', 'Dashboard 已连接');
       socket.onmessage = () => refreshAll();
-      socket.onerror = () => setOperationStatus('warning', 'Dashboard 实时通道异常，HTTP 状态仍可用');
-      socket.onclose = () => setOperationStatus('warning', 'Dashboard 实时通道已断开');
+      socket.onerror = () => {
+        if (dashboardSocket === socket) {
+          setOperationStatus('warning', 'Dashboard 实时通道异常，HTTP 状态仍可用');
+        }
+      };
+      socket.onclose = () => {
+        if (dashboardSocket === socket) {
+          setOperationStatus('warning', 'Dashboard 实时通道已断开');
+        }
+      };
     }
 
     const initialPage = location.hash.slice(1);

@@ -130,6 +130,7 @@ def test_dashboard_restores_full_workbench_navigation(tmp_path) -> None:
 
     assert 'id="stopButton"' in html
     assert "'/api/stop'" in html
+    assert '<link rel="icon" href="data:,">' in html
 
 
 def test_dashboard_contains_complete_home_and_diagnostics_observability(tmp_path) -> None:
@@ -304,6 +305,42 @@ def test_robot_websocket_requires_device_token_when_configured(tmp_path) -> None
         "/ws/kt2", headers={"X-Naobot-Token": "secret-token"}
     ) as websocket:
         assert websocket.receive_json()["type"] == "heartbeat"
+
+
+def test_second_robot_control_connection_is_rejected_without_replacing_first(tmp_path) -> None:
+    settings = Settings(
+        runtime_dir=tmp_path,
+        device_token="secret-token",
+        host_heartbeat_interval_ms=40,
+    )
+    agent = NaobotAgent(settings, llm=RuleBasedLLMClient())
+    client = TestClient(create_app(settings, agent, media_service=FakeMediaService()))
+    headers = {"X-Naobot-Token": "secret-token"}
+
+    with client.websocket_connect("/ws/kt2", headers=headers) as first:
+        assert first.receive_json()["type"] == "heartbeat"
+        with pytest.raises(WebSocketDisconnect) as duplicate:
+            with client.websocket_connect("/ws/kt2", headers=headers) as second:
+                second.receive_json()
+        assert duplicate.value.code == 1013
+        assert first.receive_json()["type"] == "heartbeat"
+
+
+def test_dashboard_websocket_requires_token_when_configured(tmp_path) -> None:
+    settings = Settings(runtime_dir=tmp_path, device_token="secret-token")
+    agent = NaobotAgent(settings, llm=RuleBasedLLMClient())
+    client = TestClient(
+        create_app(settings, agent, media_service=FakeMediaService()),
+        client=("192.0.2.1", 50000),
+    )
+
+    with pytest.raises(WebSocketDisconnect) as missing:
+        with client.websocket_connect("/ws/dashboard"):
+            pass
+    assert missing.value.code == 1008
+
+    with client.websocket_connect("/ws/dashboard?token=secret-token") as dashboard:
+        assert dashboard.receive_json()["kind"] == "status"
 
 
 def test_host_heartbeat_continues_while_brain_is_thinking(tmp_path) -> None:

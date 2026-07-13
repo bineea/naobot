@@ -167,6 +167,16 @@ class CountingAgent:
         )
 
 
+class RecordingAgent(CountingAgent):
+    def __init__(self) -> None:
+        super().__init__()
+        self.events = []
+
+    async def create_intent(self, event, media_blocks=None):
+        self.events.append(event)
+        return await super().create_intent(event, media_blocks=media_blocks)
+
+
 class BlockingAgent(CountingAgent):
     def __init__(self) -> None:
         super().__init__()
@@ -193,6 +203,33 @@ class BlockingAgent(CountingAgent):
             session_id=event.session_id,
             payload={"text": ""},
         )
+
+
+class SlowTouchRuntimeAgent:
+    def __init__(self, registry: RuntimeRegistry) -> None:
+        self.registry = registry
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.finished = asyncio.Event()
+        self.session_id = None
+
+    async def create_intent(self, event, media_blocks=None):
+        self.session_id = event.session_id
+        self.started.set()
+        try:
+            await self.release.wait()
+            await self.registry.load_state(event.session_id, "primary", is_guest=True)
+            return Envelope(
+                type=MessageType.INTENT,
+                session_id=event.session_id,
+                payload={"text": ""},
+            )
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        finally:
+            self.finished.set()
 
 
 class GuestRuntimeStreamingAgent:
@@ -467,6 +504,87 @@ def test_media_status_reports_ingress_queue_depth_and_drop_breakdown(tmp_path) -
 
 
 @pytest.mark.asyncio
+async def test_media_ingress_queue_full_sends_protocol_error(tmp_path) -> None:
+    settings = Settings(
+        runtime_dir=tmp_path,
+        media_video_queue_limit=1,
+        media_audio_queue_limit=1,
+    )
+    _client, _agent, service, _llm, _asr = make_media_client(tmp_path, settings=settings)
+    release_worker = asyncio.Event()
+
+    async def blocked_frame_worker() -> None:
+        await release_worker.wait()
+
+    service._frame_worker = blocked_frame_worker  # type: ignore[method-assign]
+    websocket = ControlledMediaWebSocket(valid_media_hello("queue-full"))
+    handler = asyncio.create_task(
+        service.handle_websocket(websocket)  # type: ignore[arg-type]
+    )
+    await asyncio.wait_for(websocket.outcome.wait(), timeout=0.5)
+
+    try:
+        for frame in (
+            MediaFrame.audio_pcm16(b"speech", timestamp_ms=1, sequence=1, flags=1),
+            MediaFrame.audio_pcm16(b"eou", timestamp_ms=2, sequence=2, flags=2),
+            MediaFrame.jpeg(b"rejected", timestamp_ms=3, sequence=3),
+        ):
+            websocket.incoming.put_nowait(
+                {"type": "websocket.receive", "bytes": frame.encode()}
+            )
+
+        async def ingress_rejected_frame() -> None:
+            while service.status()["dropped"]["total"] == 0:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(ingress_rejected_frame(), timeout=0.5)
+
+        assert {
+            "kind": "media_error",
+            "code": "MEDIA_QUEUE_FULL",
+            "message": "媒体入口队列已满",
+        } in websocket.sent_json
+    finally:
+        release_worker.set()
+        websocket.disconnect()
+        await asyncio.gather(handler, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_queued_turn_keeps_person_binding_when_session_switches_under_backpressure(
+    tmp_path,
+) -> None:
+    session = InteractionSession()
+    session.activate_from_touch(now_ms=1_000, person_id="person-a")
+    agent = RecordingAgent()
+    service = MediaService(
+        settings=Settings(runtime_dir=tmp_path, local_vad_enabled=False),
+        agent=agent,
+        session=session,
+        wake_word=QuietWakeWord(),
+        identity=PassiveIdentity(),
+        asr=FakeASR(),
+        vision=FakeVision(),
+        tts=FakeTTS(),
+        clock=StepClock(1_001),
+    )
+
+    queued_turn = await service._observe_frame(
+        MediaFrame.audio_pcm16(b"person-a", timestamp_ms=1, sequence=1, flags=3)
+    )
+    assert queued_turn is not None
+    service._turn_queue.put_nowait(queued_turn)
+
+    assert session.switch_person(now_ms=1_002, person_id="person-b") is True
+    await service._process_turn(service._turn_queue.get_nowait())
+
+    assert len(agent.events) == 1
+    assert agent.events[0].session_id == "person-a"
+    assert agent.events[0].payload["person_id"] == "person-a"
+    assert agent.events[0].payload["session_trigger"] == "touch"
+
+
+@pytest.mark.asyncio
 async def test_slow_agent_does_not_block_ingress_and_disconnect_cleans_workers(tmp_path) -> None:
     settings = Settings(
         runtime_dir=tmp_path,
@@ -562,6 +680,62 @@ async def test_slow_agent_does_not_block_ingress_and_disconnect_cleans_workers(t
             agent.release.set()
             websocket.disconnect()
             await asyncio.gather(handler, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancels_and_waits_for_slow_touch_intent(tmp_path) -> None:
+    class RecordingRobotHub:
+        def __init__(self) -> None:
+            self.intents = []
+
+        async def send_intent(self, intent) -> None:
+            self.intents.append(intent)
+
+    registry = RuntimeRegistry(Settings(runtime_dir=tmp_path))
+    agent = SlowTouchRuntimeAgent(registry)
+    robot_hub = RecordingRobotHub()
+    service = MediaService(
+        settings=Settings(runtime_dir=tmp_path),
+        agent=agent,
+        wake_word=QuietWakeWord(),
+        identity=PassiveIdentity(),
+        asr=FakeASR(),
+        vision=FakeVision(),
+        tts=FakeTTS(),
+        runtime_registry=registry,
+    )
+    service.attach(robot_hub=robot_hub)
+    websocket = ControlledMediaWebSocket(valid_media_hello("slow-touch"))
+    handler = asyncio.create_task(
+        service.handle_websocket(websocket)  # type: ignore[arg-type]
+    )
+    await asyncio.wait_for(websocket.outcome.wait(), timeout=0.5)
+
+    try:
+        websocket.incoming.put_nowait(
+            {
+                "type": "websocket.receive",
+                "text": json.dumps({"kind": "touch_head"}),
+            }
+        )
+        await asyncio.wait_for(agent.started.wait(), timeout=0.5)
+
+        websocket.disconnect()
+        await asyncio.wait_for(handler, timeout=0.5)
+
+        assert agent.cancelled.is_set()
+        agent.release.set()
+        await asyncio.sleep(0)
+        assert registry.loaded_count() == 0
+        assert robot_hub.intents == []
+    finally:
+        agent.release.set()
+        if not handler.done():
+            websocket.disconnect()
+            await asyncio.gather(handler, return_exceptions=True)
+        await asyncio.wait_for(agent.finished.wait(), timeout=0.5)
+        if agent.session_id is not None:
+            await registry.destroy_guest_runtime(agent.session_id)
 
 
 def test_media_turn_streams_tts_and_forwards_intent(tmp_path) -> None:

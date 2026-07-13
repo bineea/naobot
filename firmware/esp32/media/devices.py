@@ -3,6 +3,7 @@ from boards.n16r8_44pin import CAMERA_PINS, INMP441_PINS, MAX98357A_PINS
 PCM_SAMPLE_RATE_HZ = 16000
 PCM_CHUNK_BYTES = 640
 I2S_BUFFER_BYTES = 8000
+MAX_TRANSIENT_ERRORS = 3
 
 
 def _load_camera_module():
@@ -29,6 +30,7 @@ class Camera:
         self.available = False
         self.last_error = None
         self._closed = False
+        self._error_count = 0
         if self.module is None:
             return
         try:
@@ -73,10 +75,13 @@ class Camera:
             if hasattr(self.module, "available_frames") and not self.module.available_frames():
                 return None
             payload = self.module.capture()
+            self._error_count = 0
             return bytes(payload) if payload else None
         except Exception as exc:
             self.last_error = exc
-            self.available = False
+            self._error_count += 1
+            if self._error_count >= MAX_TRANSIENT_ERRORS:
+                self.available = False
             return None
 
     def psram_free(self):
@@ -110,6 +115,7 @@ class AudioInput:
         self._ready = False
         self.chunk_bytes = chunk_bytes
         self.last_error = None
+        self._error_count = 0
         if i2s_class is None or pin_factory is None:
             return
         try:
@@ -141,10 +147,13 @@ class AudioInput:
             count = self.i2s.readinto(buffer)
             if not count:
                 return None
+            self._error_count = 0
             return bytes(buffer[:count])
         except Exception as exc:
             self.last_error = exc
-            self.available = False
+            self._error_count += 1
+            if self._error_count >= MAX_TRANSIENT_ERRORS:
+                self.available = False
             return None
 
     def _mark_ready(self, _i2s):
@@ -178,6 +187,7 @@ class AudioOutput:
         self.available = False
         self._ready = False
         self.last_error = None
+        self._error_count = 0
         if i2s_class is None or pin_factory is None:
             return
         try:
@@ -205,10 +215,15 @@ class AudioOutput:
             return 0
         self._ready = False
         try:
-            return self.i2s.write(payload) or 0
+            count = self.i2s.write(payload) or 0
+            if count:
+                self._error_count = 0
+            return count
         except Exception as exc:
             self.last_error = exc
-            self.available = False
+            self._error_count += 1
+            if self._error_count >= MAX_TRANSIENT_ERRORS:
+                self.available = False
             return 0
 
     def _mark_ready(self, _i2s):

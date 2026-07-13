@@ -58,9 +58,13 @@ ESP32 和宿主机需要在同一局域网。先在宿主机运行 `naobot serve
 
 固件默认每 2 秒发送一次 `heartbeat`。如果 7 秒内没有收到 Host 的任意消息或 Host heartbeat，固件会标记 `agent offline`，取消当前 Host skill，并继续保留本地 fallback 和反射安全。
 
+控制 socket 一旦断开会立即取消当前动作和待执行队列；7 秒超时用于连接仍存在但 Host 无消息的 stale 场景。控制发送采用有界分块 flush，临时 EAGAIN 不会在 50 ms 安全循环中无限自旋。TCP/WebSocket connect 保留配置的 2 秒超时，建立连接后的单次 I/O 仍限制为 10 ms。
+
 媒体 socket 连接后首先发送 `media_hello`，其中包含 `device_id`、`token`、`boot_id` 和 QVGA/PCM16 capability。二进制帧头固定为 `>4sBBHIQI`，字段顺序为 `magic, version, kind, flags, sequence, timestamp_ms, payload_length`；kind 1/2/3 分别表示 PCM16 上行、JPEG 上行和 TTS PCM16 下行。视频常态 10 FPS，本地事件后的短窗口为 15 FPS；队列拥塞时先淘汰旧视频，再淘汰非语音音频，不让媒体异常进入控制 socket。
 
 heartbeat 额外报告 `camera_fps`、`audio_state`、`media_queue`、`media_dropped` 和 `psram_free`。
+
+Camera/I2S 单次瞬态异常会记录但允许后续采集恢复；连续 3 次驱动异常后才标记 unavailable，并保持控制和反射路径运行。
 
 50 ms 安全循环按 deadline 补偿睡眠，并额外记录实际调度间隔和 overrun。控制 client 只把 DNS/TCP/WebSocket 握手交给 `ConnectionWorker`；媒体链路则由独立 `MediaRuntimeWorker` 线程从头到尾独占 Camera、I2S 和媒体 WebSocket，主循环只发送事件加速截止时间并读取标量快照。`_thread` 不可用时媒体直接标记为 disabled，不会退化到安全循环中同步执行。媒体连接失败也不能改变反射控制权。当前实现仍不提供 FreeRTOS 高优先级隔离保证；真实硬件驱动、GC、线程调度或底层网络栈仍可能引入抖动，必须通过板上 stall probe 验证。
 

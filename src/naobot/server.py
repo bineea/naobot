@@ -87,17 +87,26 @@ class RobotHub:
     def __init__(self) -> None:
         self.websocket: WebSocket | None = None
         self._send_lock = asyncio.Lock()
+        self._connection_lock = asyncio.Lock()
 
-    def connect(self, websocket: WebSocket) -> None:
-        self.websocket = websocket
+    async def connect(self, websocket: WebSocket) -> bool:
+        async with self._connection_lock:
+            if self.websocket is not None:
+                return False
+            self.websocket = websocket
+            return True
 
-    def disconnect(self, websocket: WebSocket) -> None:
+    def disconnect(self, websocket: WebSocket) -> bool:
         if self.websocket is websocket:
             self.websocket = None
+            return True
+        return False
 
-    async def send_envelope(self, envelope: Envelope) -> bool:
+    async def send_envelope(
+        self, envelope: Envelope, owner: WebSocket | None = None
+    ) -> bool:
         async with self._send_lock:
-            if self.websocket is None:
+            if self.websocket is None or (owner is not None and self.websocket is not owner):
                 return False
             try:
                 await self.websocket.send_json(envelope.model_dump())
@@ -283,6 +292,15 @@ def create_app(
 
     @app.websocket("/ws/dashboard")
     async def ws_dashboard(websocket: WebSocket) -> None:
+        client_host = websocket.client.host if websocket.client else ""
+        if settings.device_token:
+            supplied_token = websocket.query_params.get("token", "")
+            if not secrets.compare_digest(supplied_token, settings.device_token):
+                await websocket.close(code=1008, reason="invalid dashboard token")
+                return
+        elif client_host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
+            await websocket.close(code=1008, reason="dashboard websocket is loopback only")
+            return
         await hub.connect(websocket)
         try:
             await websocket.send_json({"kind": "status", "payload": agent.status()})
@@ -299,7 +317,9 @@ def create_app(
                 await websocket.close(code=1008, reason="invalid device token")
                 return
         await websocket.accept()
-        robot_hub.connect(websocket)
+        if not await robot_hub.connect(websocket):
+            await websocket.close(code=1013, reason="robot control connection already active")
+            return
         agent.state.agent_connected = True
         agent.state.link_state = "connected"
         agent.state.last_robot_seen_ms = now_ms()
@@ -311,14 +331,14 @@ def create_app(
             while True:
                 event = await event_queue.get()
                 response = await agent.create_intent(event)
-                if not await robot_hub.send_envelope(response):
+                if not await robot_hub.send_envelope(response, owner=websocket):
                     return
                 await hub.broadcast({"kind": "agent_tx", "payload": response.model_dump()})
 
         async def heartbeat_worker() -> None:
             while True:
                 heartbeat = agent.host_heartbeat()
-                if not await robot_hub.send_envelope(heartbeat):
+                if not await robot_hub.send_envelope(heartbeat, owner=websocket):
                     return
                 agent.refresh_link_state()
                 await hub.broadcast({"kind": "heartbeat_tick", "payload": agent.status()})
@@ -336,7 +356,7 @@ def create_app(
                         priority=8,
                         payload={"code": "INVALID_PROTOCOL", "message": str(exc).splitlines()[0]},
                     )
-                    await robot_hub.send_envelope(error)
+                    await robot_hub.send_envelope(error, owner=websocket)
                     continue
                 agent.observe_robot_message(envelope)
                 await hub.broadcast({"kind": "robot_rx", "payload": envelope.model_dump()})
@@ -354,7 +374,8 @@ def create_app(
                                     "message": "Host 大脑事件被更高优先级事件替换",
                                     "event_id": result.evicted.id,
                                 },
-                            )
+                            ),
+                            owner=websocket,
                         )
                     if not result.accepted:
                         error = Envelope(
@@ -367,19 +388,19 @@ def create_app(
                                 "event_id": envelope.id,
                             },
                         )
-                        await robot_hub.send_envelope(error)
+                        await robot_hub.send_envelope(error, owner=websocket)
         except WebSocketDisconnect:
             pass
         finally:
             for worker in workers:
                 worker.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
-            robot_hub.disconnect(websocket)
-            agent.state.agent_connected = False
-            agent.state.link_state = "disconnected"
-            agent.state.last_robot_seen_ms = None
-            agent.log("robot_disconnected", {})
-            await hub.broadcast({"kind": "robot_disconnected", "payload": agent.status()})
+            if robot_hub.disconnect(websocket):
+                agent.state.agent_connected = False
+                agent.state.link_state = "disconnected"
+                agent.state.last_robot_seen_ms = None
+                agent.log("robot_disconnected", {})
+                await hub.broadcast({"kind": "robot_disconnected", "payload": agent.status()})
 
     @app.websocket("/ws/media")
     async def ws_media(websocket: WebSocket) -> None:

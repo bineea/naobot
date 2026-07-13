@@ -95,6 +95,9 @@ class MediaTurnSnapshot:
     audio_frames: list[MediaFrame]
     video_frames: list[MediaFrame]
     now_ms: int
+    session_id: str
+    person_id: str | None
+    trigger: str | None
 
 
 class EnrollmentManager:
@@ -420,6 +423,7 @@ class MediaService:
         await websocket.accept()
         frame_worker: asyncio.Task | None = None
         turn_worker: asyncio.Task | None = None
+        connection_tasks: set[asyncio.Task] = set()
         registered = False
         try:
             hello = await self._receive_hello(websocket)
@@ -452,21 +456,34 @@ class MediaService:
                     except ValueError as exc:
                         await self._send_media_error("INVALID_MEDIA_FRAME", str(exc))
                         continue
-                    self._frame_queue.put_nowait(frame)
+                    if not self._frame_queue.put_nowait(frame):
+                        await self._send_media_error(
+                            "MEDIA_QUEUE_FULL",
+                            "媒体入口队列已满",
+                        )
                     continue
                 if "text" in message:
-                    await self._handle_control_json(message["text"])
+                    await self._handle_control_json(
+                        message["text"],
+                        connection_tasks=connection_tasks,
+                        owner_websocket=websocket,
+                    )
         except WebSocketDisconnect:
             pass
         finally:
             if registered:
+                async with self._connection_lock:
+                    self.hub.disconnect(websocket)
+                    self._connections = max(0, self._connections - 1)
+                    self.pipeline.update_connection(self._connections > 0)
                 workers = [
                     worker for worker in (frame_worker, turn_worker) if worker is not None
                 ]
-                for worker in workers:
-                    worker.cancel()
-                if workers:
-                    await asyncio.gather(*workers, return_exceptions=True)
+                pending_tasks = [*workers, *connection_tasks]
+                for task in pending_tasks:
+                    task.cancel()
+                if pending_tasks:
+                    await asyncio.gather(*pending_tasks, return_exceptions=True)
                 if self._worker is frame_worker:
                     self._worker = None
                 if self._frame_worker_task is frame_worker:
@@ -477,10 +494,6 @@ class MediaService:
                 self._clear_turn_queue()
                 self._audio_turn.clear()
                 await self._destroy_tracked_guest_runtime()
-                async with self._connection_lock:
-                    self.hub.disconnect(websocket)
-                    self._connections = max(0, self._connections - 1)
-                    self.pipeline.update_connection(self._connections > 0)
 
     async def list_people(self) -> list[dict[str, Any]]:
         return await self.persistence.list_people()
@@ -559,7 +572,13 @@ class MediaService:
             raise WebSocketDisconnect(code=1008)
         return payload
 
-    async def _handle_control_json(self, raw: str) -> None:
+    async def _handle_control_json(
+        self,
+        raw: str,
+        *,
+        connection_tasks: set[asyncio.Task] | None = None,
+        owner_websocket: WebSocket | None = None,
+    ) -> None:
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError:
@@ -572,6 +591,7 @@ class MediaService:
         current_ms = self._clock()
         if kind == "touch_head":
             self.orchestrator.observe_touch(now_ms=current_ms, person_id=payload.get("person_id"))
+            await self._sync_guest_runtime(current_ms)
             session_id = self.session.snapshot(now_ms=current_ms).session_id or "visitor-touch"
             action = await self.enrollment.observe_touch(
                 session_id=session_id,
@@ -581,7 +601,16 @@ class MediaService:
             if action is not None and action.get("status") == "completed":
                 await self.hub.send_json({"kind": "enrollment", **action})
                 return
-            asyncio.create_task(self._emit_touch_intent(session_id=session_id))
+            task = asyncio.create_task(
+                self._emit_touch_intent(
+                    session_id=session_id,
+                    owner_websocket=owner_websocket,
+                ),
+                name="media-touch-intent",
+            )
+            if connection_tasks is not None:
+                connection_tasks.add(task)
+                task.add_done_callback(connection_tasks.discard)
             return
         if kind == "enrollment_cancel":
             await self.cancel_enrollment()
@@ -646,10 +675,20 @@ class MediaService:
         self._audio_turn.clear()
         if not audio_turn:
             return None
+        session_snapshot = self.session.snapshot(now_ms=current_ms)
+        if (
+            not session_snapshot.active
+            or not session_snapshot.listening
+            or session_snapshot.session_id is None
+        ):
+            return None
         return MediaTurnSnapshot(
             audio_frames=audio_turn,
-            video_frames=self.pipeline.video_window()[-5:],
+            video_frames=list(self.pipeline.video_window()[-5:]),
             now_ms=current_ms,
+            session_id=session_snapshot.session_id,
+            person_id=session_snapshot.person_id,
+            trigger=session_snapshot.session_trigger,
         )
 
     async def _process_turn(self, snapshot: MediaTurnSnapshot) -> None:
@@ -657,6 +696,9 @@ class MediaService:
             audio_frames=snapshot.audio_frames,
             video_frames=snapshot.video_frames,
             now_ms=snapshot.now_ms,
+            session_id=snapshot.session_id,
+            person_id=snapshot.person_id,
+            session_trigger=snapshot.trigger,
         )
         if turn is None:
             return
@@ -724,13 +766,20 @@ class MediaService:
         if session_id is not None and session_id.lower().startswith(("visitor", "guest")):
             await self.runtime_registry.destroy_guest_runtime(session_id)
 
-    async def _emit_touch_intent(self, *, session_id: str) -> None:
+    async def _emit_touch_intent(
+        self,
+        *,
+        session_id: str,
+        owner_websocket: WebSocket | None = None,
+    ) -> None:
         event = Envelope(
             type=MessageType.EVENT,
             session_id=session_id,
             payload={"name": "touch_head"},
         )
         intent = await self.agent.create_intent(event)
+        if owner_websocket is not None and self.hub.websocket is not owner_websocket:
+            return
         if self.robot_hub is not None:
             await self.robot_hub.send_intent(intent)
 

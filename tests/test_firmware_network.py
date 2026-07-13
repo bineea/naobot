@@ -194,6 +194,35 @@ def test_websocket_text_frame_is_masked() -> None:
     assert decode_masked_payload(frame) == b"hello"
 
 
+def test_control_send_json_has_bounded_flush_work_under_backpressure(monkeypatch) -> None:
+    websocket = WebSocketClient("ws://host/ws")
+    websocket.connected = True
+    websocket.sock = PartialSocket(())
+    websocket._prepare_tx(b"pending", OP_TEXT)
+    websocket._tx_offset = 0
+    calls = []
+
+    monkeypatch.setattr(websocket, "send_text", lambda _payload: True)
+
+    def stalled_flush():
+        calls.append(1)
+        if len(calls) > 8:
+            raise AssertionError("control send flush spun without a bound")
+        return True
+
+    monkeypatch.setattr(websocket, "flush_tx_chunk", stalled_flush)
+
+    assert websocket.send_json({"type": "heartbeat"}) is True
+    assert len(calls) <= 4
+
+
+def test_control_websocket_preserves_configured_connect_timeout() -> None:
+    websocket = WebSocketClient("ws://host/ws")
+
+    assert websocket.connect_timeout_sec == websocket_client.WS_CONNECT_TIMEOUT_SEC
+    assert websocket.io_timeout_sec <= 0.01
+
+
 def test_control_websocket_preserves_partial_frames_and_reassembles_continuations() -> None:
     raw = (
         server_frame(OP_TEXT, b'{"type":', fin=False)
@@ -641,3 +670,15 @@ def test_brain_timeout_cancels_motion_and_marks_offline(monkeypatch) -> None:
     assert display.statuses == ["agent offline"]
     assert motion.cancelled is True
     assert motion.cancel_reason == "brain_timeout"
+
+
+def test_control_disconnect_immediately_cancels_host_motion() -> None:
+    state = {"agent_online": True, "last_brain_seen_ms": 123}
+    display = FakeDisplay()
+    motion = FakeMotion()
+
+    firmware_main.mark_agent_offline(state, display, motion, "control_disconnected")
+
+    assert state["agent_online"] is False
+    assert motion.cancel_reason == "control_disconnected"
+    assert display.statuses == ["agent offline"]

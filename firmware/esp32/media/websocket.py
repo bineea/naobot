@@ -108,8 +108,8 @@ class MediaWebSocket:
         headers=None,
     ):
         self.url = url
-        self.io_timeout_sec = min(io_timeout_sec, 0.01)
-        self.connect_timeout_sec = min(connect_timeout_sec, 0.01)
+        self.io_timeout_sec = min(max(0.001, io_timeout_sec), 0.01)
+        self.connect_timeout_sec = max(0.01, connect_timeout_sec)
         self.send_chunk_bytes = max(1, min(send_chunk_bytes, 1024))
         self.max_rx_bytes = max(128, max_rx_bytes)
         self.max_message_bytes = max(1, max_message_bytes)

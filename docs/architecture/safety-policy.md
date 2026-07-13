@@ -34,12 +34,15 @@ L3 只输出 `goal/text/expression/skills/memory_suggestion`；L2 `BehaviorRunti
 - `GET /api/people`、`POST /api/people/{person_id}/runtime/reset`、`DELETE /api/people/{person_id}` 和 `POST /api/people/enrollment/cancel` 都执行鉴权。
 - 配置 `NAOBOT_DEVICE_TOKEN` 时，客户端必须提供 `Authorization: Bearer <token>` 或 `X-Naobot-Token`；比较使用恒定时间函数。
 - 未配置 token 时只允许 loopback；非本机请求返回 403。People 页面或 API 不得成为绕过身份确认和删除审计的入口。
+- Dashboard WebSocket 遵循相同边界：配置 token 时必须鉴权，未配置时仅允许 loopback。控制 `/ws/kt2` 同时只允许一个 owner 连接，旧连接不得向新设备注入事件。
+- runtime reset/delete 必须等待该人物在途 role，并使操作前取得的 session generation 失效；删除后旧 session save 不得重新创建人物、会话或 agent runtime。
 
 ## 传输与音频限制
 
 - 固件当前只支持明文 `ws://`，不支持 `wss://`。同一局域网中的监听、伪造、中间人和 token 泄露风险仍存在；部署时应使用受信任隔离网络、限制 Host 监听地址并保护 device token。
 - 已实现音频半双工，不是全双工音频：TTS 期间只暂停麦克风上行，摄像头继续按 10/15 FPS 上传；固件排空后恢复麦克风，Host 再等待 200 ms。AEC 与 barge-in 未实现，不得在文档或产品承诺中宣称完成。
 - 媒体坏帧、队列溢出、TTS/provider 异常、媒体断线或分片错误只影响媒体状态；不能发送运动 intent、改变 `control_authority` 或覆盖反射。
+- 媒体 turn 在入队时冻结人物与会话归属；断线必须取消并等待 touch/turn 推理任务，清理完成后不得继续下发 intent 或重建 guest runtime。
 
 ## 固件最终安全线
 

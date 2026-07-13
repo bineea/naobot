@@ -21,10 +21,46 @@ class FailingSavePersistence(RuntimePersistence):
         super().__init__(settings)
         self.fail_save = False
 
-    async def save_agent_runtime(self, person_id: str, agent_role: str, state: AgentState) -> int:
+    async def save_agent_runtime(
+        self,
+        person_id: str,
+        agent_role: str,
+        state: AgentState,
+        *,
+        expected_generation: int | None = None,
+    ) -> int:
         if self.fail_save:
             raise RuntimeError("save exploded")
-        return await super().save_agent_runtime(person_id, agent_role, state)
+        return await super().save_agent_runtime(
+            person_id,
+            agent_role,
+            state,
+            expected_generation=expected_generation,
+        )
+
+
+class BlockingSavePersistence(RuntimePersistence):
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(settings)
+        self.save_reached_session = asyncio.Event()
+        self.release_save = asyncio.Event()
+
+    async def upsert_session(
+        self,
+        session_id: str,
+        *,
+        person_id: str,
+        is_guest: bool,
+        status: str = "active",
+    ) -> None:
+        self.save_reached_session.set()
+        await self.release_save.wait()
+        await super().upsert_session(
+            session_id,
+            person_id=person_id,
+            is_guest=is_guest,
+            status=status,
+        )
 
 
 def create_v1_runtime_database(db_path, *, robot_id: str) -> None:
@@ -329,6 +365,176 @@ async def test_runtime_registry_can_reset_person_runtime(tmp_path) -> None:
     state = await registry.load_state("person-reset", "primary")
 
     assert state.session_id != "session-reset"
+
+
+@pytest.mark.asyncio
+async def test_reset_waits_for_in_flight_role_runtime(tmp_path) -> None:
+    registry = RuntimeRegistry(Settings(runtime_dir=tmp_path, robot_id="robot-test"))
+    role_entered = asyncio.Event()
+    release_role = asyncio.Event()
+
+    async def hold_role_runtime() -> None:
+        async with registry.person_runtime("person-reset-race", "primary"):
+            role_entered.set()
+            await release_role.wait()
+
+    role_task = asyncio.create_task(hold_role_runtime())
+    await asyncio.wait_for(role_entered.wait(), timeout=0.5)
+    reset_task = asyncio.create_task(registry.reset_person_runtime("person-reset-race"))
+
+    await asyncio.sleep(0.05)
+    reset_finished_while_role_active = reset_task.done()
+    release_role.set()
+    await asyncio.gather(role_task, reset_task)
+
+    assert reset_finished_while_role_active is False
+
+
+@pytest.mark.asyncio
+async def test_reset_waiting_for_one_person_does_not_block_another_person(tmp_path) -> None:
+    registry = RuntimeRegistry(Settings(runtime_dir=tmp_path, robot_id="robot-test"))
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def hold_first_person() -> None:
+        async with registry.person_runtime("person-reset-blocked", "primary"):
+            first_entered.set()
+            await release_first.wait()
+
+    first_task = asyncio.create_task(hold_first_person())
+    await asyncio.wait_for(first_entered.wait(), timeout=0.5)
+    reset_task = asyncio.create_task(
+        registry.reset_person_runtime("person-reset-blocked")
+    )
+    await asyncio.sleep(0.05)
+
+    async def enter_other_person() -> None:
+        async with registry.person_runtime("person-independent", "primary"):
+            pass
+
+    await asyncio.wait_for(enter_other_person(), timeout=0.5)
+    release_first.set()
+    await asyncio.gather(first_task, reset_task)
+
+
+@pytest.mark.asyncio
+async def test_stale_runtime_session_cannot_restore_state_after_reset(tmp_path) -> None:
+    registry = RuntimeRegistry(Settings(runtime_dir=tmp_path, robot_id="robot-test"))
+
+    async with registry.person_runtime("person-stale-reset", "primary") as old_session:
+        pass
+
+    await registry.reset_person_runtime("person-stale-reset")
+    version = await old_session.save(
+        AgentState(session_id="stale-session", summary="stale state")
+    )
+    loaded = await registry.load_state("person-stale-reset", "primary")
+
+    assert version == 0
+    assert loaded.session_id != "stale-session"
+    assert loaded.summary == ""
+
+
+@pytest.mark.asyncio
+async def test_delete_waits_for_in_flight_save_and_prevents_session_resurrection(tmp_path) -> None:
+    settings = Settings(runtime_dir=tmp_path, robot_id="robot-test")
+    persistence = BlockingSavePersistence(settings)
+    registry = RuntimeRegistry(settings, persistence=persistence)
+    await persistence.upsert_person("person-delete-race", display_name="待删除")
+
+    async with registry.person_runtime("person-delete-race", "primary") as session:
+        pass
+
+    save_task = asyncio.create_task(
+        session.save(AgentState(session_id="delete-race-session", summary="stale state"))
+    )
+    await asyncio.wait_for(persistence.save_reached_session.wait(), timeout=0.5)
+    delete_task = asyncio.create_task(persistence.delete_person("person-delete-race"))
+
+    await asyncio.sleep(0.05)
+    delete_finished_while_save_active = delete_task.done()
+    persistence.release_save.set()
+    await asyncio.gather(save_task, delete_task)
+
+    stale_version = await session.save(
+        AgentState(session_id="resurrected-session", summary="resurrected state")
+    )
+
+    assert delete_finished_while_save_active is False
+    assert stale_version == 0
+    assert await persistence.get_person("person-delete-race") is None
+    assert await persistence.load_agent_runtime("person-delete-race", "primary") is None
+
+
+@pytest.mark.asyncio
+async def test_session_from_before_delete_stays_stale_after_person_is_recreated(tmp_path) -> None:
+    settings = Settings(runtime_dir=tmp_path, robot_id="robot-test")
+    persistence = RuntimePersistence(settings)
+    registry = RuntimeRegistry(settings, persistence=persistence)
+    await persistence.upsert_person("person-delete-generation", display_name="旧人物")
+    await registry.reset_person_runtime("person-delete-generation")
+
+    async with registry.person_runtime(
+        "person-delete-generation", "primary"
+    ) as session_before_delete:
+        pass
+
+    await persistence.delete_person("person-delete-generation")
+    await persistence.upsert_person("person-delete-generation", display_name="新人物")
+
+    stale_version = await session_before_delete.save(
+        AgentState(session_id="stale-after-recreate", summary="stale state")
+    )
+    async with registry.person_runtime(
+        "person-delete-generation", "primary"
+    ) as fresh_session:
+        fresh_version = await fresh_session.save(
+            AgentState(session_id="fresh-after-recreate", summary="fresh state")
+        )
+
+    loaded = await persistence.load_agent_runtime("person-delete-generation", "primary")
+    assert stale_version == 0
+    assert fresh_version == 1
+    assert loaded is not None
+    assert loaded.session_id == "fresh-after-recreate"
+
+
+@pytest.mark.asyncio
+async def test_reenrollment_after_delete_allows_fresh_runtime_session(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("NAOBOT_DATA_KEY", Fernet.generate_key().decode("utf-8"))
+    settings = Settings(runtime_dir=tmp_path, robot_id="robot-test")
+    persistence = RuntimePersistence(settings)
+    registry = RuntimeRegistry(settings, persistence=persistence)
+    await persistence.upsert_person("person-reenroll", display_name="旧人物")
+    await persistence.delete_person("person-reenroll")
+
+    await persistence.enroll_person_atomic(
+        person_id="person-reenroll",
+        embedding=[0.25, 0.75],
+        model_name="face-v1",
+        samples=[
+            {
+                "sample_bytes": f"sample-{index}".encode(),
+                "media_type": "image/jpeg",
+                "sha256": f"sha-{index}",
+            }
+            for index in range(5)
+        ],
+        display_name="新人物",
+    )
+
+    async with registry.person_runtime("person-reenroll", "primary") as fresh_session:
+        version = await fresh_session.save(
+            AgentState(session_id="fresh-reenrolled-session", summary="fresh state")
+        )
+
+    assert version == 1
+    loaded = await persistence.load_agent_runtime("person-reenroll", "primary")
+    assert loaded is not None
+    assert loaded.session_id == "fresh-reenrolled-session"
 
 
 @pytest.mark.asyncio

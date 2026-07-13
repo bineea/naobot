@@ -38,6 +38,8 @@
 
 配置 `NAOBOT_DEVICE_TOKEN` 时，固件必须在控制 WebSocket Upgrade 请求中发送 `X-Naobot-Token`；Host 使用恒定时间比较，缺失或错误 token 以 policy violation `1008` 拒绝。未配置 token 时保留可信局域网兼容模式。控制与媒体链路当前都只支持 `ws://`，不得暴露到公网。
 
+Host 同时只登记一个 `/ws/kt2` owner；重复控制连接以 `1013` 拒绝，旧 handler 只能向自己的 owner socket 回包，不能把事件或 intent 路由到后来连接。控制 socket 断开后固件立即取消当前动作和待执行队列，不等待 7 秒 heartbeat timeout。控制发送每轮只执行有界数量的 1 KiB flush，持续背压不得阻塞 50 ms 安全循环。
+
 固件以最近一次 Host heartbeat 的 `host_ts_ms` 和本地接收 tick 建立短期时钟锚点：`host_now = last_host_ts_ms + ticks_diff(local_now, local_seen)`。锚点超过 7 秒即不可靠；无可靠 Host 时钟时，`stop` 始终可执行，运动 intent 必须返回 `HOST_CLOCK_UNAVAILABLE`，短时表情与提示音仍可执行。有可靠锚点时，`host_now > ts_ms + deadline_ms` 返回 `INTENT_EXPIRED`。
 
 固件在 ACK 前按以下顺序处理：`stop` 立即抢占；`emergency_stop/fall_detected/recovering/fault` 拒绝全部非 stop；`low_battery` 拒绝运动但允许受限表情/提示音；之后才校验 payload、动作参数并提交 MotionController。拒绝返回 `REFLEX_ACTIVE`、`POLICY_DENIED` 或对应时钟错误，不能先 ACK 再由运动层取消。
@@ -109,6 +111,10 @@ TCP 每次最多发送 1 KiB 只是非阻塞发送切片，不等同于创建多
 设备可在媒体连接发送 `touch_head`、`enrollment_cancel` 和 `ping`；Host 分别处理注册/触摸、取消注册和返回 `pong`。非法 JSON、非对象或未知 kind 返回 `INVALID_CONTROL_JSON`/`INVALID_CONTROL_KIND`。
 
 其他媒体错误包括 `INVALID_MEDIA_FRAME`、`MEDIA_QUEUE_FULL`、`INVALID_MEDIA_KIND`、`MEDIA_BACKEND_ERROR`、`MEDIA_WORKER_ERROR` 和 `TTS_ERROR`。坏媒体帧、媒体队列满或 provider 异常不得关闭控制 `/ws/kt2`，也不得改变固件反射控制权。
+
+媒体入口拒绝帧时必须发送 `MEDIA_QUEUE_FULL`，不能仅增加本地丢帧计数。EOU 形成的 turn snapshot 必须冻结当时的 `session_id/person_id/session_trigger`；后续人物切换不得改变已排队 turn 的归属。
+
+Dashboard `/ws/dashboard` 在配置 device token 时通过 `?token=` 完成会话级鉴权，未配置 token 时只允许 loopback；该通道只承载状态和诊断广播，不承载机器人控制。
 
 ## status 与 heartbeat
 

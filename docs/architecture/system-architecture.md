@@ -40,7 +40,7 @@ Host 位于 `src/naobot/`，运行在 Python 3.11：
 - 团队固定并行运行情绪、行为、安全三位专家，再由产品负责人输出唯一决策；安全事件走确定性 fallback。
 - 单 Agent 默认预算 6 秒，团队从开始到负责人收敛共用 15 秒预算。未配置、超时、异常或非法输出进入 fallback。
 - `BehaviorRuntime` 只根据语义字段生成兼容 `actions`，并由 `PolicyGuard` 校验；LLM 自带 `actions` 不参与执行。
-- `MediaService` 负责媒体连接、短期窗口、自然激活、VAD/ASR/视觉/身份/TTS 编排、注册和 People 管理。
+- `MediaService` 负责媒体连接、短期窗口、自然激活、VAD/ASR/视觉/身份/TTS 编排、注册和 People 管理；turn queue 冻结入队时的人物/会话，所有派生推理任务归属于媒体连接并在断线时取消。
 - 会话可由唤醒词、短问候、触摸或持续目光激活；会话激活前不调用 cloud provider 或 Agent。
 - 视频 capability 为常态 10 FPS、事件窗口 15 FPS；Host 默认保留 10 秒视频和 15 秒音频 RAM 窗口。
 - TTS 使用半双工：Host 标记 speaking，TTS 完成后等待 200 ms 再恢复 listening；未实现 AEC 和 barge-in。
@@ -52,6 +52,7 @@ Host 位于 `src/naobot/`，运行在 Python 3.11：
 
 - `RuntimePersistence` 使用 `runtime/naobot.db` 和 SQLite WAL，保存 people、conversation sessions、已识别人员各 agent role 的 AgentScope state、embedding 和注册样本。
 - `RuntimeRegistry` 按人员加异步锁；已识别人员 runtime 可从 SQLite 恢复，访客/visitor/guest runtime 只在内存缓存，媒体断开时销毁。
+- reset/delete 使用人物 activity gate 和持久层 generation/tombstone：不同 role 仍可并行，但管理操作等待在途调用，旧 RuntimeSession 保存被拒绝。
 - 持久化 AgentScope state 会清除原始 base64/URL 媒体，只保留摘要和 SHA-256。
 - 未知身份保持 visitor 隔离，不能读取或写入已识别人员 runtime。
 - 注册只接受未知单人，要求最近 5 张帧、口头“确认”和摸头确认；embedding 与这 5 张样本用 Fernet 加密。

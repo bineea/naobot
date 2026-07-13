@@ -320,11 +320,16 @@ def check_brain_timeout(state, display, motion):
         return
     if ticks_diff(now_ms(), last_seen) <= BRAIN_HEARTBEAT_TIMEOUT_MS:
         return
-    if state.get("agent_online"):
-        state["agent_online"] = False
+    mark_agent_offline(state, display, motion, "brain_timeout")
+
+
+def mark_agent_offline(state, display, motion, reason):
+    was_online = state.get("agent_online", False)
+    state["agent_online"] = False
+    if was_online:
         display.show_status("agent offline")
-        if motion:
-            motion.cancel("brain_timeout")
+    if motion:
+        motion.cancel(reason)
 
 
 async def network_loop(display, power, imu, actions, safety, protocol, state, motion, reflex):
@@ -350,6 +355,9 @@ async def network_loop(display, power, imu, actions, safety, protocol, state, mo
 
         while ws.connected:
             try:
+                if ws.tx_pending and not ws.flush_tx_chunk():
+                    ws.close()
+                    break
                 message = ws.recv_json()
                 if message:
                     handle_agent_message(message, actions, safety, protocol, ws, motion, reflex, state, display)
@@ -365,8 +373,7 @@ async def network_loop(display, power, imu, actions, safety, protocol, state, mo
             await sleep_ms(100)
 
         state["ws"] = None
-        state["agent_online"] = False
-        display.show_status("agent offline")
+        mark_agent_offline(state, display, motion, "control_disconnected")
         await sleep_ms(WS_RECONNECT_DELAY_MS)
 
 
