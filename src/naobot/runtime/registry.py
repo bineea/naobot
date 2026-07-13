@@ -88,8 +88,9 @@ class RuntimeRegistry:
             cache[key] = copied
             return 0
         scrubbed_payload = scrub_agent_state_for_storage(copied)
+        version = await self.persistence.save_agent_runtime(person_id, agent_role, copied)
         cache[key] = AgentState.model_validate(scrubbed_payload)
-        return await self.persistence.save_agent_runtime(person_id, agent_role, copied)
+        return version
 
     @asynccontextmanager
     async def person_runtime(

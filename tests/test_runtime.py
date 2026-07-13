@@ -15,6 +15,17 @@ class NestedMediaModel(BaseModel):
     payload: object
 
 
+class FailingSavePersistence(RuntimePersistence):
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(settings)
+        self.fail_save = False
+
+    async def save_agent_runtime(self, person_id: str, agent_role: str, state: AgentState) -> int:
+        if self.fail_save:
+            raise RuntimeError("save exploded")
+        return await super().save_agent_runtime(person_id, agent_role, state)
+
+
 @pytest.mark.asyncio
 async def test_runtime_registry_initializes_schema_and_persists_person_state(tmp_path) -> None:
     settings = Settings(runtime_dir=tmp_path, robot_id="robot-test")
@@ -161,6 +172,32 @@ async def test_runtime_registry_can_reset_person_runtime(tmp_path) -> None:
     state = await registry.load_state("person-reset", "primary")
 
     assert state.session_id != "session-reset"
+
+
+@pytest.mark.asyncio
+async def test_runtime_registry_keeps_old_cache_when_persistent_save_fails(tmp_path) -> None:
+    settings = Settings(runtime_dir=tmp_path, robot_id="robot-test")
+    persistence = FailingSavePersistence(settings)
+    registry = RuntimeRegistry(settings, persistence=persistence)
+
+    await registry.save_state(
+        "person-failure",
+        "primary",
+        AgentState(session_id="session-old", summary="old"),
+    )
+
+    persistence.fail_save = True
+    with pytest.raises(RuntimeError, match="save exploded"):
+        await registry.save_state(
+            "person-failure",
+            "primary",
+            AgentState(session_id="session-new", summary="new"),
+        )
+
+    loaded = await registry.load_state("person-failure", "primary")
+
+    assert loaded.session_id == "session-old"
+    assert loaded.summary == "old"
 
 
 @pytest.mark.asyncio
