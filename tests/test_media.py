@@ -30,6 +30,7 @@ from naobot.media.protocol import (
     NOMINAL_VIDEO_FPS,
     PCM16_MONO_16K_CAPABILITY,
     PROTOCOL_HEADER,
+    PROTOCOL_MAGIC,
     PROTOCOL_VERSION,
     QVGA_CAPABILITY,
     MediaFrame,
@@ -96,6 +97,16 @@ def test_media_frame_roundtrip_and_strict_decode() -> None:
     assert PROTOCOL_HEADER.size == 24
     assert encoded[:4] == b"NABM"
     assert decoded == frame
+    magic_value, version_value, kind, flags, sequence, timestamp_ms, payload_length = (
+        PROTOCOL_HEADER.unpack(encoded[: PROTOCOL_HEADER.size])
+    )
+    assert magic_value == PROTOCOL_MAGIC
+    assert version_value == PROTOCOL_VERSION
+    assert kind == MediaFrameKind.AUDIO_PCM16
+    assert flags == 3
+    assert sequence == 7
+    assert timestamp_ms == 12_345
+    assert payload_length == 4
 
     magic = bytearray(encoded)
     magic[0:4] = b"NOPE"
@@ -117,7 +128,7 @@ def test_media_frame_roundtrip_and_strict_decode() -> None:
         MediaFrame.decode(truncated)
 
     wrong_payload_length = bytearray(encoded)
-    wrong_payload_length[8:12] = struct.pack(">I", 99)
+    wrong_payload_length[20:24] = struct.pack(">I", 99)
     with pytest.raises(ValueError, match="length"):
         MediaFrame.decode(bytes(wrong_payload_length))
 

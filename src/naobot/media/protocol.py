@@ -60,6 +60,10 @@ class MediaFrame:
             raise ValueError("timestamp_ms must be non-negative")
         if self.sequence < 0:
             raise ValueError("sequence must be non-negative")
+        if self.sequence > 0xFFFFFFFF:
+            raise ValueError("sequence must fit into uint32")
+        if self.timestamp_ms > 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("timestamp_ms must fit into uint64")
         if self.flags < 0 or self.flags > 0xFFFF:
             raise ValueError("flags must fit into uint16")
         if len(self.payload) > 0xFFFFFFFF:
@@ -74,9 +78,9 @@ class MediaFrame:
             PROTOCOL_VERSION,
             int(self.kind),
             self.flags,
-            len(self.payload),
-            self.timestamp_ms,
             self.sequence,
+            self.timestamp_ms,
+            len(self.payload),
         )
         return header + self.payload
 
@@ -84,7 +88,7 @@ class MediaFrame:
     def decode(cls, raw: bytes) -> MediaFrame:
         if len(raw) < PROTOCOL_HEADER.size:
             raise ValueError("frame length is smaller than header length")
-        magic, version, raw_kind, flags, payload_length, timestamp_ms, sequence = (
+        magic, version, raw_kind, flags, sequence, timestamp_ms, payload_length = (
             PROTOCOL_HEADER.unpack(raw[: PROTOCOL_HEADER.size])
         )
         if magic != PROTOCOL_MAGIC:
