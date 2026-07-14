@@ -5,12 +5,13 @@
 ## 必读顺序
 
 1. `docs/product/prd.md`：唯一产品事实源与事实边界。
-2. `docs/product/roadmap.md`、`docs/product/acceptance.md`：软件已完成项与 N16R8 待验收项。
-3. `docs/architecture/system-architecture.md`：L3/L2/L1/L0、双 WebSocket、runtime 与媒体组件。
-4. `docs/architecture/protocol.md`：控制 envelope、媒体 hello、24 字节帧头、TTS、分片和 heartbeat。
-5. `docs/architecture/safety-policy.md`：控制优先级、隐私、People 鉴权和明文局域网风险。
-6. `docs/development.md`：环境、全部 `NAOBOT_*` 配置、People 调试、定制固件构建/烧录。
-7. `docs/decisions/ADR-0003-agentscope-brain-runtime.md` 与 `docs/agents/review-checklist.md`。
+2. `docs/reviews/2026-07-14-product-capability-audit.md`：当前九大产品能力域、L0-L5 成熟度和 P0-P2 缺口。
+3. `docs/product/roadmap.md`、`docs/product/acceptance.md`：产品推进顺序与分级完成定义。
+4. `docs/architecture/system-architecture.md`：L3/L2/L1/L0、双 WebSocket、runtime 与媒体组件。
+5. `docs/architecture/protocol.md`：控制 envelope、媒体 hello、24 字节帧头、TTS、分片和 heartbeat。
+6. `docs/architecture/safety-policy.md`：控制优先级、隐私、People 鉴权和明文局域网风险。
+7. `docs/development.md`：环境、全部 `NAOBOT_*` 配置、People 调试、定制固件构建/烧录。
+8. `docs/decisions/ADR-0003-agentscope-brain-runtime.md` 与 `docs/agents/review-checklist.md`。
 
 ## 当前实现事实
 
@@ -20,6 +21,15 @@
 - 已识别人员 runtime 持久化到 SQLite WAL；visitor/guest runtime 仅内存并在连接结束时销毁。
 - 控制 `/ws/kt2` 与媒体 `/ws/media` 分离；媒体支持 hello/token、10/15 FPS、VAD、TTS 和半双工。
 - People 注册要求未知单人、5 张样本、口头确认、摸头确认和 `NAOBOT_DATA_KEY`；People API 有鉴权。
+
+## 产品目标与成熟度
+
+- 产品目标不是软件 MVP，而是面向家庭多人、默认儿童安全、高度主动、功能完善且长期有趣的桌面陪伴机器人。
+- 功能按 `L0 缺失 / L1 原型 / L2 自动化验证 / L3 集成可用 / L4 家庭场景验收 / L5 产品稳定` 记录。
+- 代码存在、fake 测试或协议测试不能单独证明 L3-L5；完成声明必须链接对应的实机、家庭场景或发布记录。
+- 当前 agent 接任务前先检查最新审计中的 P0/P1，避免在关键产品缺口未解决时把可选扩展描述成主线完成。
+- 高度主动行为必须受勿扰、频率、身份、儿童内容和固件安全边界约束。
+- 受限桌面探索是正式目标，但在边缘/距离传感器和实机安全验收完成前必须保持禁用。
 
 ## 事实与隐私红线
 

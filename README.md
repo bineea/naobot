@@ -1,6 +1,6 @@
 # naobot
 
-naobot 是 KT2 LLM 桌面智能机器人软件 MVP。当前软件包含 Host AgentScope Brain、FastAPI Dashboard、控制/媒体双 WebSocket、自然交互与身份注册、SQLite runtime、ESP32 MicroPython 固件、CPython 模拟器和自动化测试。
+naobot 的目标是成为面向家庭多人、默认儿童安全、高度主动、功能完善且长期有趣的 KT2 LLM 桌面陪伴机器人。当前仓库已经形成 Host AgentScope Brain、FastAPI Dashboard、控制/媒体双 WebSocket、自然交互与身份注册、SQLite runtime、ESP32 MicroPython 固件、CPython 模拟器和自动化测试等架构基础，但尚未达到完整产品完成状态。
 
 系统采用 L3/L2/L1/L0 分层自治：AgentScope 只输出语义字段，`BehaviorRuntime` 确定性编译并忽略 LLM `actions`，固件运动层与反射层保留最终控制权。Toolkit 为空，模型未配置、超时、异常或非法输出时进入安全 fallback。
 
@@ -12,6 +12,7 @@ naobot 是 KT2 LLM 桌面智能机器人软件 MVP。当前软件包含 Host Age
 - `/ws/kt2` 承载控制 envelope，`/ws/media` 承载 hello/token、音视频与 TTS；视频常态 10 FPS、事件窗口 15 FPS。
 - 半双工已实现：TTS 时仅暂停麦克风上行，摄像头继续按 10/15 FPS 上传；固件排空音频后恢复麦克风，Host 再延迟 200 ms 恢复监听。`wss://`、AEC 和 barge-in 未实现。
 - 软件与协议测试已覆盖，但真实 N16R8、C 编译、项目定制 bin、摄像头/I2S/PSRAM/CH343 和 30 分钟指标均未验收。
+- 当前能力成熟度以 L0-L5 记录；自动化测试通过通常只代表 L2，不等于家庭场景或产品稳定性通过。
 
 ## 文档入口
 
@@ -19,6 +20,7 @@ naobot 是 KT2 LLM 桌面智能机器人软件 MVP。当前软件包含 Host Age
 - 产品事实源：`docs/product/prd.md`
 - 路线图与硬件门槛：`docs/product/roadmap.md`
 - 软件/硬件验收：`docs/product/acceptance.md`
+- 最新产品能力审计：`docs/reviews/2026-07-14-product-capability-audit.md`
 - 系统架构：`docs/architecture/system-architecture.md`
 - 协议：`docs/architecture/protocol.md`
 - 安全与隐私：`docs/architecture/safety-policy.md`
