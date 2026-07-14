@@ -139,8 +139,11 @@ class FirmwareProtocol:
             payload["recovered"] = reflex.state == "recovered"
         return self.envelope("event", payload)
 
-    def ack(self, intent_id, status="accepted"):
-        return self.envelope("ack", {"intent_id": intent_id, "status": status})
+    def ack(self, intent_id, status="accepted", reason=None):
+        payload = {"intent_id": intent_id, "status": status}
+        if reason:
+            payload["reason"] = reason
+        return self.envelope("ack", payload)
 
     def error(self, code, message, intent_id=None):
         payload = {"code": code, "message": message}
@@ -280,13 +283,17 @@ def execute_intent(
         if not accepted:
             ws.send_json(protocol.error("EXECUTION_FAILED", reason, intent_id))
             return
-    else:
-        for action in action_list:
-            result = actions.execute(action)
-            if not result.accepted:
-                ws.send_json(protocol.error("EXECUTION_FAILED", result.reason, intent_id))
-                return
-    ws.send_json(protocol.ack(intent_id))
+        # accepted=True（含 duplicate 重复确认）：发 accepted，skill 自然完成/中断时
+        # 由 MotionController.on_intent_done 回调发 completed/failed。
+        ws.send_json(protocol.ack(intent_id, "accepted"))
+        return
+    # 非 motion 路径：同步执行，成功即终态 completed。
+    for action in action_list:
+        result = actions.execute(action)
+        if not result.accepted:
+            ws.send_json(protocol.error("EXECUTION_FAILED", result.reason, intent_id))
+            return
+    ws.send_json(protocol.ack(intent_id, "completed"))
 
 
 def handle_agent_message(message, actions, safety, protocol, ws, motion=None, reflex=None, state=None, display=None):
@@ -387,9 +394,6 @@ async def main():
     actions = ActionPlayer(servos, display, buzzer)
     safety = SafetyGuard(power, imu)
     reflex = ReflexController(power, imu, actions, display, buzzer)
-    motion = MotionController(actions, safety, reflex, now_ms)
-    fallback = LocalFallback(display, actions)
-    adapter = EventAdapter(touch, imu, power)
     protocol = FirmwareProtocol(SESSION_ID)
     media_worker = create_default_worker()
     media_state = media_worker.snapshot()
@@ -404,6 +408,15 @@ async def main():
         "local_loop_overrun_ms": 0,
         "media": media_state,
     }
+
+    def _on_intent_done(intent_id, status, reason=""):
+        ws = network_state.get("ws")
+        if ws and ws.connected:
+            ws.send_json(protocol.ack(intent_id, status, reason if reason else None))
+
+    motion = MotionController(actions, safety, reflex, now_ms, on_intent_done=_on_intent_done)
+    fallback = LocalFallback(display, actions)
+    adapter = EventAdapter(touch, imu, power)
 
     display.set_face("idle")
     print("naobot firmware booted; agent:", AGENT_WS_URL)

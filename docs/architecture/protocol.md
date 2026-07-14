@@ -34,7 +34,7 @@
 }
 ```
 
-机器人执行或拒绝 intent 后返回 `ack` 或 `error`。Host 事件队列拒绝新事件时返回 `EVENT_QUEUE_FULL`；较高优先级事件驱逐待处理事件时，对被驱逐事件返回 `EVENT_EVICTED`，两者都携带 `event_id`，不能当作 intent 执行结果。
+机器人执行或拒绝 intent 后返回 `ack` 或 `error`。`ack.payload.status` 三态：`accepted`（已入队/已接收，非终态）、`completed`（该 intent 全部动作自然播完，终态）、`failed`（执行中被 reflex 或中断取消，携带 `reason`，终态）。`error` 信封用于入队前拒绝（`POLICY_DENIED`/`REFLEX_ACTIVE`/`INTENT_EXPIRED`/`HOST_CLOCK_UNAVAILABLE`/`INVALID_INTENT`/`EXECUTION_FAILED`），未执行，不能与 `ack failed` 混用。固件对近期 `intent_id` 做有界 LRU 去重，重复 intent 只回 `accepted` 不重复执行；MotionController 动作队列有界（默认 8），满时返回 `EXECUTION_FAILED`。Host 侧 `IntentTracker` 维护 pending/accepted 中间态，收到终态或 `error` 移除，由 heartbeat 周期回收超过 `deadline_ms` 未收到终态的 intent。Host 事件队列拒绝新事件时返回 `EVENT_QUEUE_FULL`；较高优先级事件驱逐待处理事件时，对被驱逐事件返回 `EVENT_EVICTED`，两者都携带 `event_id`，不能当作 intent 执行结果。
 
 配置 `NAOBOT_DEVICE_TOKEN` 时，固件必须在控制 WebSocket Upgrade 请求中发送 `X-Naobot-Token`；Host 使用恒定时间比较，缺失或错误 token 以 policy violation `1008` 拒绝。未配置 token 时保留可信局域网兼容模式。控制与媒体链路当前都只支持 `ws://`，不得暴露到公网。
 

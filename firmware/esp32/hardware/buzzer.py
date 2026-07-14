@@ -33,17 +33,27 @@ class Buzzer:
         if self.pwm:
             self.pwm.duty_u16(0)
 
+    def play_step(self, freq, duration_ms):
+        """设置当前段频率并开/关音。duration_ms 由 BuzzerSkill.tick 计时，此处只设硬件状态。"""
+        if not self.pwm:
+            return
+        if freq:
+            self.pwm.freq(freq)
+            self.pwm.duty_u16(12000)
+        else:
+            self.pwm.duty_u16(0)
+
+    def off(self):
+        if self.pwm:
+            self.pwm.duty_u16(0)
+
     def chirp(self, tone="soft"):
         pattern = TONE_PATTERNS.get(tone, TONE_PATTERNS["soft"])
         if not self.pwm:
             print("chirp:", tone)
             return True
         for freq, duration_ms in pattern:
-            if freq:
-                self.pwm.freq(freq)
-                self.pwm.duty_u16(12000)
-            else:
-                self.pwm.duty_u16(0)
+            self.play_step(freq, duration_ms)
             sleep_ms(duration_ms)
-        self.pwm.duty_u16(0)
+        self.off()
         return True

@@ -1,3 +1,6 @@
+from hardware.buzzer import TONE_PATTERNS
+from hardware.display import BLINK_DELAY_MS, FACE_ANIMATIONS
+
 MOVEMENT_ACTIONS = ("wave", "small_step_forward", "turn_left", "turn_right", "gentle_nudge")
 
 NEUTRAL = {"lf": 90, "rf": 90, "lr": 90, "rr": 90}
@@ -74,6 +77,86 @@ class ImmediateSkill:
         self.running = False
 
 
+class DisplaySkill:
+    """OLED 多帧动画的 tick/cancel 化执行。start 只设状态不渲染（仿 PoseSkill），
+    由 MotionController.tick 逐帧推进，避免动作队列里的 set_face/blink 阻塞安全循环。"""
+
+    def __init__(self, display, name, frames, delay_ms):
+        self.display = display
+        self.name = name
+        self.frames = tuple(frames)
+        self.delay_ms = delay_ms
+        self.index = 0
+        self.last_tick_ms = 0
+        self.running = False
+
+    def start(self, now_ms):
+        self.index = 0
+        self.last_tick_ms = now_ms - self.delay_ms
+        self.running = True
+
+    def tick(self, now_ms):
+        if not self.running:
+            return True
+        if self.index >= len(self.frames):
+            self.running = False
+            return True
+        if now_ms - self.last_tick_ms < self.delay_ms:
+            return False
+        self.display.render_frame(self.frames[self.index])
+        self.index += 1
+        self.last_tick_ms = now_ms
+        if self.index >= len(self.frames):
+            self.running = False
+            return True
+        return False
+
+    def cancel(self):
+        self.running = False
+
+
+class BuzzerSkill:
+    """蜂鸣器多段音型的 tick/cancel 化执行。start 立即播放第一段，tick 按段时长推进，
+    cancel 立即静音。避免动作队列里的 chirp 阻塞安全循环。"""
+
+    def __init__(self, buzzer, name, pattern):
+        self.buzzer = buzzer
+        self.name = name
+        self.pattern = tuple(pattern)
+        self.index = 0
+        self.last_tick_ms = 0
+        self.running = False
+
+    def start(self, now_ms):
+        self.index = 0
+        self.last_tick_ms = now_ms
+        self.running = True
+        if self.pattern:
+            self.buzzer.play_step(*self.pattern[0])
+
+    def tick(self, now_ms):
+        if not self.running:
+            return True
+        if self.index >= len(self.pattern):
+            self.running = False
+            return True
+        _freq, duration_ms = self.pattern[self.index]
+        if now_ms - self.last_tick_ms < duration_ms:
+            return False
+        self.index += 1
+        self.last_tick_ms = now_ms
+        if self.index >= len(self.pattern):
+            self.buzzer.off()
+            self.running = False
+            return True
+        self.buzzer.play_step(*self.pattern[self.index])
+        return False
+
+    def cancel(self):
+        self.running = False
+        self.buzzer.off()
+
+
 class ActionPlayer:
     def __init__(self, servos, display, buzzer=None):
         self.servos = servos
@@ -145,6 +228,21 @@ class ActionPlayer:
             return PoseSkill(self.servos, name, frames, 170)
         if name == "gentle_nudge":
             return PoseSkill(self.servos, name, (NUDGE_A, NUDGE_B, NEUTRAL), 130)
+        if name == "set_face":
+            face = args.get("face", "idle")
+            if face not in FACE_ANIMATIONS:
+                frames, delay_ms = ((face,), 0)
+            else:
+                frames, delay_ms = FACE_ANIMATIONS[face]
+            return DisplaySkill(self.display, name, frames, delay_ms)
+        if name == "blink":
+            current_face = getattr(self.display, "face", "idle")
+            return DisplaySkill(self.display, name, ("blink", current_face), BLINK_DELAY_MS)
+        if name == "chirp":
+            tone = args.get("tone", "soft")
+            pattern = TONE_PATTERNS.get(tone, TONE_PATTERNS["soft"])
+            if self.buzzer:
+                return BuzzerSkill(self.buzzer, name, pattern)
         return ImmediateSkill(self, action)
 
     def _set_face(self, args):

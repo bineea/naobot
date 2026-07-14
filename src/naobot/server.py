@@ -341,6 +341,7 @@ def create_app(
                 if not await robot_hub.send_envelope(heartbeat, owner=websocket):
                     return
                 agent.refresh_link_state()
+                agent.reclaim_stale_intents()
                 await hub.broadcast({"kind": "heartbeat_tick", "payload": agent.status()})
                 await asyncio.sleep(settings.host_heartbeat_interval_ms / 1000)
 
@@ -361,6 +362,18 @@ def create_app(
                 agent.observe_robot_message(envelope)
                 await hub.broadcast({"kind": "robot_rx", "payload": envelope.model_dump()})
                 if envelope.type == MessageType.EVENT:
+                    event_name = envelope.payload.get("name")
+                    if event_name in ("touch_head", "touch_back"):
+                        consumed = await media_service.route_touch_event(
+                            name=event_name,
+                            person_id=envelope.payload.get("person_id"),
+                        )
+                        if consumed:
+                            agent.log(
+                                "touch_consumed_by_enrollment",
+                                {"name": event_name, "event_id": envelope.id},
+                            )
+                            continue
                     result = await event_queue.put(envelope)
                     if result.evicted is not None:
                         agent.log("event_evicted", {"event_id": result.evicted.id})

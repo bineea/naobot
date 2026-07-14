@@ -6,6 +6,7 @@ from agentscope.message import DataBlock
 
 from .behavior import BehaviorRuntime
 from .brain import AgentScopeBrainRuntime
+from .intent_tracker import IntentTracker
 from .llm import LLMClient
 from .models import Envelope, MessageType, RobotMode, RobotState, new_id, now_ms
 from .policy import PolicyGuard
@@ -28,6 +29,7 @@ class NaobotAgent:
         self.llm = self.brain  # 兼容现有注入和测试入口。
         self.logs: list[dict] = []
         self.last_intent: Envelope | None = None
+        self.intents = IntentTracker()
         self._host_heartbeat_seq = 0
 
     def log(self, kind: str, data: dict) -> None:
@@ -93,9 +95,13 @@ class NaobotAgent:
         self.log("robot_rx", envelope.model_dump())
         self.update_state_from_envelope(envelope)
         if envelope.type == MessageType.ACK:
-            self.log("ack", envelope.payload)
+            payload = envelope.payload
+            self.intents.observe_ack(payload.get("intent_id"), payload.get("status", "accepted"))
+            self.log("ack", payload)
         if envelope.type == MessageType.ERROR:
-            self.log("robot_error", envelope.payload)
+            payload = envelope.payload
+            self.intents.observe_error(payload.get("intent_id"))
+            self.log("robot_error", payload)
 
     async def create_intent(
         self,
@@ -128,8 +134,22 @@ class NaobotAgent:
         intent = self.behavior.compile(decision, event, self.state)
         if intent.type == MessageType.INTENT:
             self.last_intent = intent
+            tracked = self.intents.track(
+                intent.id,
+                getattr(intent, "deadline_ms", None),
+                getattr(intent, "ts_ms", None),
+            )
+            if not tracked:
+                self.log("intent_dedup", {"intent_id": intent.id})
         self.log("agent_tx", intent.model_dump())
         return intent
+
+    def reclaim_stale_intents(self, current_ms: int | None = None) -> list[str]:
+        """回收超时未收到终态回执的 intent，返回被回收的 intent_id 列表。"""
+        expired = self.intents.reclaim(current_ms)
+        for intent_id in expired:
+            self.log("intent_timeout", {"intent_id": intent_id})
+        return expired
 
     def refresh_link_state(self, current_ms: int | None = None) -> None:
         current_ms = now_ms() if current_ms is None else current_ms

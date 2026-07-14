@@ -572,6 +572,31 @@ class MediaService:
             raise WebSocketDisconnect(code=1008)
         return payload
 
+    async def route_touch_event(self, *, name: str, person_id: str | None = None) -> bool:
+        """控制 WS 触摸事件桥接到媒体注册/会话。
+
+        与 _handle_control_json 的 touch_head 分支对称，但不调用 _emit_touch_intent——
+        控制 WS 路径的 intent 由 server.ws_kt2 的 event_worker 产生。返回 True 表示
+        被注册流程消费（caller 应跳过 intent 创建），False 表示应正常产 intent。
+        """
+        if name not in ("touch_head", "touch_back"):
+            return False
+        current_ms = self._clock()
+        self.orchestrator.observe_touch(now_ms=current_ms, person_id=person_id)
+        await self._sync_guest_runtime(current_ms)
+        if name == "touch_back":
+            return False  # touch_back 无注册语义，激活会话后仍产 intent
+        session_id = self.session.snapshot(now_ms=current_ms).session_id or "visitor-touch"
+        action = await self.enrollment.observe_touch(
+            session_id=session_id,
+            now_ms=current_ms,
+            recent_video_frames=self.pipeline.video_window()[-5:],
+        )
+        if action is not None and action.get("status") == "completed":
+            await self.hub.send_json({"kind": "enrollment", **action})
+            return True  # 注册完成，消费触摸
+        return False  # 无 pending 或注册未完成，正常产 intent
+
     async def _handle_control_json(
         self,
         raw: str,

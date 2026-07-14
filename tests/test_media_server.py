@@ -1238,3 +1238,132 @@ async def test_media_websocket_disconnect_destroys_real_guest_runtime(tmp_path) 
     await service.handle_websocket(DisconnectingWebSocket())  # type: ignore[arg-type]
 
     assert registry.loaded_count() == 0
+
+
+async def _drive_enrollment_to_awaiting_touch(media_service, clock):
+    """驱动媒体服务进入注册 awaiting_touch 状态（控制 WS 桥接测试前置）。"""
+    sent_json = []
+
+    async def capture_json(payload):
+        sent_json.append(payload)
+        return True
+
+    async def capture_binary(_payload):
+        return True
+
+    media_service.hub.send_json = capture_json  # type: ignore[method-assign]
+    media_service.hub.send_binary = capture_binary  # type: ignore[method-assign]
+
+    for sequence in range(1, 6):
+        await media_service._handle_frame(
+            MediaFrame.jpeg(
+                f"jpeg-{sequence}".encode("ascii"),
+                timestamp_ms=1_000 + sequence,
+                sequence=sequence,
+            )
+        )
+    clock.set(10_001)
+    await media_service._handle_frame(
+        MediaFrame.audio_pcm16(b"wake", timestamp_ms=1_000, sequence=10, flags=1)
+    )
+    await media_service._handle_frame(
+        MediaFrame.audio_pcm16(b"utter", timestamp_ms=1_001, sequence=11, flags=3)
+    )
+    clock.set(10_202)
+    await media_service._handle_frame(
+        MediaFrame.audio_pcm16(b"confirm", timestamp_ms=1_010, sequence=12, flags=3)
+    )
+    assert any(
+        item.get("kind") == "enrollment" and item.get("status") == "awaiting_touch"
+        for item in sent_json
+    )
+    return sent_json
+
+
+@pytest.mark.asyncio
+async def test_route_touch_event_completes_enrollment(tmp_path) -> None:
+    clock = StepClock(10_000)
+    settings = Settings(
+        runtime_dir=tmp_path,
+        tts_resume_delay_ms=200,
+        data_key=Fernet.generate_key().decode("utf-8"),
+    )
+    agent = NaobotAgent(settings, llm=SlowFriendlyLLM())
+    media_service = MediaService(
+        settings=settings,
+        agent=agent,
+        session=InteractionSession(tts_resume_delay_ms=settings.tts_resume_delay_ms),
+        wake_word=FakeWakeWord(),
+        identity=UnknownIdentity(),
+        asr=SequenceASR(["记住我", "确认"]),
+        vision=FakeVision(),
+        tts=FakeTTS(),
+        clock=clock,
+    )
+    sent_json = await _drive_enrollment_to_awaiting_touch(media_service, clock)
+
+    clock.set(10_203)
+    before_tx = sum(1 for log in agent.logs if log["kind"] == "agent_tx")
+    consumed = await media_service.route_touch_event(name="touch_head")
+    after_tx = sum(1 for log in agent.logs if log["kind"] == "agent_tx")
+
+    assert consumed is True
+    assert any(
+        item.get("kind") == "enrollment" and item.get("status") == "completed"
+        for item in sent_json
+    )
+    # route_touch_event 不调用 _emit_touch_intent，不应额外产生 intent。
+    assert after_tx == before_tx
+
+
+@pytest.mark.asyncio
+async def test_route_touch_event_without_enrollment_returns_false(tmp_path) -> None:
+    agent = CountingAgent()
+    service = MediaService(
+        settings=Settings(runtime_dir=tmp_path),
+        agent=agent,
+        wake_word=QuietWakeWord(),
+        identity=PassiveIdentity(),
+        asr=FakeASR(),
+        vision=CountingVision(),
+        tts=FakeTTS(),
+    )
+
+    consumed = await service.route_touch_event(name="touch_head")
+
+    assert consumed is False
+    assert agent.calls == 0  # 不产 intent
+
+
+@pytest.mark.asyncio
+async def test_route_touch_event_touch_back_returns_false(tmp_path) -> None:
+    agent = CountingAgent()
+    service = MediaService(
+        settings=Settings(runtime_dir=tmp_path),
+        agent=agent,
+        wake_word=QuietWakeWord(),
+        identity=PassiveIdentity(),
+        asr=FakeASR(),
+        vision=CountingVision(),
+        tts=FakeTTS(),
+    )
+
+    consumed = await service.route_touch_event(name="touch_back")
+
+    assert consumed is False
+    assert agent.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_route_touch_event_ignores_unknown_name(tmp_path) -> None:
+    service = MediaService(
+        settings=Settings(runtime_dir=tmp_path),
+        agent=CountingAgent(),
+        wake_word=QuietWakeWord(),
+        identity=PassiveIdentity(),
+        asr=FakeASR(),
+        vision=CountingVision(),
+        tts=FakeTTS(),
+    )
+
+    assert await service.route_touch_event(name="fall_detected") is False

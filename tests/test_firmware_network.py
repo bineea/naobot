@@ -14,8 +14,9 @@ firmware_main = importlib.import_module("main")
 websocket_client = importlib.import_module("comm.websocket_client")
 
 from comm.websocket_client import WebSocketClient, parse_ws_url  # noqa: E402
+from control.motion_controller import MotionController  # noqa: E402
 from media.websocket import OP_CLOSE, OP_CONTINUATION, OP_PING, OP_TEXT  # noqa: E402
-from motion.action_player import ActionResult  # noqa: E402
+from motion.action_player import ActionPlayer, ActionResult  # noqa: E402
 
 
 def decode_masked_payload(frame: bytes) -> bytes:
@@ -682,3 +683,171 @@ def test_control_disconnect_immediately_cancels_host_motion() -> None:
     assert state["agent_online"] is False
     assert motion.cancel_reason == "control_disconnected"
     assert display.statuses == ["agent offline"]
+
+
+class _RecorderServos:
+    def __init__(self):
+        self.calls = []
+
+    def pose(self, positions):
+        self.calls.append(("pose", dict(positions)))
+
+    def sequence(self, frames, delay_ms=180):
+        self.calls.append(("sequence", list(frames), delay_ms))
+
+    def stop(self):
+        self.calls.append(("stop",))
+
+
+class _RecorderDisplay:
+    def __init__(self):
+        self.face = "idle"
+        self.expressions = []
+        self.frames = []
+
+    def set_face(self, face):
+        self.face = face
+
+    def set_expression(self, params):
+        self.expressions.append(dict(params))
+
+    def render_frame(self, frame, status=None):
+        self.frames.append(frame)
+
+
+class _RecorderBuzzer:
+    def __init__(self):
+        self.steps = []
+
+    def chirp(self, tone="soft"):
+        return True
+
+    def play_step(self, freq, duration_ms):
+        self.steps.append(("step", freq, duration_ms))
+
+    def off(self):
+        self.steps.append(("off",))
+
+
+def _make_motion(clock, *, on_intent_done=None, queue_capacity=8):
+    actions = ActionPlayer(_RecorderServos(), _RecorderDisplay(), _RecorderBuzzer())
+    return (
+        MotionController(
+            actions,
+            FakeSafety(),
+            None,
+            clock,
+            on_intent_done=on_intent_done,
+            queue_capacity=queue_capacity,
+        ),
+        actions,
+    )
+
+
+def test_execute_intent_motion_path_emits_accepted_then_completed() -> None:
+    ws = FakeWs()
+    protocol = firmware_main.FirmwareProtocol("test")
+    current_time = {"value": 0}
+    done = []
+
+    def on_done(intent_id, status, reason=""):
+        done.append((intent_id, status, reason))
+        ws.send_json(protocol.ack(intent_id, status, reason or None))
+
+    motion, actions = _make_motion(lambda: current_time["value"], on_intent_done=on_done)
+    message = {
+        "id": "i1",
+        "type": "intent",
+        "payload": {"actions": [{"name": "set_expression", "args": {"emotion": "happy"}}]},
+    }
+
+    firmware_main.execute_intent(message, actions, FakeSafety(), protocol, ws, motion=motion)
+    assert ws.sent[-1]["type"] == "ack"
+    assert ws.sent[-1]["payload"]["status"] == "accepted"
+    assert ws.sent[-1]["payload"]["intent_id"] == "i1"
+
+    # ImmediateSkill.start 已同步执行；tick 触发完成回调发 completed。
+    motion.tick()
+    assert ws.sent[-1]["payload"]["status"] == "completed"
+    assert ws.sent[-1]["payload"]["intent_id"] == "i1"
+    assert done == [("i1", "completed", "")]
+
+
+def test_execute_intent_duplicate_id_acks_without_reexecute() -> None:
+    ws = FakeWs()
+    protocol = firmware_main.FirmwareProtocol("test")
+    motion, actions = _make_motion(lambda: 0)
+    message = {
+        "id": "dup",
+        "type": "intent",
+        "payload": {"actions": [{"name": "set_expression", "args": {"emotion": "happy"}}]},
+    }
+
+    firmware_main.execute_intent(message, actions, FakeSafety(), protocol, ws, motion=motion)
+    assert ws.sent[-1]["payload"]["status"] == "accepted"
+    assert len(actions.display.expressions) == 1
+
+    firmware_main.execute_intent(message, actions, FakeSafety(), protocol, ws, motion=motion)
+    assert ws.sent[-1]["payload"]["status"] == "accepted"
+    assert len(actions.display.expressions) == 1  # 重复 id 不重执行
+
+
+def test_motion_queue_full_returns_execution_failed() -> None:
+    ws = FakeWs()
+    protocol = firmware_main.FirmwareProtocol("test")
+    motion, actions = _make_motion(lambda: 0, queue_capacity=2)
+    # current 占 1 + queue 占 1 = 容量 2
+    motion.submit_action({"name": "set_face", "args": {"face": "idle"}})
+    motion.submit_action({"name": "set_face", "args": {"face": "happy"}})
+    assert len(motion.queue) == 1
+
+    message = {
+        "id": "q1",
+        "type": "intent",
+        "payload": {"actions": [{"name": "set_face", "args": {"face": "alert"}}]},
+    }
+    firmware_main.execute_intent(message, actions, FakeSafety(), protocol, ws, motion=motion)
+
+    assert ws.sent[-1]["type"] == "error"
+    assert ws.sent[-1]["payload"]["code"] == "EXECUTION_FAILED"
+    assert ws.sent[-1]["payload"]["intent_id"] == "q1"
+
+
+def test_reflex_cancel_emits_failed_for_pending_intent() -> None:
+    ws = FakeWs()
+    protocol = firmware_main.FirmwareProtocol("test")
+    done = []
+
+    def on_done(intent_id, status, reason=""):
+        done.append((intent_id, status, reason))
+        ws.send_json(protocol.ack(intent_id, status, reason or None))
+
+    motion, actions = _make_motion(lambda: 0, on_intent_done=on_done)
+    message = {
+        "id": "r1",
+        "type": "intent",
+        "payload": {"actions": [{"name": "set_expression", "args": {"emotion": "happy"}}]},
+    }
+    firmware_main.execute_intent(message, actions, FakeSafety(), protocol, ws, motion=motion)
+
+    motion.cancel("reflex")
+    assert ("r1", "failed", "reflex") in done
+    assert ws.sent[-1]["payload"]["status"] == "failed"
+    assert ws.sent[-1]["payload"]["reason"] == "reflex"
+
+
+def test_execute_intent_non_motion_path_emits_completed() -> None:
+    actions = FakeActions()
+    ws = FakeWs()
+    protocol = firmware_main.FirmwareProtocol("test")
+    message = {
+        "id": "n1",
+        "type": "intent",
+        "payload": {"actions": [{"name": "set_face", "args": {"face": "happy"}}]},
+    }
+
+    firmware_main.execute_intent(message, actions, FakeSafety(), protocol, ws)
+
+    assert ws.sent[-1]["type"] == "ack"
+    assert ws.sent[-1]["payload"]["status"] == "completed"
+    assert ws.sent[-1]["payload"]["intent_id"] == "n1"

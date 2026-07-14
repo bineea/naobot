@@ -12,6 +12,15 @@ except ImportError:
 from config import I2C_FREQ, I2C_ID, I2C_SCL, I2C_SDA, OLED_ADDR, OLED_HEIGHT, OLED_WIDTH
 
 FACE_NAMES = ("idle", "happy", "sleepy", "alert", "dizzy", "sad")
+# 动画 face 的帧序列与每帧延时(ms)；非动画 face(dizzy/sad 等)单帧直绘。
+# 供 DisplaySkill 按 tick 推进，避免 set_face 经动作队列时阻塞安全循环。
+FACE_ANIMATIONS = {
+    "idle": (("idle", "idle_left", "idle_right", "idle"), 110),
+    "happy": (("happy_open", "happy_half", "happy"), 90),
+    "alert": (("alert_left", "alert_right", "alert_left", "alert"), 70),
+    "sleepy": (("sleepy_open", "sleepy_half", "sleepy_low", "sleepy"), 110),
+}
+BLINK_DELAY_MS = 80
 EXPRESSION_EMOTIONS = {
     "idle": "idle",
     "happy": "happy",
@@ -103,15 +112,15 @@ class Display:
         self.last_status = str(line)
         self._safe_render_frame(self.face, status=self.last_status)
 
+    def render_frame(self, frame, status=None):
+        """渲染单帧（供 DisplaySkill.tick 调用，非阻塞）。"""
+        self._safe_render_frame(frame, status=status)
+
     def _animate(self, face):
-        if face == "idle":
-            self._play(("idle", "idle_left", "idle_right", "idle"), 110)
-        elif face == "happy":
-            self._play(("happy_open", "happy_half", "happy"), 90)
-        elif face == "alert":
-            self._play(("alert_left", "alert_right", "alert_left", "alert"), 70)
-        elif face == "sleepy":
-            self._play(("sleepy_open", "sleepy_half", "sleepy_low", "sleepy"), 110)
+        entry = FACE_ANIMATIONS.get(face)
+        if entry is not None:
+            frames, delay_ms = entry
+            self._play(frames, delay_ms)
         else:
             self._safe_render_frame(face)
 

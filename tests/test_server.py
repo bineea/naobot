@@ -82,6 +82,9 @@ class FakeMediaService:
     async def cancel_enrollment(self):
         self.cancelled = True
 
+    async def route_touch_event(self, *, name: str, person_id: str | None = None) -> bool:
+        return False
+
     async def list_sessions(self):
         return [{"session_id": "person-1", "person_id": "person-1"}]
 
