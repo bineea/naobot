@@ -21,7 +21,7 @@ def test_compile_preserves_semantics_and_source_metadata() -> None:
         skills=[SkillIntent(name="wave", args={"level": 1})],
     )
 
-    intent = runtime.compile(decision, event, RobotState())
+    intent = runtime.compile(decision, event, RobotState(battery_pct=100))
 
     assert intent.type == MessageType.INTENT
     assert intent.id.startswith("int_")
@@ -57,7 +57,7 @@ def test_compile_ignores_llm_actions_and_deduplicates_skills() -> None:
     intent = BehaviorRuntime().compile(
         decision,
         Envelope(type=MessageType.EVENT),
-        RobotState(),
+        RobotState(battery_pct=100),
     )
 
     assert intent.type == MessageType.INTENT
@@ -146,3 +146,16 @@ def test_policy_rejects_movement_skill_during_low_battery() -> None:
 
     assert result.type == MessageType.ERROR
     assert "低电量拒绝运动动作" in result.payload["message"]
+
+
+def test_policy_rejects_movement_skill_when_battery_soc_is_unknown() -> None:
+    decision = LLMDecision(skills=[SkillIntent(name="wave", args={"level": 1})])
+
+    result = BehaviorRuntime().compile(
+        decision,
+        Envelope(type=MessageType.EVENT),
+        RobotState(battery_pct=None),
+    )
+
+    assert result.type == MessageType.ERROR
+    assert "电量未知" in result.payload["message"]
