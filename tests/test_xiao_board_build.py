@@ -63,13 +63,18 @@ def test_config_uses_xiao_profile_and_shared_peripheral_constants() -> None:
     assert config.I2C_SCL == 6
     assert config.OLED_ADDR == 0x3C
     assert config.PCA9685_ADDR == 0x40
-    assert config.BQ27441_ADDR == 0x55
+    assert config.BQ34Z100_ADDR == 0x55
+    assert config.INA226_ADDR == 0x41
     assert config.MPR121_ADDR == 0x5A
     assert config.MPU6050_ADDR == 0x68
-    assert config.BQ25895_ADDR == 0x6A
+    assert config.BATTERY_SERIES_MIN == 2
+    assert config.BATTERY_SERIES_MAX == 6
+    assert config.BATTERY_SERIES_COUNT == 2
     assert config.BATTERY_WARN_PCT == 20
     assert config.LOW_BATTERY_PCT == 15
     assert config.BATTERY_CRITICAL_PCT == 8
+    assert not hasattr(config, "BQ27441_ADDR")
+    assert not hasattr(config, "BQ25895_ADDR")
 
 
 def test_xiao_build_recipe_pins_versions_memory_usb_and_partitions() -> None:
