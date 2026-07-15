@@ -5,6 +5,7 @@
 #include "py/obj.h"
 #include "py/objdict.h"
 #include "py/mpthread.h"
+#include "py/nlr.h"
 #include "py/runtime.h"
 
 static bool camera_initialized;
@@ -128,9 +129,16 @@ static mp_obj_t camera_capture(void) {
         camera_capture_errors++;
         return mp_const_none;
     }
-    mp_obj_t payload = mp_obj_new_bytes(frame->buf, frame->len);
-    esp_camera_fb_return(frame);
-    return payload;
+    nlr_buf_t nlr;
+    if (nlr_push(&nlr) == 0) {
+        mp_obj_t payload = mp_obj_new_bytes(frame->buf, frame->len);
+        nlr_pop();
+        esp_camera_fb_return(frame);
+        return payload;
+    } else {
+        esp_camera_fb_return(frame);
+        nlr_jump(nlr.ret_val);
+    }
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(camera_capture_obj, camera_capture);
 

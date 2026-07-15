@@ -6,6 +6,7 @@
 #include "freertos/task.h"
 #include "py/mperrno.h"
 #include "py/mpthread.h"
+#include "py/nlr.h"
 #include "py/obj.h"
 #include "py/objdict.h"
 #include "py/runtime.h"
@@ -14,6 +15,8 @@
 #define PDM_BITS (16)
 #define PDM_CHANNELS (1)
 #define PDM_DMA_FRAME_NUM (256)
+#define PDM_PUMP_BYTES (256)
+#define PDM_READ_TIMEOUT_TICKS ((TickType_t)1)
 
 typedef struct {
     i2s_chan_handle_t channel;
@@ -44,23 +47,24 @@ static void pdm_owner_guard(void) {
 }
 
 static esp_err_t pdm_release(void) {
-    esp_err_t first_error = ESP_OK;
     if (pdm_state.channel != NULL) {
         if (pdm_state.enabled) {
             esp_err_t result = i2s_channel_disable(pdm_state.channel);
             if (result != ESP_OK) {
-                first_error = result;
+                return result;
             }
+            pdm_state.enabled = false;
+            pdm_state.initialized = false;
         }
         esp_err_t result = i2s_del_channel(pdm_state.channel);
-        if (first_error == ESP_OK && result != ESP_OK) {
-            first_error = result;
+        if (result != ESP_OK) {
+            return result;
         }
+        pdm_state.channel = NULL;
     }
     if (pdm_state.buffer != NULL) {
         heap_caps_free(pdm_state.buffer);
     }
-    pdm_state.channel = NULL;
     pdm_state.buffer = NULL;
     pdm_state.capacity = 0;
     pdm_state.head = 0;
@@ -68,11 +72,11 @@ static esp_err_t pdm_release(void) {
     pdm_state.rate_hz = 0;
     pdm_state.enabled = false;
     pdm_state.initialized = false;
-    return first_error;
+    return ESP_OK;
 }
 
 static esp_err_t pdm_pump(void) {
-    uint8_t overflow_buffer[256];
+    uint8_t overflow_buffer[PDM_PUMP_BYTES];
     size_t free_bytes = pdm_state.capacity - pdm_state.queued;
     bool dropping = free_bytes < 2;
     uint8_t *destination;
@@ -87,6 +91,9 @@ static esp_err_t pdm_pump(void) {
         if (requested > free_bytes) {
             requested = free_bytes;
         }
+        if (requested > PDM_PUMP_BYTES) {
+            requested = PDM_PUMP_BYTES;
+        }
         requested &= ~(size_t)1;
         destination = pdm_state.buffer + tail;
     }
@@ -99,15 +106,11 @@ static esp_err_t pdm_pump(void) {
         destination,
         requested,
         &received,
-        0
+        PDM_READ_TIMEOUT_TICKS
     );
     MP_THREAD_GIL_ENTER();
 
-    if (result == ESP_ERR_TIMEOUT) {
-        pdm_state.last_error = ESP_OK;
-        return ESP_OK;
-    }
-    if (result != ESP_OK) {
+    if (result != ESP_OK && result != ESP_ERR_TIMEOUT) {
         pdm_state.last_error = result;
         return result;
     }
@@ -189,6 +192,7 @@ static mp_obj_t pdm_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_a
     if (pdm_state.buffer == NULL) {
         pdm_state.capacity = 0;
         pdm_state.last_error = ESP_ERR_NO_MEM;
+        pdm_state.creator = NULL;
         mp_raise_OSError(MP_ENOMEM);
     }
 
@@ -234,11 +238,17 @@ static mp_obj_t pdm_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_a
     pdm_state.rate_hz = PDM_SAMPLE_RATE_HZ;
     return mp_const_none;
 
-init_failed:
-    pdm_state.last_error = result;
-    pdm_release();
-    pdm_state.last_error = result;
-    mp_raise_OSError(result);
+init_failed: {
+    esp_err_t init_error = result;
+    esp_err_t cleanup_result = pdm_release();
+    if (cleanup_result != ESP_OK) {
+        pdm_state.last_error = cleanup_result;
+        mp_raise_OSError(cleanup_result);
+    }
+    pdm_state.creator = NULL;
+    pdm_state.last_error = init_error;
+    mp_raise_OSError(init_error);
+}
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(pdm_init_obj, 0, pdm_init);
 
@@ -277,12 +287,19 @@ static mp_obj_t pdm_read(mp_obj_t max_bytes_in) {
     }
     memcpy(payload, pdm_state.buffer + pdm_state.head, first);
     memcpy(payload + first, pdm_state.buffer, count - first);
-    pdm_state.head = (pdm_state.head + count) % pdm_state.capacity;
-    pdm_state.queued -= count;
-    pdm_state.read_bytes += count;
-    mp_obj_t result = mp_obj_new_bytes(payload, count);
-    heap_caps_free(payload);
-    return result;
+    nlr_buf_t nlr;
+    if (nlr_push(&nlr) == 0) {
+        mp_obj_t result = mp_obj_new_bytes(payload, count);
+        nlr_pop();
+        heap_caps_free(payload);
+        pdm_state.head = (pdm_state.head + count) % pdm_state.capacity;
+        pdm_state.queued -= count;
+        pdm_state.read_bytes += count;
+        return result;
+    } else {
+        heap_caps_free(payload);
+        nlr_jump(nlr.ret_val);
+    }
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(pdm_read_obj, pdm_read);
 
@@ -302,11 +319,12 @@ static MP_DEFINE_CONST_FUN_OBJ_0(pdm_available_obj, pdm_available);
 static mp_obj_t pdm_deinit(void) {
     pdm_owner_guard();
     esp_err_t result = pdm_release();
-    if (result != ESP_OK) {
-        pdm_state.last_error = result;
-        mp_raise_OSError(result);
+    if (result == ESP_OK) {
+        pdm_state.creator = NULL;
+        return mp_const_none;
     }
-    return mp_const_none;
+    pdm_state.last_error = result;
+    mp_raise_OSError(result);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(pdm_deinit_obj, pdm_deinit);
 

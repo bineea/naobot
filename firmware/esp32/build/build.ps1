@@ -5,7 +5,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $MicroPythonTag = "v1.28.0"
-$MicroPythonCommit = "2b0015629f67fd186f980079b2e696ad0bc7343c"
+$MicroPythonTagObject = "2b0015629f67fd186f980079b2e696ad0bc7343c"
+$MicroPythonCommit = "e0e9fbb17ed6fd06bb76e266ae554784c9c80804"
 $Esp32CameraTag = "v2.1.6"
 $Esp32CameraCommit = "2ac69a6f1749694804f5196e63fa1f79800b74bf"
 $MicroPythonDir = Join-Path $Workspace "micropython"
@@ -34,8 +35,13 @@ git -C $CameraDir fetch --depth 1 origin "refs/tags/$Esp32CameraTag"
 git -C $CameraDir checkout --detach $Esp32CameraCommit
 
 $actualMicroPython = git -C $MicroPythonDir rev-parse HEAD
+$actualMicroPythonTag = git -C $MicroPythonDir rev-parse "$MicroPythonTag^{tag}"
 $actualCamera = git -C $CameraDir rev-parse HEAD
-if ($actualMicroPython -ne $MicroPythonCommit -or $actualCamera -ne $Esp32CameraCommit) {
+if (
+    $actualMicroPython -ne $MicroPythonCommit `
+    -or $actualMicroPythonTag -ne $MicroPythonTagObject `
+    -or $actualCamera -ne $Esp32CameraCommit
+) {
     throw "上游源码提交校验失败。"
 }
 
