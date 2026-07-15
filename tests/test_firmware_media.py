@@ -1294,7 +1294,7 @@ def test_custom_image_recipe_static_structure_pins_exact_upstream_versions() -> 
     build_root = FIRMWARE_ROOT / "build"
     script = (build_root / "build.ps1").read_text(encoding="utf-8")
     sdkconfig = (build_root / "sdkconfig.board").read_text(encoding="utf-8")
-    board_cmake = (build_root / "N16R8_44PIN" / "mpconfigboard.cmake").read_text(
+    board_cmake = (build_root / "XIAO_ESP32S3_SENSE" / "mpconfigboard.cmake").read_text(
         encoding="utf-8"
     )
     cmake = (build_root / "camera_module" / "micropython.cmake").read_text(encoding="utf-8")
@@ -1303,13 +1303,13 @@ def test_custom_image_recipe_static_structure_pins_exact_upstream_versions() -> 
     assert "v2.1.6" in script
     assert "CONFIG_CAMERA_PSRAM_DMA=y" in sdkconfig
     assert "CONFIG_SPIRAM_MODE_OCT=y" in sdkconfig
-    assert "CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y" in sdkconfig
-    assert "CONFIG_ESP_CONSOLE_USB_CDC=n" in sdkconfig
+    assert "CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y" in sdkconfig
+    assert "CONFIG_ESP_CONSOLE_USB_CDC=y" in sdkconfig
     assert "CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=n" in sdkconfig
-    assert "CONFIG_TINYUSB_ENABLED=n" in sdkconfig
-    assert "MICROPY_HW_ENABLE_USBDEV=0" in board_cmake
+    assert "CONFIG_TINYUSB_ENABLED=y" in sdkconfig
+    assert "MICROPY_HW_ENABLE_USBDEV=1" in board_cmake
     assert "MICROPY_HW_ESP_USB_SERIAL_JTAG=0" in board_cmake
-    assert "MICROPY_HW_ENABLE_UART_REPL=1" in board_cmake
+    assert "MICROPY_HW_ENABLE_UART_REPL=0" in board_cmake
     assert "${MICROPY_BOARD_DIR}/../sdkconfig.board" in board_cmake
     assert "BOARD_DIR=$BoardDir" in script
     assert "esp32-camera" in cmake

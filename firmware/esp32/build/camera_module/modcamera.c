@@ -102,6 +102,38 @@ static mp_obj_t camera_psram_free(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(camera_psram_free_obj, camera_psram_free);
 
+static mp_obj_t camera_sensor_pid(void) {
+    sensor_t *sensor = esp_camera_sensor_get();
+    if (sensor == NULL) {
+        return mp_const_none;
+    }
+    return mp_obj_new_int(sensor->id.PID);
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(camera_sensor_pid_obj, camera_sensor_pid);
+
+static const char *camera_sensor_name_from_pid(uint16_t pid) {
+    switch (pid) {
+        case OV2640_PID:
+            return "OV2640";
+        case OV3660_PID:
+            return "OV3660";
+        case OV5640_PID:
+            return "OV5640";
+        default:
+            return "unknown";
+    }
+}
+
+static mp_obj_t camera_sensor_name(void) {
+    sensor_t *sensor = esp_camera_sensor_get();
+    if (sensor == NULL) {
+        return mp_const_none;
+    }
+    const char *name = camera_sensor_name_from_pid(sensor->id.PID);
+    return mp_obj_new_str(name, strlen(name));
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(camera_sensor_name_obj, camera_sensor_name);
+
 static const mp_rom_map_elem_t camera_module_globals_table[] = {
     {MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_camera)},
     {MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&camera_init_obj)},
@@ -110,6 +142,8 @@ static const mp_rom_map_elem_t camera_module_globals_table[] = {
     {MP_ROM_QSTR(MP_QSTR_available_frames), MP_ROM_PTR(&camera_available_frames_obj)},
     {MP_ROM_QSTR(MP_QSTR_set_psram_dma), MP_ROM_PTR(&camera_set_psram_dma_obj)},
     {MP_ROM_QSTR(MP_QSTR_psram_free), MP_ROM_PTR(&camera_psram_free_obj)},
+    {MP_ROM_QSTR(MP_QSTR_sensor_pid), MP_ROM_PTR(&camera_sensor_pid_obj)},
+    {MP_ROM_QSTR(MP_QSTR_sensor_name), MP_ROM_PTR(&camera_sensor_name_obj)},
     {MP_ROM_QSTR(MP_QSTR_FRAME_QVGA), MP_ROM_INT(FRAMESIZE_QVGA)},
     {MP_ROM_QSTR(MP_QSTR_PIXFORMAT_JPEG), MP_ROM_INT(PIXFORMAT_JPEG)},
     {MP_ROM_QSTR(MP_QSTR_CAMERA_FB_IN_PSRAM), MP_ROM_INT(CAMERA_FB_IN_PSRAM)},

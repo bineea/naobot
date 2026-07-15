@@ -41,7 +41,11 @@ if ($actualMicroPython -ne $MicroPythonCommit -or $actualCamera -ne $Esp32Camera
 
 $Manifest = (Resolve-Path (Join-Path $PSScriptRoot "manifest.py")).Path
 $UserModule = (Resolve-Path (Join-Path $PSScriptRoot "camera_module/micropython.cmake")).Path
-$BoardDir = (Resolve-Path (Join-Path $PSScriptRoot "N16R8_44PIN")).Path
+$BoardDir = (Resolve-Path (Join-Path $PSScriptRoot "XIAO_ESP32S3_SENSE")).Path
+$Partitions = Join-Path $BoardDir "partitions.csv"
+$PartitionTarget = Join-Path $MicroPythonDir "ports/esp32/partitions.csv"
+
+Copy-Item -LiteralPath $Partitions -Destination $PartitionTarget -Force
 
 make -C (Join-Path $MicroPythonDir "ports/esp32") submodules
 make -C (Join-Path $MicroPythonDir "mpy-cross")
@@ -52,4 +56,4 @@ make -C (Join-Path $MicroPythonDir "ports/esp32") `
     USER_C_MODULES=$UserModule `
     all
 
-Write-Host "构建流程完成；请自行检查 ports/esp32/build-N16R8_44PIN-SPIRAM_OCT/。"
+Write-Host "构建流程完成；请自行检查 ports/esp32/build-XIAO_ESP32S3_SENSE-SPIRAM_OCT/。"
