@@ -143,11 +143,21 @@ class SDStorage:
         self._last_error = None
         return True
 
-    def read_update(self, sequence, filename, offset=0):
+    def read_update(self, sequence, filename, offset=0, max_bytes=None):
         try:
             path = self._update_path(sequence, filename)
             if not isinstance(offset, int) or offset < 0:
                 raise ValueError("invalid update offset")
+            if max_bytes is None:
+                read_size = self.read_chunk_bytes
+            elif (
+                not isinstance(max_bytes, int)
+                or isinstance(max_bytes, bool)
+                or not 1 <= max_bytes <= 4096
+            ):
+                raise ValueError("invalid update read size")
+            else:
+                read_size = min(self.read_chunk_bytes, max_bytes)
         except ValueError:
             self._set_error("invalid update path")
             return None
@@ -157,7 +167,7 @@ class SDStorage:
             with self.open_fn(path, "rb") as update_file:
                 if offset:
                     update_file.seek(offset)
-                data = update_file.read(self.read_chunk_bytes)
+                data = update_file.read(read_size)
         except Exception as exc:
             self._invalidate(exc)
             return None

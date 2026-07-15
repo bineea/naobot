@@ -89,7 +89,7 @@ class StorageWorker:
         finally:
             self._release()
 
-    def submit_update_read(self, sequence, filename, offset=0):
+    def submit_update_read(self, sequence, filename, offset=0, max_bytes=None):
         self._acquire()
         try:
             if len(self._queue) >= self.queue_limit:
@@ -102,6 +102,7 @@ class StorageWorker:
                     "sequence": sequence,
                     "filename": filename,
                     "offset": offset,
+                    "max_bytes": max_bytes,
                     "request": request,
                 }
             )
@@ -162,7 +163,10 @@ class StorageWorker:
                     error = self._storage_error()
             else:
                 result = self._storage.read_update(
-                    item["sequence"], item["filename"], item["offset"]
+                    item["sequence"],
+                    item["filename"],
+                    item["offset"],
+                    item["max_bytes"],
                 )
                 if result is None:
                     error = self._storage_error()

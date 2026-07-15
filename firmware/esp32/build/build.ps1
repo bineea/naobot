@@ -1,5 +1,6 @@
 param(
     [string]$Workspace = (Join-Path $PSScriptRoot "_work"),
+    [string]$OtaPublicKeyHeader = $env:NAOBOT_OTA_PUBLIC_KEY_HEADER,
     [switch]$Clean
 )
 
@@ -50,6 +51,15 @@ $UserModule = (Resolve-Path (Join-Path $PSScriptRoot "camera_module/micropython.
 $BoardDir = (Resolve-Path (Join-Path $PSScriptRoot "XIAO_ESP32S3_SENSE")).Path
 $Partitions = Join-Path $BoardDir "partitions.csv"
 $PartitionTarget = Join-Path $MicroPythonDir "ports/esp32/partitions.csv"
+
+if ($OtaPublicKeyHeader) {
+    $OtaPublicKeyHeader = (Resolve-Path -LiteralPath $OtaPublicKeyHeader).Path
+    $publicKeySource = Get-Content -Raw -LiteralPath $OtaPublicKeyHeader
+    if ($publicKeySource -notmatch "BEGIN PUBLIC KEY" -or $publicKeySource -match "PRIVATE KEY") {
+        throw "OTA 公钥头文件必须只包含 public key material。"
+    }
+    $env:NAOBOT_OTA_PUBLIC_KEY_HEADER = $OtaPublicKeyHeader
+}
 
 Copy-Item -LiteralPath $Partitions -Destination $PartitionTarget -Force
 

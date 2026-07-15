@@ -17,6 +17,9 @@ from config import (
     DEVICE_TOKEN,
     FIRMWARE_HEARTBEAT_INTERVAL_MS,
     MEDIA_EVENT_BOOST_MS,
+    OTA_CHUNK_BYTES,
+    OTA_CURRENT_SEQUENCE,
+    OTA_UPDATE_SEQUENCE,
     SAFETY_LOOP_PERIOD_MS,
     SESSION_ID,
     WIFI_CONNECT_TIMEOUT_MS,
@@ -39,6 +42,7 @@ from motion.action_player import ActionPlayer
 from reflex.reflex_controller import ReflexController
 from safety.guard import MOVEMENT_ACTIONS, SafetyGuard
 from storage.storage_worker import create_default_worker as create_storage_worker
+from update.update_coordinator import UpdateCoordinator
 
 
 def now_ms():
@@ -114,6 +118,7 @@ class FirmwareProtocol:
         state = state or {}
         media_state = state.get("media", state)
         storage_state = state.get("storage", {})
+        ota_state = state.get("ota", {})
         payload = {
             "source": getattr(power, "source", "none"),
             "uptime_ms": now_ms(),
@@ -144,6 +149,11 @@ class FirmwareProtocol:
             "storage_queue": storage_state.get("queue_depth", 0),
             "storage_dropped": storage_state.get("dropped", 0),
             "storage_last_error": storage_state.get("last_error"),
+            "ota_state": ota_state.get("ota_state", "unavailable"),
+            "ota_progress_pct": ota_state.get("ota_progress_pct", 0),
+            "ota_error": ota_state.get("ota_error"),
+            "ota_pending_verify": ota_state.get("ota_pending_verify", False),
+            "ota_sequence": ota_state.get("ota_sequence"),
         }
         if reflex:
             motion_state = motion.motion_state if motion else "idle"
@@ -432,6 +442,13 @@ async def main():
         "servo_output_enabled": servos.enabled,
         "media": media_state,
         "storage": storage_state,
+        "ota": {
+            "ota_state": "initializing",
+            "ota_progress_pct": 0,
+            "ota_error": None,
+            "ota_pending_verify": False,
+            "ota_sequence": None,
+        },
     }
 
     def _on_intent_done(intent_id, status, reason=""):
@@ -440,6 +457,20 @@ async def main():
             ws.send_json(protocol.ack(intent_id, status, reason if reason else None))
 
     motion = MotionController(actions, safety, reflex, now_ms, on_intent_done=_on_intent_done)
+    ota = UpdateCoordinator(
+        storage_worker,
+        power,
+        motion,
+        servo_gate,
+        reflex,
+        touch,
+        clock_ms=now_ms,
+        chunk_size=OTA_CHUNK_BYTES,
+        current_sequence=OTA_CURRENT_SEQUENCE,
+    )
+    if OTA_UPDATE_SEQUENCE is not None:
+        ota.request_install(OTA_UPDATE_SEQUENCE)
+    network_state["ota"] = ota.status()
     fallback = LocalFallback(display, actions)
     adapter = EventAdapter(touch, imu, power)
 
@@ -478,6 +509,8 @@ async def main():
                     envelope = protocol.event(event, power, imu, reflex, motion, network_state)
                     if not ws or not ws.connected or not ws.send_json(envelope):
                         fallback.handle(event)
+            ota.tick()
+            network_state["ota"] = ota.status()
             await sleep_to_safety_deadline(loop_start, network_state)
     finally:
         media_worker.stop()

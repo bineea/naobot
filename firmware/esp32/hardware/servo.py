@@ -47,6 +47,21 @@ class ServoOutputGate:
         self.available = True
         return True
 
+    def confirm_disabled(self):
+        if self._pin is None or not self.available:
+            return None
+        try:
+            value = self._pin.value()
+        except Exception as exc:
+            self.disabled = None
+            print("servo oe feedback failed:", exc)
+            return None
+        if value not in (0, 1):
+            self.disabled = None
+            return None
+        self.disabled = value == 1
+        return self.disabled
+
 
 class ServoBank:
     CHANNELS = {"lf": 0, "rf": 1, "lr": 2, "rr": 3}

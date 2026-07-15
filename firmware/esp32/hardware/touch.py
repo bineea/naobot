@@ -68,3 +68,11 @@ class TouchInputs:
         if rising & 0x02:
             self._pending.append("touch_back")
         return self._pending.pop(0) if self._pending else None
+
+    @property
+    def touch_mask(self):
+        return self._stable_mask
+
+    @property
+    def both_touched(self):
+        return self.available and self._stable_mask == 0x03
