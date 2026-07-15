@@ -27,3 +27,21 @@
 
 - 完成的是 CPython fake 存储行为验证；没有 microSD 实卡、XIAO 板或定制 MicroPython 固件实测，不将其表述为硬件验收。
 - 未改动现有的 `tests/test_firmware_native_media_modules.py` 修改和其他协作者的未跟踪内容。
+
+## 评审修复
+
+- `StorageWorker` 改为独立 `_thread` 的唯一运行时所有者。主循环只调用 `start()`、`stop()` 与纯内存 `snapshot()`；不再调用会执行 SD I/O 的 `tick()`。
+- 工作器将入队、结果 `poll()` 与快照都限制为锁保护的有界内存交换；物理挂载、`stat`、读写、JSON 序列化和轮转只发生在工作线程的 `_run_one()` 路径。
+- `SDStorage.snapshot()` 改为纯内存读取。挂载和日志写入期间维护 `log_bytes` 缓存，日志使用 UTF-8 字节数计量，拒绝超过活动日志上限的单条记录，确保活动 `naobot.log` 不超过 128 KiB。
+- 挂载和运行时 I/O 错误统一调用失效清理：尽力 `umount`、`deinit`，清除卡、挂载和可用状态，并以配置的指数退避限制重试；后续请求在退避到期后可重新挂载。
+- 递归诊断校验增加最大深度和活动引用集合，明确拒绝二进制、循环引用及过深对象图。
+- 新增阻塞存储 fake，证明安全主循环侧的 `snapshot()`、`tick()` 和 `poll()` 不会触发存储操作，实际阻塞操作仅在线程启动后发生。
+
+## 评审修复 TDD 与验证
+
+1. RED：新增回归测试后，旧实现在 UTF-8 字节限额、超大日志、循环引用、失效退避和线程接口上共失败 7 项。
+2. GREEN：线程所有权、缓存快照和失效状态机实现后，存储测试恢复通过。
+3. `./.venv/Scripts/python.exe -m pytest tests/test_firmware_storage.py tests/test_firmware_network.py -q`：54 passed。
+4. `./.venv/Scripts/python.exe -m ruff check firmware/esp32/storage firmware/esp32/main.py firmware/esp32/config.py tests/test_firmware_storage.py`：通过。
+5. `./.venv/Scripts/python.exe -m py_compile firmware/esp32/storage/__init__.py firmware/esp32/storage/sd_storage.py firmware/esp32/storage/storage_worker.py firmware/esp32/main.py firmware/esp32/config.py tests/test_firmware_storage.py`：通过。
+6. `git diff --check`：通过。

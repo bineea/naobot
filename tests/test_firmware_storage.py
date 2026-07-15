@@ -1,4 +1,5 @@
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -9,15 +10,45 @@ if str(FIRMWARE_ROOT) not in sys.path:
 
 class FakeSDCard:
     calls = []
+    deinit_calls = 0
 
     def __init__(self, **kwargs):
         type(self).calls.append(kwargs)
+
+    def deinit(self):
+        type(self).deinit_calls += 1
+
+
+class ManualThread:
+    def __init__(self):
+        self.target = None
+        self.args = None
+
+    @staticmethod
+    def allocate_lock():
+        return threading.Lock()
+
+    def start_new_thread(self, target, args):
+        self.target = target
+        self.args = args
+        return 1
+
+
+class GatedThread(ManualThread):
+    def __init__(self):
+        super().__init__()
+        self.thread = None
+
+    def release(self):
+        self.thread = threading.Thread(target=self.target, args=self.args, daemon=True)
+        self.thread.start()
 
 
 def create_storage(tmp_path, **kwargs):
     from storage.sd_storage import SDStorage
 
     FakeSDCard.calls = []
+    FakeSDCard.deinit_calls = 0
     mount_point = tmp_path / "sd"
 
     def mount(_card, path):
@@ -90,15 +121,113 @@ def test_log_rotation_retains_only_configured_archives(tmp_path):
     archive_one = tmp_path / "sd" / "naobot.log.1"
     archive_two = tmp_path / "sd" / "naobot.log.2"
 
-    assert storage.ensure_mounted() is True
+    log_path.parent.mkdir(parents=True)
     log_path.write_bytes(b"x" * 32)
     archive_one.write_text("newer archive")
     archive_two.write_text("oldest archive")
+    assert storage.ensure_mounted() is True
 
     assert storage.append_log({"event": "rotated"}) is True
     assert archive_one.read_bytes() == b"x" * 32
     assert archive_two.read_text() == "newer archive"
     assert log_path.read_text() == '{"event":"rotated"}\n'
+
+
+def test_log_never_exceeds_exact_utf8_limit_and_rotates_non_ascii_records(tmp_path):
+    entry = '{"event":"\u96ea"}\n'.encode()
+    storage = create_storage(tmp_path, log_limit_bytes=len(entry))
+    log_path = tmp_path / "sd" / "naobot.log"
+
+    assert storage.append_log({"event": "\u96ea"}) is True
+    assert storage.snapshot()["log_bytes"] == len(entry)
+    assert log_path.read_bytes() == entry
+    assert storage.append_log({"event": "\u96ea"}) is True
+    assert log_path.read_bytes() == entry
+    assert (tmp_path / "sd" / "naobot.log.1").read_bytes() == entry
+    assert storage.snapshot()["log_bytes"] == len(entry)
+
+
+def test_log_rejects_a_single_record_larger_than_the_active_log_limit(tmp_path):
+    storage = create_storage(tmp_path, log_limit_bytes=16)
+
+    assert storage.append_log({"event": "x" * 32}) is False
+    assert storage.snapshot()["log_bytes"] == 0
+    assert storage.snapshot()["last_error"] == "log record too large"
+    assert not (tmp_path / "sd" / "naobot.log").exists()
+
+
+def test_default_rotation_keeps_seven_archives_and_tolerates_gaps(tmp_path):
+    storage = create_storage(tmp_path, log_limit_bytes=8)
+    root = tmp_path / "sd"
+    log_path = root / "naobot.log"
+
+    root.mkdir(parents=True)
+    log_path.write_bytes(b"old-log!")
+    (root / "naobot.log.1").write_bytes(b"one")
+    (root / "naobot.log.3").write_bytes(b"three")
+    (root / "naobot.log.7").write_bytes(b"seven")
+    assert storage.ensure_mounted() is True
+
+    assert storage.append_log({"x": 1}) is True
+    assert (root / "naobot.log.1").read_bytes() == b"old-log!"
+    assert (root / "naobot.log.2").read_bytes() == b"one"
+    assert not (root / "naobot.log.3").exists()
+    assert (root / "naobot.log.4").read_bytes() == b"three"
+    assert not (root / "naobot.log.7").exists()
+
+
+def test_binary_validation_rejects_deep_and_cyclic_diagnostics_without_recursing_forever(tmp_path):
+    storage = create_storage(tmp_path)
+    cyclic = {"event": "cycle"}
+    cyclic["self"] = cyclic
+    deeply_nested = {"event": "deep"}
+    cursor = deeply_nested
+    for _ in range(32):
+        cursor["child"] = {}
+        cursor = cursor["child"]
+
+    assert storage.append_log(cyclic) is False
+    assert storage.snapshot()["last_error"] == "diagnostic record contains cycle"
+    assert storage.append_log(deeply_nested) is False
+    assert storage.snapshot()["last_error"] == "diagnostic record nesting too deep"
+
+
+def test_mount_and_io_failures_invalidate_card_then_retry_after_backoff(tmp_path):
+    from storage.sd_storage import SDStorage
+
+    clock = [0]
+    mounts = []
+    umounts = []
+
+    def mount(_card, path):
+        mounts.append(path)
+        if len(mounts) == 1:
+            raise OSError("mount failed")
+        Path(path).mkdir(parents=True, exist_ok=True)
+
+    storage = SDStorage(
+        mount_point=str(tmp_path / "sd"),
+        sdcard_factory=FakeSDCard,
+        mount_fn=mount,
+        umount_fn=lambda path: umounts.append(path),
+        clock=lambda: clock[0],
+        retry_base_ms=10,
+        retry_max_ms=40,
+    )
+
+    assert storage.ensure_mounted() is False
+    assert storage.snapshot()["mounted"] is False
+    assert FakeSDCard.deinit_calls == 1
+    assert storage.ensure_mounted() is False
+    assert len(mounts) == 1
+    clock[0] = 10
+    assert storage.ensure_mounted() is True
+    storage.open_fn = lambda *_args: (_ for _ in ()).throw(OSError("card removed"))
+    assert storage.append_log({"event": "write"}) is False
+    assert storage.snapshot()["available"] is False
+    assert storage.snapshot()["mounted"] is False
+    assert FakeSDCard.deinit_calls == 2
+    assert umounts == [str(tmp_path / "sd"), str(tmp_path / "sd")]
 
 
 @pytest.mark.parametrize("sequence, filename", [
@@ -122,8 +251,9 @@ def test_update_reads_are_bounded_and_reject_path_escape(tmp_path, sequence, fil
 
 
 def test_worker_drops_logs_under_queue_pressure_and_rejects_updates(tmp_path):
-    worker = storage_worker_class()(create_storage(tmp_path), queue_limit=1)
+    worker = storage_worker_class()(create_storage(tmp_path), queue_limit=1, thread_module=ManualThread())
 
+    assert worker.start() is True
     assert worker.submit_log({"event": "first"}) is True
     assert worker.submit_log({"event": "second"}) is False
     rejected = worker.submit_update_read("20260715", "firmware.bin")
@@ -131,24 +261,67 @@ def test_worker_drops_logs_under_queue_pressure_and_rejects_updates(tmp_path):
     assert rejected == {"accepted": False, "reason": "storage queue full"}
     assert worker.snapshot()["queue_depth"] == 1
     assert worker.snapshot()["dropped"] == 1
-    assert worker.tick() is True
+    assert worker.tick() is False
+    assert worker._run_one() is True
     assert worker.snapshot()["queue_depth"] == 0
 
 
 def test_worker_processes_bounded_update_reads_cooperatively(tmp_path):
     storage = create_storage(tmp_path, read_chunk_bytes=3)
-    worker = storage_worker_class()(storage, queue_limit=2)
+    worker = storage_worker_class()(storage, queue_limit=2, thread_module=ManualThread())
     update_dir = tmp_path / "sd" / "updates" / "20260715"
 
     assert storage.ensure_mounted() is True
     update_dir.mkdir(parents=True)
     (update_dir / "firmware.bin").write_bytes(b"abcdef")
 
+    assert worker.start() is True
     request = worker.submit_update_read("20260715", "firmware.bin")
 
-    assert request == {"accepted": True, "result": None, "error": None}
-    assert worker.tick() is True
-    assert request == {"accepted": True, "result": b"abc", "error": None}
+    assert worker.poll(request) == {"accepted": True, "result": None, "error": None}
+    assert worker._run_one() is True
+    assert worker.poll(request) == {"accepted": True, "result": b"abc", "error": None}
+
+
+def test_main_side_worker_snapshot_tick_and_poll_do_not_run_blocking_storage(tmp_path):
+    class BlockingStorage:
+        def __init__(self):
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.append_calls = 0
+
+        def append_log(self, _record):
+            self.append_calls += 1
+            self.entered.set()
+            self.release.wait(1)
+            return True
+
+        @staticmethod
+        def snapshot():
+            return {
+                "available": False,
+                "mounted": False,
+                "log_bytes": 0,
+                "last_error": None,
+                "pins": {},
+            }
+
+    thread_module = GatedThread()
+    storage = BlockingStorage()
+    worker = storage_worker_class()(storage, queue_limit=1, thread_module=thread_module, idle_delay_ms=1)
+
+    assert worker.start() is True
+    assert worker.submit_log({"event": "queued"}) is True
+    assert worker.snapshot()["queue_depth"] == 1
+    assert worker.tick() is False
+    assert worker.poll() is None
+    assert storage.append_calls == 0
+    thread_module.release()
+    assert storage.entered.wait(1)
+    assert worker.snapshot()["queue_depth"] == 0
+    worker.stop()
+    storage.release.set()
+    thread_module.thread.join(1)
 
 
 def test_protocol_heartbeat_includes_storage_telemetry():

@@ -447,6 +447,7 @@ async def main():
     print("naobot firmware booted; agent:", AGENT_WS_URL)
     asyncio.create_task(network_loop(display, power, imu, actions, safety, protocol, network_state, motion, reflex))
     media_worker.start()
+    storage_worker.start()
 
     previous_loop_start = None
     try:
@@ -466,7 +467,6 @@ async def main():
                 motion.cancel("reflex")
                 reflex.run()
             motion.tick()
-            storage_worker.tick()
             event = adapter.poll()
             if event:
                 media_worker.request_event_boost(ticks_add(now_ms(), MEDIA_EVENT_BOOST_MS))
@@ -481,6 +481,7 @@ async def main():
             await sleep_to_safety_deadline(loop_start, network_state)
     finally:
         media_worker.stop()
+        storage_worker.stop()
 
 
 if __name__ == "__main__":
