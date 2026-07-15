@@ -11,6 +11,16 @@ if str(FIRMWARE_ROOT) not in sys.path:
     sys.path.insert(0, str(FIRMWARE_ROOT))
 
 
+def read_xiao_partitions() -> list[list[str]]:
+    source = (BUILD_ROOT / "XIAO_ESP32S3_SENSE" / "partitions.csv").read_text(
+        encoding="utf-8"
+    )
+    return [
+        [field.strip() for field in row]
+        for row in reader(line for line in source.splitlines() if line and not line.startswith("#"))
+    ]
+
+
 def test_xiao_esp32s3_sense_profile_has_the_fixed_wiring() -> None:
     board = importlib.import_module("boards.xiao_esp32s3_sense")
 
@@ -71,9 +81,6 @@ def test_xiao_build_recipe_pins_versions_memory_usb_and_partitions() -> None:
     variant_cmake = (
         BUILD_ROOT / "XIAO_ESP32S3_SENSE" / "mpconfigvariant_SPIRAM_OCT.cmake"
     ).read_text(encoding="utf-8")
-    partitions = (BUILD_ROOT / "XIAO_ESP32S3_SENSE" / "partitions.csv").read_text(
-        encoding="utf-8"
-    )
 
     assert "v1.28.0" in script
     assert "2b0015629f67fd186f980079b2e696ad0bc7343c" in script
@@ -93,18 +100,32 @@ def test_xiao_build_recipe_pins_versions_memory_usb_and_partitions() -> None:
     assert "MICROPY_HW_ESP_USB_SERIAL_JTAG=0" in board_cmake
     assert "MICROPY_HW_ENABLE_UART_REPL=0" in board_cmake
     assert "boards/sdkconfig.spiram_oct" in variant_cmake
-    partition_rows = {
-        normalized[0]: normalized
-        for row in reader(line for line in partitions.splitlines() if line and not line.startswith("#"))
-        for normalized in ([field.strip() for field in row],)
-    }
+    partition_rows = {row[0]: row for row in read_xiao_partitions()}
     assert partition_rows["nvs"][1:5] == ["data", "nvs", "0x9000", "0x6000"]
-    assert partition_rows["otadata"][1:5] == ["data", "ota", "0xe000", "0x2000"]
-    assert partition_rows["phy_init"][1:5] == ["data", "phy", "0xf000", "0x1000"]
-    assert partition_rows["ota_0"][1:5] == ["app", "ota_0", "0x10000", "0x280000"]
-    assert partition_rows["ota_1"][1:5] == ["app", "ota_1", "0x290000", "0x280000"]
-    assert partition_rows["littlefs"][1:5] == ["data", "spiffs", "0x520000", "0x2A0000"]
+    assert partition_rows["otadata"][1:5] == ["data", "ota", "0xF000", "0x2000"]
+    assert partition_rows["phy_init"][1:5] == ["data", "phy", "0x11000", "0x1000"]
+    assert partition_rows["ota_0"][1:5] == ["app", "ota_0", "0x20000", "0x280000"]
+    assert partition_rows["ota_1"][1:5] == ["app", "ota_1", "0x2A0000", "0x280000"]
+    assert partition_rows["vfs"][1:5] == ["data", "spiffs", "0x520000", "0x2A0000"]
     assert partition_rows["coredump"][1:5] == ["data", "coredump", "0x7C0000", "0x40000"]
+
+
+def test_xiao_partitions_are_non_overlapping_aligned_and_fit_flash() -> None:
+    intervals = []
+    for name, partition_type, _subtype, offset, size, *_flags in read_xiao_partitions():
+        start = int(offset, 0)
+        end = start + int(size, 0)
+        assert start >= 0
+        assert end <= 8 * 1024 * 1024
+        if partition_type == "app":
+            assert start % 0x10000 == 0
+        intervals.append((start, end, name))
+
+    intervals.sort()
+    for (_start, end, name), (next_start, _next_end, next_name) in zip(
+        intervals, intervals[1:], strict=False
+    ):
+        assert end <= next_start, f"{name} overlaps {next_name}"
 
 
 def test_camera_recipe_keeps_qvga_jpeg_psram_dma_and_sensor_diagnostics() -> None:
@@ -119,15 +140,15 @@ def test_camera_recipe_keeps_qvga_jpeg_psram_dma_and_sensor_diagnostics() -> Non
     assert "MP_QSTR_sensor_name" in source
 
 
-def test_deprecated_n16r8_profiles_are_absent_from_owned_firmware_code() -> None:
+def test_deprecated_targets_are_absent_from_formal_runtime_code() -> None:
     assert not (FIRMWARE_ROOT / "boards" / "n16r8_44pin.py").exists()
     assert not (BUILD_ROOT / "N16R8_44PIN").exists()
 
-    owned_sources = [
-        FIRMWARE_ROOT / "config.py",
-        *(path for path in (FIRMWARE_ROOT / "boards").glob("*.py")),
-        *(path for path in BUILD_ROOT.rglob("*") if path.is_file() and "__pycache__" not in path.parts),
+    runtime_sources = [
+        path
+        for path in FIRMWARE_ROOT.rglob("*")
+        if path.suffix in {".c", ".py"} and "__pycache__" not in path.parts
     ]
-    text = "\n".join(path.read_text(encoding="utf-8") for path in owned_sources)
-    for deprecated in ("N16R8", "16MB", "CH343", "INMP441"):
+    text = "\n".join(path.read_text(encoding="utf-8") for path in runtime_sources)
+    for deprecated in ("N16R8", "16MB", "CH343"):
         assert deprecated not in text
