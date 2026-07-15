@@ -6,6 +6,14 @@ from boards.xiao_esp32s3_sense import (
     SD_PINS,
 )
 
+__all__ = (
+    "EXTERNAL_I2C_PINS",
+    "MAX98357A_PINS",
+    "PCA9685_OE_PIN",
+    "PDM_MIC_PINS",
+    "SD_PINS",
+)
+
 WIFI_SSID = "YOUR_WIFI"
 WIFI_PASSWORD = "YOUR_PASSWORD"
 AGENT_WS_URL = "ws://192.168.1.100:8765/ws/kt2"

@@ -1,4 +1,4 @@
-from boards.n16r8_44pin import CAMERA_PINS, INMP441_PINS, MAX98357A_PINS
+from boards.xiao_esp32s3_sense import CAMERA_PINS, MAX98357A_PINS, PDM_MIC_PINS
 
 PCM_SAMPLE_RATE_HZ = 16000
 PCM_CHUNK_BYTES = 640
@@ -22,6 +22,15 @@ def _load_i2s():
         return I2S, Pin
     except (ImportError, RuntimeError):
         return None, None
+
+
+def _load_pdm_module():
+    try:
+        import pdm
+
+        return pdm
+    except (ImportError, RuntimeError):
+        return None
 
 
 class Camera:
@@ -49,8 +58,8 @@ class Camera:
                 "pin_href": CAMERA_PINS["href"],
                 "pin_sccb_sda": CAMERA_PINS["sccb_sda"],
                 "pin_sccb_scl": CAMERA_PINS["sccb_scl"],
-                "sccb_i2c_port": 0,
-                "reuse_sccb_i2c": True,
+                "sccb_i2c_port": 1,
+                "reuse_sccb_i2c": False,
                 "pin_pwdn": -1,
                 "pin_reset": -1,
                 "xclk_freq_hz": 20000000,
@@ -105,50 +114,39 @@ class Camera:
 
 
 class AudioInput:
-    def __init__(self, i2s_class=None, pin_factory=None, chunk_bytes=PCM_CHUNK_BYTES):
-        if i2s_class is None or pin_factory is None:
-            loaded_i2s, loaded_pin = _load_i2s()
-            i2s_class = i2s_class or loaded_i2s
-            pin_factory = pin_factory or loaded_pin
-        self.i2s = None
+    def __init__(self, pdm_module=None, chunk_bytes=PCM_CHUNK_BYTES):
+        self.pdm = pdm_module if pdm_module is not None else _load_pdm_module()
         self.available = False
-        self._ready = False
         self.chunk_bytes = chunk_bytes
         self.last_error = None
         self._error_count = 0
-        if i2s_class is None or pin_factory is None:
+        if self.pdm is None:
             return
         try:
-            self.i2s = i2s_class(
-                0,
-                sck=pin_factory(INMP441_PINS["sck"]),
-                ws=pin_factory(INMP441_PINS["ws"]),
-                sd=pin_factory(INMP441_PINS["sd"]),
-                mode=i2s_class.RX,
-                bits=i2s_class.B16,
-                format=i2s_class.MONO,
-                rate=PCM_SAMPLE_RATE_HZ,
-                ibuf=I2S_BUFFER_BYTES,
+            if not hasattr(self.pdm, "read"):
+                raise RuntimeError("PDM non-blocking read unavailable")
+            initialized = self.pdm.init(
+                clk_pin=PDM_MIC_PINS["clk"],
+                data_pin=PDM_MIC_PINS["data"],
+                sample_rate_hz=PCM_SAMPLE_RATE_HZ,
+                bits=16,
+                channels=1,
+                buffer_bytes=I2S_BUFFER_BYTES,
             )
-            if not hasattr(self.i2s, "irq"):
-                raise RuntimeError("I2S non-blocking readiness unavailable")
-            self.i2s.irq(self._mark_ready)
-            self.available = True
+            self.available = initialized is not False
         except Exception as exc:
             self.last_error = exc
             self._deinit()
 
     def read_chunk(self):
-        if not self.available or self.i2s is None or not self._ready:
+        if not self.available or self.pdm is None:
             return None
-        self._ready = False
-        buffer = bytearray(self.chunk_bytes)
         try:
-            count = self.i2s.readinto(buffer)
-            if not count:
+            payload = self.pdm.read(self.chunk_bytes)
+            if not payload:
                 return None
             self._error_count = 0
-            return bytes(buffer[:count])
+            return bytes(payload)
         except Exception as exc:
             self.last_error = exc
             self._error_count += 1
@@ -156,25 +154,19 @@ class AudioInput:
                 self.available = False
             return None
 
-    def _mark_ready(self, _i2s):
-        self._ready = True
-
     def close(self):
         self.available = False
-        self._ready = False
         self._deinit()
 
     def _deinit(self):
-        if self.i2s is None:
+        if self.pdm is None:
             return
         try:
-            if hasattr(self.i2s, "irq"):
-                self.i2s.irq(None)
-            if hasattr(self.i2s, "deinit"):
-                self.i2s.deinit()
+            if hasattr(self.pdm, "deinit"):
+                self.pdm.deinit()
         except Exception as exc:
             self.last_error = exc
-        self.i2s = None
+        self.pdm = None
 
 
 class AudioOutput:

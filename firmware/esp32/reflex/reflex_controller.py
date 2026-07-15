@@ -16,6 +16,10 @@ class ReflexController:
         self.emergency_stop = False
 
     def request_emergency_stop(self):
+        if hasattr(self.actions, "emergency_stop"):
+            self.actions.emergency_stop()
+        else:
+            self.actions.stop()
         self.emergency_stop = True
         self.state = "emergency_stop"
         self.authority = "emergency"
@@ -25,12 +29,12 @@ class ReflexController:
             self.state = "emergency_stop"
             self.authority = "emergency"
             return True
-        if self.power.is_low():
-            self.state = "low_battery"
-            self.authority = "reflex"
-            return True
         if self.imu.is_fault():
             self.state = "fall_detected"
+            self.authority = "reflex"
+            return True
+        if self.power.is_low():
+            self.state = "low_battery"
             self.authority = "reflex"
             return True
         if self.state in ("fall_detected", "recovering", "low_battery"):
@@ -52,7 +56,13 @@ class ReflexController:
             return True
         if self.state == "low_battery":
             if self._active_reflex != "low_battery":
-                self.last_reflex = run_low_battery_reflex(self.actions, self.display, self.buzzer)
+                self.last_reflex = run_low_battery_reflex(
+                    self.power,
+                    self.imu,
+                    self.actions,
+                    self.display,
+                    self.buzzer,
+                )
                 self._active_reflex = "low_battery"
             return True
         if self.state == "fall_detected":

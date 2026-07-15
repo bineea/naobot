@@ -1,15 +1,10 @@
 try:
-    from machine import I2C, Pin
-except ImportError:
-    I2C = None
-    Pin = None
-
-try:
     import utime as time
 except ImportError:
     import time
 
-from config import I2C_FREQ, I2C_ID, I2C_SCL, I2C_SDA, OLED_ADDR, OLED_HEIGHT, OLED_WIDTH
+from config import OLED_ADDR, OLED_HEIGHT, OLED_WIDTH
+from hardware.i2c import SharedI2C
 
 FACE_NAMES = ("idle", "happy", "sleepy", "alert", "dizzy", "sad")
 # 动画 face 的帧序列与每帧延时(ms)；非动画 face(dizzy/sad 等)单帧直绘。
@@ -48,6 +43,7 @@ class Display:
         self.face = "idle"
         self.available = False
         self.oled = oled
+        self.i2c = i2c
         self.last_status = ""
 
         if self.oled:
@@ -56,10 +52,10 @@ class Display:
             return
 
         try:
-            i2c = i2c or self._create_i2c()
-            if not i2c:
+            self.i2c = self.i2c if self.i2c is not None else SharedI2C.get()
+            if not self.i2c:
                 raise RuntimeError("i2c unavailable")
-            self.oled = self._create_oled(i2c)
+            self.oled = self._create_oled(self.i2c)
             self.available = True
             self._safe_render_frame(self.face)
         except Exception as exc:
@@ -68,9 +64,7 @@ class Display:
             print("display fallback:", exc)
 
     def _create_i2c(self):
-        if not I2C or not Pin:
-            return None
-        return I2C(I2C_ID, scl=Pin(I2C_SCL), sda=Pin(I2C_SDA), freq=I2C_FREQ)
+        return SharedI2C.get()
 
     def _create_oled(self, i2c):
         try:

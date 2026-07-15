@@ -14,12 +14,16 @@ from safety.guard import SafetyGuard  # noqa: E402
 
 
 class FakePower:
-    def __init__(self, low=False):
+    def __init__(self, low=False, critical=False):
         self.battery_pct = 5 if low else 80
         self.low = low
+        self.critical = critical
 
     def is_low(self):
         return self.low
+
+    def is_critical(self):
+        return self.critical
 
 
 class FakeImu:
@@ -36,15 +40,27 @@ class FakeImu:
 class FakeServos:
     def __init__(self):
         self.calls = []
+        self.enabled = False
+        self.emergency_latched = False
 
     def pose(self, positions):
+        if self.emergency_latched:
+            return False
+        self.enabled = True
         self.calls.append(("pose", dict(positions)))
+        return True
 
     def sequence(self, frames, delay_ms=180):
         self.calls.append(("sequence", [dict(frame) for frame in frames], delay_ms))
 
     def stop(self):
+        self.enabled = False
         self.calls.append(("stop",))
+
+    def emergency_off(self):
+        self.emergency_latched = True
+        self.enabled = False
+        self.calls.append(("emergency_off",))
 
 
 class FakeDisplay:
@@ -83,10 +99,67 @@ def test_reflex_controller_runs_fall_reflex_locally() -> None:
     assert reflex.run() is True
 
     assert ("stop",) in servos.calls
+    assert not any(call[0] == "pose" for call in servos.calls)
     assert "alert" in display.faces
     assert "alert" in buzzer.tones
     assert reflex.status()["control_authority"] == "reflex"
     assert reflex.status()["last_reflex"] == "brace_and_sit"
+
+
+def test_emergency_stop_latches_servo_output_before_display() -> None:
+    events = []
+
+    class OrderedServos(FakeServos):
+        def emergency_off(self):
+            super().emergency_off()
+            events.append("emergency_off")
+
+    class OrderedDisplay(FakeDisplay):
+        def set_face(self, face):
+            super().set_face(face)
+            events.append("display")
+
+    servos = OrderedServos()
+    display = OrderedDisplay()
+    actions = ActionPlayer(servos, display, FakeBuzzer())
+    reflex = ReflexController(FakePower(), FakeImu(), actions, display)
+
+    reflex.request_emergency_stop()
+    reflex.run()
+
+    assert events[0] == "emergency_off"
+    assert events[1] == "display"
+    assert servos.emergency_latched is True
+
+
+def test_low_battery_safe_sit_is_disabled_after_pose() -> None:
+    servos = FakeServos()
+    display = FakeDisplay()
+    actions = ActionPlayer(servos, display, FakeBuzzer())
+    reflex = ReflexController(FakePower(low=True), FakeImu(), actions, display)
+
+    assert reflex.check() and reflex.run()
+
+    assert [call[0] for call in servos.calls] == ["stop", "pose", "stop"]
+    assert servos.enabled is False
+    assert reflex.last_reflex == "low_battery_sit"
+
+
+def test_critical_battery_never_reenables_servo_for_sit() -> None:
+    servos = FakeServos()
+    display = FakeDisplay()
+    actions = ActionPlayer(servos, display, FakeBuzzer())
+    reflex = ReflexController(
+        FakePower(low=True, critical=True),
+        FakeImu(),
+        actions,
+        display,
+    )
+
+    assert reflex.check() and reflex.run()
+
+    assert [call[0] for call in servos.calls] == ["stop"]
+    assert reflex.last_reflex == "low_battery_off"
 
 
 def test_reflex_controller_can_trigger_same_fall_again_after_recovery() -> None:

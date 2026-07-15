@@ -266,10 +266,19 @@ def test_random_bytes_uses_byte_sized_getrandbits(monkeypatch) -> None:
 def test_firmware_protocol_event_shape() -> None:
     class Power:
         battery_pct = 77
+        voltage_mv = 3890
+        current_ma = -85
+        charging = False
+        external_power = False
+        fault = False
+        available = True
+        level = "normal"
 
     class Imu:
+        posture = "upright"
+
         def read_posture(self):
-            return "upright"
+            raise AssertionError("protocol must not sample IMU")
 
     protocol = firmware_main.FirmwareProtocol("kt2-test")
     event = protocol.event("touch_head", Power(), Imu())
@@ -284,10 +293,19 @@ def test_firmware_protocol_event_shape() -> None:
 def test_firmware_protocol_heartbeat_includes_link_health_payload() -> None:
     class Power:
         battery_pct = 77
+        voltage_mv = 3890
+        current_ma = -85
+        charging = True
+        external_power = True
+        fault = False
+        available = True
+        level = "normal"
 
     class Imu:
+        posture = "upright"
+
         def read_posture(self):
-            return "upright"
+            raise AssertionError("heartbeat must not sample IMU")
 
     class Motion:
         motion_state = "wave"
@@ -298,7 +316,7 @@ def test_firmware_protocol_heartbeat_includes_link_health_payload() -> None:
         Imu(),
         FakeReflex(),
         Motion(),
-        {"agent_online": True, "local_loop_ms": 4},
+        {"agent_online": True, "local_loop_ms": 4, "servo_output_enabled": True},
     )
 
     assert heartbeat["type"] == "heartbeat"
@@ -307,6 +325,14 @@ def test_firmware_protocol_heartbeat_includes_link_health_payload() -> None:
     assert heartbeat["payload"]["local_loop_ms"] == 4
     assert heartbeat["payload"]["control_authority"] == "skill"
     assert heartbeat["payload"]["motion_state"] == "wave"
+    assert heartbeat["payload"]["voltage_mv"] == 3890
+    assert heartbeat["payload"]["current_ma"] == -85
+    assert heartbeat["payload"]["charging"] is True
+    assert heartbeat["payload"]["external_power"] is True
+    assert heartbeat["payload"]["power_fault"] is False
+    assert heartbeat["payload"]["power_available"] is True
+    assert heartbeat["payload"]["power_level"] == "normal"
+    assert heartbeat["payload"]["servo_output_enabled"] is True
 
 
 def test_execute_intent_runs_safe_actions_and_acks() -> None:

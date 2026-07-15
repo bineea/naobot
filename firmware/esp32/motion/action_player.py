@@ -311,6 +311,20 @@ class ActionPlayer:
     def stop(self):
         self.servos.stop()
 
+    def emergency_stop(self):
+        if hasattr(self.servos, "emergency_off"):
+            self.servos.emergency_off()
+        else:
+            self.servos.stop()
+
+    @property
+    def emergency_latched(self):
+        return bool(getattr(self.servos, "emergency_latched", False))
+
+    @property
+    def servo_output_enabled(self):
+        return bool(getattr(self.servos, "enabled", False))
+
 
 def clamp_int(value, minimum, maximum):
     try:

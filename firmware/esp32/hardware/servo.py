@@ -1,10 +1,11 @@
 try:
-    from machine import PWM, Pin
-except ImportError:
-    PWM = None
+    from machine import Pin
+except (ImportError, RuntimeError):
     Pin = None
 
-from config import SERVO_LIMITS, SERVO_PINS
+from config import PCA9685_OE_PIN
+from hardware.i2c import SharedI2C
+from hardware.pca9685 import PCA9685
 
 try:
     import utime as time
@@ -19,52 +20,119 @@ def sleep_ms(ms):
         time.sleep(ms / 1000)
 
 
-class Servo:
-    def __init__(self, pin):
-        self.pin = pin
-        self.angle_value = SERVO_LIMITS["neutral"]
-        self.pwm = PWM(Pin(pin), freq=50) if PWM and Pin else None
-
-    def angle(self, degrees):
-        degrees = max(SERVO_LIMITS["min"], min(SERVO_LIMITS["max"], int(degrees)))
-        self.angle_value = degrees
-        if self.pwm:
-            us = 500 + (degrees / 180) * 2000
-            duty = int(us / 20000 * 65535)
-            self.pwm.duty_u16(duty)
-
-    def off(self):
-        if self.pwm:
-            self.pwm.duty_u16(0)
-
-
 class ServoBank:
-    def __init__(self):
-        self.servos = {name: Servo(pin) for name, pin in SERVO_PINS.items()}
+    CHANNELS = {"lf": 0, "rf": 1, "lr": 2, "rr": 3}
+    MIN_ANGLE = 30
+    MAX_ANGLE = 150
+    NEUTRAL_ANGLE = 90
+
+    def __init__(self, i2c=None, pin_factory=Pin):
+        self.enabled = False
+        self.available = False
+        self.emergency_latched = False
+        self.positions = {name: self.NEUTRAL_ANGLE for name in self.CHANNELS}
+        self._oe = None
+        self._init_oe(pin_factory)
+        self.i2c = i2c if i2c is not None else SharedI2C.get()
+        self.driver = PCA9685(self.i2c)
+        self.available = self._oe is not None and self.driver.available
+
+    def _init_oe(self, pin_factory):
+        if pin_factory is None:
+            return
+        try:
+            self._oe = pin_factory(PCA9685_OE_PIN, pin_factory.OUT)
+            self._set_oe(True)
+        except Exception as exc:
+            self._oe = None
+            print("servo oe fallback:", exc)
+
+    def _set_oe(self, disabled):
+        if self._oe is None:
+            return False
+        self._oe.value(1 if disabled else 0)
+        return True
+
+    @classmethod
+    def _clamp(cls, degrees):
+        return max(cls.MIN_ANGLE, min(cls.MAX_ANGLE, int(degrees)))
+
+    def enable(self):
+        if not self.available or self.emergency_latched:
+            return False
+        try:
+            if not self._set_oe(False):
+                return False
+            self.enabled = True
+            return True
+        except Exception as exc:
+            self.enabled = False
+            print("servo enable failed:", exc)
+            return False
+
+    def disable(self):
+        self.enabled = False
+        try:
+            return self._set_oe(True)
+        except Exception as exc:
+            print("servo disable failed:", exc)
+            return False
 
     def neutral(self):
-        for servo in self.servos.values():
-            servo.angle(SERVO_LIMITS["neutral"])
+        return self.set_all(self.NEUTRAL_ANGLE)
+
+    def _write_positions(self, positions):
+        if self.emergency_latched or not self.available:
+            return False
+        self.disable()
+        try:
+            for name, degrees in positions.items():
+                self.driver.set_angle(self.CHANNELS[name], degrees)
+        except Exception as exc:
+            print("servo write failed:", exc)
+            return False
+        self.positions.update(positions)
+        return self.enable()
 
     def set_all(self, degrees):
-        for servo in self.servos.values():
-            servo.angle(degrees)
+        if self.emergency_latched or not self.available:
+            return False
+        degrees = self._clamp(degrees)
+        return self._write_positions({name: degrees for name in self.CHANNELS})
 
     def set(self, name, degrees):
-        servo = self.servos.get(name)
-        if not servo:
+        if name not in self.CHANNELS:
             raise ValueError(f"unknown servo: {name}")
-        servo.angle(degrees)
+        if self.emergency_latched or not self.available:
+            return False
+        degrees = self._clamp(degrees)
+        return self._write_positions({name: degrees})
 
     def pose(self, positions):
+        if self.emergency_latched or not self.available:
+            return False
+        clamped = {}
         for name, degrees in positions.items():
-            self.set(name, degrees)
+            if name not in self.CHANNELS:
+                raise ValueError(f"unknown servo: {name}")
+            clamped[name] = self._clamp(degrees)
+        return self._write_positions(clamped)
 
     def sequence(self, frames, delay_ms=180):
         for frame in frames:
-            self.pose(frame)
+            if not self.pose(frame):
+                return False
             sleep_ms(delay_ms)
+        return True
 
     def stop(self):
-        for servo in self.servos.values():
-            servo.off()
+        self.disable()
+        try:
+            self.driver.all_off()
+        except Exception as exc:
+            print("servo clear failed:", exc)
+        return True
+
+    def emergency_off(self):
+        self.emergency_latched = True
+        return self.stop()

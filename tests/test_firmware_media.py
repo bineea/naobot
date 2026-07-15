@@ -16,7 +16,7 @@ FIRMWARE_ROOT = Path(__file__).resolve().parents[1] / "firmware" / "esp32"
 if str(FIRMWARE_ROOT) not in sys.path:
     sys.path.insert(0, str(FIRMWARE_ROOT))
 
-board = importlib.import_module("boards.n16r8_44pin")
+board = importlib.import_module("boards.xiao_esp32s3_sense")
 firmware_main = importlib.import_module("main")
 firmware_config = importlib.import_module("config")
 wifi_config = importlib.import_module("comm.wifi_config")
@@ -108,6 +108,28 @@ class FakeI2S:
     def write(self, payload):
         self.writes.append(bytes(payload))
         return len(payload)
+
+    def deinit(self):
+        self.deinit_calls += 1
+
+
+class FakePDMModule:
+    def __init__(self, chunks=None) -> None:
+        self.config = None
+        self.chunks = list(chunks if chunks is not None else [b"\x01\x02" * 320])
+        self.deinit_calls = 0
+
+    def init(self, **kwargs):
+        self.config = dict(kwargs)
+        return True
+
+    def read(self, chunk_bytes):
+        if not self.chunks:
+            return None
+        payload = self.chunks.pop(0)
+        if payload is None:
+            return None
+        return bytes(payload[:chunk_bytes])
 
     def deinit(self):
         self.deinit_calls += 1
@@ -270,40 +292,15 @@ def wait_for_media_connection(client, timeout_sec=1.0):
     return False
 
 
-def test_n16r8_44pin_board_profile_matches_fixed_wiring() -> None:
-    assert board.BOARD_NAME == "ESP32-S3-N16R8-44PIN"
-    assert board.FLASH_MB == 16
+def test_xiao_board_profile_matches_media_wiring() -> None:
+    assert board.BOARD_NAME == "Seeed XIAO ESP32S3 Sense"
+    assert board.FLASH_MB == 8
     assert board.PSRAM_MB == 8
-    assert board.CAMERA_PINS == {
-        "d0": 4,
-        "d1": 5,
-        "d2": 10,
-        "d3": 11,
-        "d4": 12,
-        "d5": 13,
-        "d6": 14,
-        "d7": 18,
-        "xclk": 21,
-        "pclk": 38,
-        "vsync": 39,
-        "href": 40,
-        "sccb_sda": 8,
-        "sccb_scl": 9,
-    }
-    assert board.INMP441_PINS == {"sck": 41, "ws": 42, "sd": 47}
-    assert board.MAX98357A_PINS == {"bclk": 19, "lrc": 20, "din": 45}
-    assert board.TOUCH_PINS == {"head": 1, "back": 2}
-    assert board.SERVO_PINS == {"lf": 6, "rf": 7, "lr": 15, "rr": 16}
-    assert board.I2C_PINS == {"sda": 8, "scl": 9}
-    assert board.BUZZER_PIN == 17
-    assert board.AVOID_PINS == (35, 36, 37, 48)
-    assert board.USB_UART_BRIDGE == "CH343"
-    assert board.NATIVE_USB_ENABLED is False
-    assert board.CONSOLE_TRANSPORT == "CH343_UART"
-    assert not set(board.used_pins()) & set(board.AVOID_PINS)
-    assert {pin for pin in board.used_pins() if pin in (19, 20)} == {19, 20}
-    assert not ({19, 20} & set(board.CAMERA_PINS.values()))
-    assert not ({19, 20} & set(board.INMP441_PINS.values()))
+    assert board.CAMERA_PINS["sccb_sda"] == 40
+    assert board.CAMERA_PINS["sccb_scl"] == 39
+    assert board.PDM_MIC_PINS == {"clk": 42, "data": 41}
+    assert board.MAX98357A_PINS == {"bclk": 43, "lrc": 44, "din": 4}
+    assert board.EXTERNAL_I2C_PINS == {"sda": 5, "scl": 6}
 
 
 def test_firmware_protocol_is_byte_compatible_with_host() -> None:
@@ -371,8 +368,10 @@ def test_camera_configures_qvga_jpeg_double_buffer_psram_dma_latest() -> None:
     assert module.config["fb_count"] == 2
     assert module.config["fb_location"] == module.CAMERA_FB_IN_PSRAM
     assert module.config["grab_mode"] == module.CAMERA_GRAB_LATEST
-    assert module.config["sccb_i2c_port"] == 0
-    assert module.config["reuse_sccb_i2c"] is True
+    assert module.config["pin_sccb_sda"] == 40
+    assert module.config["pin_sccb_scl"] == 39
+    assert module.config["sccb_i2c_port"] == 1
+    assert module.config["reuse_sccb_i2c"] is False
     assert module.psram_dma is True
     assert camera.capture() == b"jpeg-a"
     assert camera.psram_free() == 7_654_321
@@ -408,7 +407,7 @@ def test_camera_recovers_after_one_transient_capture_error() -> None:
 
 def test_media_devices_degrade_safely_without_micropython_modules() -> None:
     camera = Camera(camera_module=None)
-    audio_in = AudioInput(i2s_class=None, pin_factory=None)
+    audio_in = AudioInput(pdm_module=None)
     audio_out = AudioOutput(i2s_class=None, pin_factory=None)
 
     assert camera.available is False
@@ -420,35 +419,32 @@ def test_media_devices_degrade_safely_without_micropython_modules() -> None:
     assert audio_out.write(b"pcm") == 0
 
 
-def test_i2s_devices_use_pcm16_mono_16khz_and_fixed_pins() -> None:
+def test_pdm_input_and_i2s_output_use_xiao_fixed_pins() -> None:
     FakeI2S.instances = []
-    audio_in = AudioInput(i2s_class=FakeI2S, pin_factory=pin_number)
+    pdm = FakePDMModule(chunks=[None, b"\x01\x02" * 320])
+    audio_in = AudioInput(pdm_module=pdm)
     audio_out = AudioOutput(i2s_class=FakeI2S, pin_factory=pin_number)
 
-    rx, tx = FakeI2S.instances
-    assert rx.kwargs == {
-        "sck": 41,
-        "ws": 42,
-        "sd": 47,
-        "mode": FakeI2S.RX,
-        "bits": FakeI2S.B16,
-        "format": FakeI2S.MONO,
-        "rate": 16_000,
-        "ibuf": 8_000,
+    [tx] = FakeI2S.instances
+    assert pdm.config == {
+        "clk_pin": 42,
+        "data_pin": 41,
+        "sample_rate_hz": 16_000,
+        "bits": 16,
+        "channels": 1,
+        "buffer_bytes": 8_000,
     }
     assert tx.kwargs == {
-        "sck": 19,
-        "ws": 20,
-        "sd": 45,
+        "sck": 43,
+        "ws": 44,
+        "sd": 4,
         "mode": FakeI2S.TX,
         "bits": FakeI2S.B16,
         "format": FakeI2S.MONO,
         "rate": 16_000,
         "ibuf": 8_000,
     }
-    assert rx.irq_handler is not None
     assert audio_in.read_chunk() is None
-    rx.trigger_ready()
     assert audio_in.read_chunk() == b"\x01\x02" * 320
     assert audio_in.read_chunk() is None
     assert tx.irq_handler is not None
@@ -459,22 +455,20 @@ def test_i2s_devices_use_pcm16_mono_16khz_and_fixed_pins() -> None:
 
 
 def test_audio_input_recovers_after_one_transient_read_error() -> None:
-    class FlakyI2S(FakeI2S):
-        def __init__(self, bus_id, **kwargs):
-            super().__init__(bus_id, **kwargs)
+    class FlakyPDM(FakePDMModule):
+        def __init__(self):
+            super().__init__([b"\x01\x02" * 320])
             self.read_calls = 0
 
-        def readinto(self, buffer):
+        def read(self, chunk_bytes):
             self.read_calls += 1
             if self.read_calls == 1:
-                raise OSError("temporary i2s fault")
-            return super().readinto(buffer)
+                raise OSError("temporary pdm fault")
+            return super().read(chunk_bytes)
 
-    audio = AudioInput(i2s_class=FlakyI2S, pin_factory=pin_number)
-    audio.i2s.trigger_ready()
+    audio = AudioInput(pdm_module=FlakyPDM())
     assert audio.read_chunk() is None
     assert audio.available is True
-    audio.i2s.trigger_ready()
     assert audio.read_chunk() == b"\x01\x02" * 320
 
 
@@ -814,7 +808,7 @@ def make_client(transport, *, state=None, camera=None, audio_in=None, audio_out=
         token="secret",
         boot_id="boot-1",
         camera=camera or Camera(camera_module=FakeCameraModule()),
-        audio_input=audio_in or AudioInput(i2s_class=FakeI2S, pin_factory=pin_number),
+        audio_input=audio_in or AudioInput(pdm_module=FakePDMModule()),
         audio_output=audio_out or AudioOutput(i2s_class=FakeI2S, pin_factory=pin_number),
         transport_factory=lambda _url: transport,
         state=state,
@@ -859,7 +853,7 @@ def test_media_client_reconnects_after_disconnect_without_raising() -> None:
         token="secret",
         boot_id="boot-1",
         camera=Camera(camera_module=None),
-        audio_input=AudioInput(i2s_class=None, pin_factory=None),
+        audio_input=AudioInput(pdm_module=None),
         audio_output=AudioOutput(i2s_class=None, pin_factory=None),
         transport_factory=lambda _url: transports.pop(0),
         state=state,
@@ -892,10 +886,11 @@ def test_media_client_connect_runs_inline_for_single_thread_ownership() -> None:
     assert time.perf_counter() - started >= 0.015
 
 
-def test_media_client_close_releases_camera_and_i2s_once() -> None:
+def test_media_client_close_releases_camera_pdm_and_i2s_once() -> None:
     camera_module = FakeCameraModule()
     camera = Camera(camera_module=camera_module)
-    audio_in = AudioInput(i2s_class=FakeI2S, pin_factory=pin_number)
+    pdm = FakePDMModule()
+    audio_in = AudioInput(pdm_module=pdm)
     audio_out = AudioOutput(i2s_class=FakeI2S, pin_factory=pin_number)
     client = make_client(FakeTransport(), camera=camera, audio_in=audio_in, audio_out=audio_out)
 
@@ -903,7 +898,8 @@ def test_media_client_close_releases_camera_and_i2s_once() -> None:
     client.close()
 
     assert camera_module.deinit_calls == 1
-    assert audio_in.i2s is None
+    assert pdm.deinit_calls == 1
+    assert audio_in.pdm is None
     assert audio_out.i2s is None
 
 
@@ -940,7 +936,7 @@ def test_tts_downlink_keeps_video_but_pauses_audio_until_tts_end() -> None:
     assert output.i2s.writes == [tts_payload[:1024], tts_payload[1024:]]
 
     client.handle_incoming(OP_TEXT, b'{"kind":"tts_end"}')
-    client.audio_input.i2s.trigger_ready()
+    client.audio_input.pdm.chunks.append(b"\x01\x02" * 320)
     client.collect(200, event_boost=False)
     assert client.state["audio_state"] == "listening"
     assert [frame.kind for frame in client.queue._items] == [KIND_AUDIO_PCM16]
@@ -976,7 +972,7 @@ def test_tts_zero_write_retries_and_playback_timeout_cannot_stick_speaking() -> 
         token="secret",
         boot_id="boot-1",
         camera=Camera(camera_module=None),
-        audio_input=AudioInput(i2s_class=None, pin_factory=None),
+        audio_input=AudioInput(pdm_module=None),
         audio_output=output,
         transport_factory=lambda _url: transport,
         tts_playback_timeout_ms=100,
@@ -1011,7 +1007,7 @@ def test_tts_receive_progress_refreshes_stall_timeout() -> None:
         token="secret",
         boot_id="boot-1",
         camera=Camera(camera_module=None),
-        audio_input=AudioInput(i2s_class=None, pin_factory=None),
+        audio_input=AudioInput(pdm_module=None),
         audio_output=output,
         transport_factory=lambda _url: transport,
         tts_playback_timeout_ms=100,
@@ -1035,7 +1031,7 @@ def test_tts_write_progress_refreshes_stall_timeout_during_long_playback() -> No
         token="secret",
         boot_id="boot-1",
         camera=Camera(camera_module=None),
-        audio_input=AudioInput(i2s_class=None, pin_factory=None),
+        audio_input=AudioInput(pdm_module=None),
         audio_output=output,
         transport_factory=lambda _url: transport,
         tts_playback_timeout_ms=100,

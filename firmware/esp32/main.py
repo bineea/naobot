@@ -27,6 +27,7 @@ from config import (
 from control.motion_controller import MotionController
 from hardware.buzzer import Buzzer
 from hardware.display import Display
+from hardware.i2c import SharedI2C
 from hardware.imu import IMU
 from hardware.power import PowerMonitor
 from hardware.servo import ServoBank
@@ -115,7 +116,15 @@ class FirmwareProtocol:
             "source": "firmware",
             "uptime_ms": now_ms(),
             "battery_pct": power.battery_pct,
-            "posture": imu.read_posture(),
+            "voltage_mv": getattr(power, "voltage_mv", None),
+            "current_ma": getattr(power, "current_ma", None),
+            "charging": getattr(power, "charging", None),
+            "external_power": getattr(power, "external_power", None),
+            "power_fault": getattr(power, "fault", "unknown"),
+            "power_available": getattr(power, "available", False),
+            "power_level": getattr(power, "level", "unknown"),
+            "posture": getattr(imu, "posture", "unknown"),
+            "servo_output_enabled": state.get("servo_output_enabled", False),
             "local_loop_ms": state.get("local_loop_ms", 0),
             "local_loop_interval_ms": state.get("local_loop_interval_ms", 0),
             "local_loop_overrun_ms": state.get("local_loop_overrun_ms", 0),
@@ -385,11 +394,12 @@ async def network_loop(display, power, imu, actions, safety, protocol, state, mo
 
 
 async def main():
-    display = Display()
-    imu = IMU()
-    power = PowerMonitor()
-    touch = TouchInputs()
-    servos = ServoBank()
+    shared_i2c = SharedI2C.get()
+    display = Display(i2c=shared_i2c)
+    imu = IMU(i2c=shared_i2c)
+    power = PowerMonitor(i2c=shared_i2c)
+    touch = TouchInputs(i2c=shared_i2c)
+    servos = ServoBank(i2c=shared_i2c)
     buzzer = Buzzer()
     actions = ActionPlayer(servos, display, buzzer)
     safety = SafetyGuard(power, imu)
@@ -406,6 +416,7 @@ async def main():
         "local_loop_ms": 0,
         "local_loop_interval_ms": 0,
         "local_loop_overrun_ms": 0,
+        "servo_output_enabled": servos.enabled,
         "media": media_state,
     }
 
@@ -427,6 +438,9 @@ async def main():
     try:
         while True:
             loop_start = now_ms()
+            power.sample()
+            imu.read_posture()
+            network_state["servo_output_enabled"] = servos.enabled
             network_state["media"] = media_worker.snapshot()
             if previous_loop_start is not None:
                 network_state["local_loop_interval_ms"] = max(

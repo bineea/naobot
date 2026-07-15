@@ -1,25 +1,16 @@
 try:
-    from machine import I2C, Pin
-except ImportError:
-    I2C = None
-    Pin = None
-
-try:
     import utime as time
 except ImportError:
     import time
 
 from config import (
-    I2C_FREQ,
-    I2C_ID,
-    I2C_SCL,
-    I2C_SDA,
     MPU6050_ADDR,
     MPU6050_CALIBRATION_SAMPLES,
     POSTURE_FALLEN_AXIS_MIN,
     POSTURE_FALLEN_Z_MAX,
     POSTURE_UPRIGHT_Z_MIN,
 )
+from hardware.i2c import SharedI2C
 
 PWR_MGMT_1 = 0x6B
 CONFIG = 0x1A
@@ -45,7 +36,7 @@ class IMU:
         }
 
         try:
-            self.i2c = self.i2c or self._create_i2c()
+            self.i2c = self.i2c if self.i2c is not None else self._create_i2c()
             if not self.i2c:
                 raise RuntimeError("i2c unavailable")
             if not self._device_present():
@@ -61,9 +52,7 @@ class IMU:
             print("imu fallback:", exc)
 
     def _create_i2c(self):
-        if not I2C or not Pin:
-            return None
-        return I2C(I2C_ID, scl=Pin(I2C_SCL), sda=Pin(I2C_SDA), freq=I2C_FREQ)
+        return SharedI2C.get()
 
     def _device_present(self):
         if not hasattr(self.i2c, "scan"):
@@ -162,4 +151,4 @@ class IMU:
         return self.posture
 
     def is_fault(self):
-        return self.read_posture() not in ("upright", "sitting")
+        return self.posture not in ("upright", "sitting")
