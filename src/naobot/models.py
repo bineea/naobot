@@ -91,7 +91,18 @@ class Envelope(BaseModel):
 
 class RobotState(BaseModel):
     mode: RobotMode = RobotMode.READY_LOCAL
-    battery_pct: int = 100
+    battery_pct: int | None = None
+    soc_precise: bool = False
+    power_source: str = "none"
+    pack_voltage_mv: int | None = None
+    cell_voltage_mv: int | None = None
+    current_ma: int | None = None
+    power_mw: int | None = None
+    charging: bool | None = None
+    series_count: int | None = None
+    power_available: bool = False
+    power_fault: bool | str = "unknown"
+    power_level: str = "unknown"
     posture: str = "upright"
     agent_connected: bool = False
     last_event: str | None = None
@@ -116,7 +127,9 @@ class RobotState(BaseModel):
 
     @field_validator("battery_pct")
     @classmethod
-    def battery_range(cls, value: int) -> int:
+    def battery_range(cls, value: int | None) -> int | None:
+        if value is None:
+            return None
         if value < 0 or value > 100:
             raise ValueError("battery_pct must be between 0 and 100")
         return value

@@ -272,6 +272,64 @@ def test_servo_emergency_latch_blocks_every_future_pwm_write() -> None:
     assert ("oe", 1, 0) not in events[events_after_emergency:]
 
 
+def test_servo_repeated_emergency_returns_cached_success_without_more_writes() -> None:
+    bus = FakeI2C(devices=(0x40,))
+    servos = ServoBank(i2c=bus, pin_factory=FakePin)
+    assert servos.pose({"lf": 90}) is True
+
+    assert servos.emergency_off() is True
+    writes_after_first = len(bus.writes)
+
+    assert servos.emergency_off() is True
+    assert len(bus.writes) == writes_after_first
+
+
+def test_servo_emergency_reports_oe_high_failure_and_caches_failure() -> None:
+    class FailingEmergencyPin:
+        OUT = 1
+        fail_high = False
+
+        def __init__(self, number, mode=None):
+            self.number = number
+
+        def value(self, value=None):
+            if value == 1 and self.fail_high:
+                raise OSError("oe stuck low")
+            return value
+
+    bus = FakeI2C(devices=(0x40,))
+    servos = ServoBank(i2c=bus, pin_factory=FailingEmergencyPin)
+    assert servos.pose({"lf": 90}) is True
+    writes_before_emergency = len(bus.writes)
+    FailingEmergencyPin.fail_high = True
+
+    assert servos.emergency_off() is False
+    assert servos.enabled is True
+    assert servos.emergency_off() is False
+    assert len(bus.writes) == writes_before_emergency
+
+
+def test_servo_emergency_reports_pca_clear_failure_and_caches_failure() -> None:
+    class FailingClearI2C(FakeI2C):
+        fail_clear = False
+
+        def writeto_mem(self, address, register, data):
+            if self.fail_clear and register == 0xFA:
+                raise OSError("pca clear failed")
+            super().writeto_mem(address, register, data)
+
+    bus = FailingClearI2C(devices=(0x40,))
+    servos = ServoBank(i2c=bus, pin_factory=FakePin)
+    assert servos.pose({"lf": 90}) is True
+    bus.fail_clear = True
+
+    assert servos.emergency_off() is False
+    assert servos.enabled is False
+    writes_after_first = len(bus.writes)
+    assert servos.emergency_off() is False
+    assert len(bus.writes) == writes_after_first
+
+
 def test_servo_output_gate_raises_oe_during_construction() -> None:
     events = []
     FakePin.events = events
@@ -339,7 +397,7 @@ def test_power_monitor_reads_multicell_gauge_snapshot() -> None:
         "cell_voltage_mv": 3800,
         "current_ma": -120,
         "power_mw": -912,
-        "charging": True,
+        "charging": False,
         "series_count": 2,
         "fault": False,
         "available": True,

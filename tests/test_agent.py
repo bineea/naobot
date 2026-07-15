@@ -126,6 +126,49 @@ def test_heartbeat_updates_control_state_with_host_receive_time(tmp_path, monkey
     assert agent.status()["robot"]["local_loop_overrun_ms"] == 3
 
 
+def test_agent_preserves_missing_soc_and_accepts_explicit_unknown_power_state(tmp_path) -> None:
+    agent = NaobotAgent(Settings(runtime_dir=tmp_path), llm=RuleBasedLLMClient())
+    agent.state.battery_pct = 64
+
+    agent.update_state_from_envelope(
+        Envelope(type=MessageType.HEARTBEAT, payload={"source": "bq34z100"})
+    )
+    assert agent.state.battery_pct == 64
+
+    agent.update_state_from_envelope(
+        Envelope(
+            type=MessageType.HEARTBEAT,
+            payload={
+                "battery_pct": None,
+                "soc_precise": False,
+                "source": "ina226_voltage_fallback",
+                "pack_voltage_mv": 14100,
+                "cell_voltage_mv": 3525,
+                "current_ma": -85,
+                "power_mw": -1199,
+                "charging": True,
+                "series_count": 4,
+                "power_available": True,
+                "power_fault": False,
+                "level": "normal",
+            },
+        )
+    )
+
+    assert agent.state.battery_pct is None
+    assert agent.state.soc_precise is False
+    assert agent.state.power_source == "ina226_voltage_fallback"
+    assert agent.state.pack_voltage_mv == 14100
+    assert agent.state.cell_voltage_mv == 3525
+    assert agent.state.current_ma == -85
+    assert agent.state.power_mw == -1199
+    assert agent.state.charging is True
+    assert agent.state.series_count == 4
+    assert agent.state.power_available is True
+    assert agent.state.power_fault is False
+    assert agent.state.power_level == "normal"
+
+
 @pytest.mark.parametrize(
     "message_type",
     [MessageType.EVENT, MessageType.STATUS, MessageType.ACK, MessageType.ERROR],

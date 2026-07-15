@@ -42,7 +42,7 @@ class NaobotAgent:
         self._mark_robot_seen(received_ms)
         if envelope.type == MessageType.EVENT:
             self.state.last_event = payload.get("name")
-            self.state.battery_pct = int(payload.get("battery_pct", self.state.battery_pct))
+            self._update_power_state(payload)
             self.state.posture = payload.get("posture", self.state.posture)
             self._update_control_state(payload)
             if payload.get("name") == "battery_low":
@@ -50,7 +50,7 @@ class NaobotAgent:
             elif payload.get("name") == "fall_detected":
                 self.state.mode = RobotMode.FAULT
         elif envelope.type in {MessageType.STATUS, MessageType.HEARTBEAT}:
-            self.state.battery_pct = int(payload.get("battery_pct", self.state.battery_pct))
+            self._update_power_state(payload)
             self.state.posture = payload.get("posture", self.state.posture)
             self._update_control_state(payload)
             if envelope.type == MessageType.HEARTBEAT:
@@ -61,6 +61,35 @@ class NaobotAgent:
                     self.state.remote_uptime_ms = int(payload["uptime_ms"])
             if payload.get("mode"):
                 self.state.mode = RobotMode(payload["mode"])
+
+    def _update_power_state(self, payload: dict) -> None:
+        if "battery_pct" in payload:
+            battery_pct = payload["battery_pct"]
+            self.state.battery_pct = None if battery_pct is None else int(battery_pct)
+        if "soc_precise" in payload:
+            self.state.soc_precise = bool(payload["soc_precise"])
+        source = payload.get("source")
+        if source in {"bq34z100", "bq34z100+ina226", "ina226_voltage_fallback", "none"}:
+            self.state.power_source = source
+        for field in (
+            "pack_voltage_mv",
+            "cell_voltage_mv",
+            "current_ma",
+            "power_mw",
+            "series_count",
+        ):
+            if field in payload:
+                value = payload[field]
+                setattr(self.state, field, None if value is None else int(value))
+        if "charging" in payload:
+            charging = payload["charging"]
+            self.state.charging = None if charging is None else bool(charging)
+        if "power_available" in payload:
+            self.state.power_available = bool(payload["power_available"])
+        if "power_fault" in payload:
+            self.state.power_fault = payload["power_fault"]
+        if "level" in payload:
+            self.state.power_level = str(payload["level"])
 
     def _mark_robot_seen(self, received_ms: int) -> None:
         self.state.last_robot_seen_ms = received_ms

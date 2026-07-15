@@ -52,7 +52,11 @@ class PolicyGuard:
             for action in actions:
                 if is_movement_action(action.name):
                     return PolicyResult(False, f"{state.mode} 状态拒绝运动动作")
-        if state.battery_pct <= self.low_battery_threshold:
+        if state.battery_pct is None:
+            for action in actions:
+                if is_movement_action(action.name):
+                    return PolicyResult(False, "电量未知，拒绝运动动作")
+        elif state.battery_pct <= self.low_battery_threshold:
             for action in actions:
                 if is_movement_action(action.name):
                     return PolicyResult(False, "低电量拒绝运动动作")

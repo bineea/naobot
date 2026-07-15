@@ -3,7 +3,9 @@ from naobot.policy import PolicyGuard
 
 
 def test_policy_allows_safe_action() -> None:
-    result = PolicyGuard().validate_actions([Action(name="wave", args={"level": 1})], RobotState())
+    result = PolicyGuard().validate_actions(
+        [Action(name="wave", args={"level": 1})], RobotState(battery_pct=80)
+    )
     assert result.accepted
 
 
@@ -20,6 +22,23 @@ def test_policy_rejects_low_battery_movement() -> None:
     assert "低电量" in result.reason
 
 
+def test_policy_rejects_movement_when_battery_soc_is_unknown() -> None:
+    state = RobotState(battery_pct=None)
+
+    result = PolicyGuard().validate_actions([Action(name="wave", args={"level": 1})], state)
+
+    assert not result.accepted
+    assert "电量未知" in result.reason
+
+
+def test_policy_allows_non_movement_when_battery_soc_is_unknown() -> None:
+    result = PolicyGuard().validate_actions(
+        [Action(name="chirp", args={"tone": "soft"})], RobotState(battery_pct=None)
+    )
+
+    assert result.accepted
+
+
 def test_policy_rejects_expired_intent() -> None:
     envelope = Envelope(
         type=MessageType.INTENT,
@@ -27,7 +46,7 @@ def test_policy_rejects_expired_intent() -> None:
         deadline_ms=100,
         payload={"actions": [{"name": "blink", "args": {}}]},
     )
-    result = PolicyGuard().validate_intent(envelope, RobotState())
+    result = PolicyGuard().validate_intent(envelope, RobotState(battery_pct=80))
     assert not result.accepted
     assert "过期" in result.reason
 
@@ -51,7 +70,7 @@ def test_policy_allows_semantic_intent() -> None:
         },
     )
 
-    result = PolicyGuard().validate_intent(envelope, RobotState())
+    result = PolicyGuard().validate_intent(envelope, RobotState(battery_pct=80))
 
     assert result.accepted
 

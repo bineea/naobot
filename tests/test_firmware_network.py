@@ -292,14 +292,18 @@ def test_firmware_protocol_event_shape() -> None:
 
 def test_firmware_protocol_heartbeat_includes_link_health_payload() -> None:
     class Power:
-        battery_pct = 77
-        voltage_mv = 3890
+        battery_pct = None
+        soc_precise = False
+        pack_voltage_mv = 14100
+        cell_voltage_mv = 3525
         current_ma = -85
+        power_mw = -1199
         charging = True
-        external_power = True
+        series_count = 4
         fault = False
         available = True
         level = "normal"
+        source = "ina226_voltage_fallback"
 
     class Imu:
         posture = "upright"
@@ -320,19 +324,63 @@ def test_firmware_protocol_heartbeat_includes_link_health_payload() -> None:
     )
 
     assert heartbeat["type"] == "heartbeat"
-    assert heartbeat["payload"]["source"] == "firmware"
+    assert heartbeat["payload"]["source"] == "ina226_voltage_fallback"
     assert heartbeat["payload"]["agent_online"] is True
     assert heartbeat["payload"]["local_loop_ms"] == 4
     assert heartbeat["payload"]["control_authority"] == "skill"
     assert heartbeat["payload"]["motion_state"] == "wave"
-    assert heartbeat["payload"]["voltage_mv"] == 3890
+    assert heartbeat["payload"]["battery_pct"] is None
+    assert heartbeat["payload"]["soc_precise"] is False
+    assert heartbeat["payload"]["pack_voltage_mv"] == 14100
+    assert heartbeat["payload"]["cell_voltage_mv"] == 3525
     assert heartbeat["payload"]["current_ma"] == -85
+    assert heartbeat["payload"]["power_mw"] == -1199
     assert heartbeat["payload"]["charging"] is True
-    assert heartbeat["payload"]["external_power"] is True
+    assert heartbeat["payload"]["series_count"] == 4
     assert heartbeat["payload"]["power_fault"] is False
     assert heartbeat["payload"]["power_available"] is True
-    assert heartbeat["payload"]["power_level"] == "normal"
+    assert heartbeat["payload"]["level"] == "normal"
     assert heartbeat["payload"]["servo_output_enabled"] is True
+    assert "voltage_mv" not in heartbeat["payload"]
+    assert "external_power" not in heartbeat["payload"]
+    assert "power_level" not in heartbeat["payload"]
+
+
+def test_firmware_heartbeat_exposes_failed_reflex_shutdown_without_success_claim() -> None:
+    class Power:
+        battery_pct = None
+        soc_precise = False
+        pack_voltage_mv = None
+        cell_voltage_mv = None
+        current_ma = None
+        power_mw = None
+        charging = None
+        series_count = 4
+        fault = "power_devices_unavailable"
+        available = False
+        level = "unknown"
+        source = "none"
+
+    class Imu:
+        posture = "fault"
+
+    class FailedReflex:
+        def status(self, motion_state="idle"):
+            return {
+                "control_authority": "emergency",
+                "reflex_state": "fault",
+                "motion_state": motion_state,
+                "last_reflex": "fall_shutdown_failed",
+                "shutdown_succeeded": False,
+            }
+
+    heartbeat = firmware_main.FirmwareProtocol("kt2-test").heartbeat(
+        Power(), Imu(), FailedReflex()
+    )
+
+    assert heartbeat["payload"]["reflex_state"] == "fault"
+    assert heartbeat["payload"]["last_reflex"] == "fall_shutdown_failed"
+    assert heartbeat["payload"]["shutdown_succeeded"] is False
 
 
 def test_execute_intent_runs_safe_actions_and_acks() -> None:

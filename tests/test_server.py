@@ -107,7 +107,7 @@ def test_health_and_status(tmp_path) -> None:
     client = make_client(tmp_path, media_service=FakeMediaService())
     assert client.get("/health").json() == {"status": "ok"}
     status = client.get("/api/status").json()
-    assert status["robot"]["battery_pct"] == 100
+    assert status["robot"]["battery_pct"] is None
     assert status["llm_configured"] is False
     assert status["media"]["current_person"] == "person-1"
     assert status["media"]["session_trigger"] == "touch"
@@ -176,6 +176,67 @@ def test_dashboard_contains_complete_home_and_diagnostics_observability(tmp_path
         "statusDump",
     ):
         assert f'id="{element_id}"' in html
+    assert "robot.battery_pct == null ? '-'" in html
+
+
+@pytest.mark.parametrize(
+    ("power_payload", "expected_source", "expected_available"),
+    (
+        (
+            {
+                "battery_pct": None,
+                "soc_precise": False,
+                "source": "ina226_voltage_fallback",
+                "pack_voltage_mv": 14100,
+                "cell_voltage_mv": 3525,
+                "current_ma": -85,
+                "power_mw": -1199,
+                "charging": True,
+                "series_count": 4,
+                "power_available": True,
+                "power_fault": False,
+                "level": "normal",
+            },
+            "ina226_voltage_fallback",
+            True,
+        ),
+        (
+            {
+                "battery_pct": None,
+                "soc_precise": False,
+                "source": "none",
+                "pack_voltage_mv": None,
+                "cell_voltage_mv": None,
+                "current_ma": None,
+                "power_mw": None,
+                "charging": None,
+                "series_count": 4,
+                "power_available": False,
+                "power_fault": "power_devices_unavailable",
+                "level": "unknown",
+            },
+            "none",
+            False,
+        ),
+    ),
+)
+def test_robot_heartbeat_nullable_power_reaches_status_api(
+    tmp_path, power_payload, expected_source, expected_available
+) -> None:
+    client = make_client(tmp_path, media_service=FakeMediaService())
+    heartbeat = Envelope(type=MessageType.HEARTBEAT, seq=7, payload=power_payload)
+
+    with client.websocket_connect("/ws/kt2") as websocket:
+        assert websocket.receive_json()["type"] == "heartbeat"
+        websocket.send_json(heartbeat.model_dump())
+        robot = client.get("/api/status").json()["robot"]
+
+    assert robot["battery_pct"] is None
+    assert robot["soc_precise"] is False
+    assert robot["power_source"] == expected_source
+    assert robot["power_available"] is expected_available
+    assert robot["pack_voltage_mv"] == power_payload["pack_voltage_mv"]
+    assert robot["power_fault"] == power_payload["power_fault"]
 
 
 def test_dashboard_preserves_management_controls(tmp_path) -> None:

@@ -61,6 +61,7 @@ class FakeServos:
         self.emergency_latched = True
         self.enabled = False
         self.calls.append(("emergency_off",))
+        return True
 
 
 class FakeDisplay:
@@ -111,8 +112,9 @@ def test_emergency_stop_latches_servo_output_before_display() -> None:
 
     class OrderedServos(FakeServos):
         def emergency_off(self):
-            super().emergency_off()
+            result = super().emergency_off()
             events.append("emergency_off")
+            return result
 
     class OrderedDisplay(FakeDisplay):
         def set_face(self, face):
@@ -160,6 +162,32 @@ def test_critical_battery_never_reenables_servo_for_sit() -> None:
 
     assert [call[0] for call in servos.calls] == ["emergency_off"]
     assert reflex.last_reflex == "low_battery_stop"
+
+
+@pytest.mark.parametrize(
+    ("power", "imu", "expected_reflex"),
+    (
+        (FakePower(), FakeImu(fault=True), "fall_shutdown_failed"),
+        (FakePower(low=True), FakeImu(), "low_battery_shutdown_failed"),
+    ),
+)
+def test_reflex_reports_shutdown_failure_and_enters_fault(power, imu, expected_reflex) -> None:
+    class FailingEmergencyServos(FakeServos):
+        def emergency_off(self):
+            self.calls.append(("emergency_off",))
+            return False
+
+    servos = FailingEmergencyServos()
+    display = FakeDisplay()
+    actions = ActionPlayer(servos, display, FakeBuzzer())
+    reflex = ReflexController(power, imu, actions, display)
+
+    assert reflex.check() and reflex.run()
+
+    assert reflex.last_reflex == expected_reflex
+    assert reflex.state == "fault"
+    assert reflex.status()["reflex_state"] == "fault"
+    assert reflex.status()["shutdown_succeeded"] is False
 
 
 def test_reflex_controller_can_trigger_same_fall_again_after_recovery() -> None:

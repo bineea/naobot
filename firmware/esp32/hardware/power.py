@@ -14,6 +14,7 @@ from config import (
     INA226_ADDR,
     INA226_CALIBRATION,
     INA226_CONFIG,
+    INA226_CONVERSION_READY_MS,
     INA226_CURRENT_LSB_UA,
     POWER_SAMPLE_INTERVAL_MS,
 )
@@ -33,11 +34,13 @@ BQ34Z100_SAFETY_FLAGS = 0xFC00
 
 INA226_CONFIGURATION = 0x00
 INA226_BUS_VOLTAGE = 0x02
-INA226_POWER = 0x03
 INA226_CURRENT = 0x04
 INA226_CALIBRATION_REGISTER = 0x05
+INA226_MASK_ENABLE = 0x06
 INA226_BUS_VOLTAGE_LSB_UV = 1250
-INA226_POWER_LSB_MW = (25 * INA226_CURRENT_LSB_UA) // 1000
+INA226_MASK_CVRF = 1 << 3
+INA226_MASK_OVF = 1 << 2
+CURRENT_POLARITY_CONFLICT_MIN_MA = 100
 
 
 def now_ms():
@@ -52,6 +55,12 @@ def ticks_diff(end, start):
     return end - start
 
 
+def ticks_add(start, delta):
+    if hasattr(time, "ticks_add"):
+        return time.ticks_add(start, delta)
+    return start + delta
+
+
 class PowerMonitor:
     def __init__(self, i2c=None, series_count=BATTERY_SERIES_COUNT, clock_ms=now_ms):
         self.i2c = i2c if i2c is not None else SharedI2C.get()
@@ -59,6 +68,7 @@ class PowerMonitor:
         self._clock_ms = clock_ms
         self._last_sample_ms = None
         self._ina_configured = False
+        self._ina_ready_at_ms = None
         self._set_unknown("unknown")
         self.sample(force=True)
 
@@ -106,7 +116,7 @@ class PowerMonitor:
             "flags": self._read_le_u16(BQ34Z100_ADDR, BQ34Z100_FLAGS),
         }
 
-    def _read_ina226(self):
+    def _read_ina226(self, sample_ms):
         if not self._ina_configured:
             self._write_be_u16(INA226_ADDR, INA226_CONFIGURATION, INA226_CONFIG)
             self._write_be_u16(
@@ -115,13 +125,26 @@ class PowerMonitor:
                 INA226_CALIBRATION,
             )
             self._ina_configured = True
+            self._ina_ready_at_ms = ticks_add(sample_ms, INA226_CONVERSION_READY_MS)
+            return {"status": "pending"}
+        if ticks_diff(sample_ms, self._ina_ready_at_ms) < 0:
+            return {"status": "pending"}
+
+        mask = self._read_be_u16(INA226_ADDR, INA226_MASK_ENABLE)
+        if mask & INA226_MASK_OVF:
+            return {"status": "overflow"}
+        if not mask & INA226_MASK_CVRF:
+            return {"status": "pending"}
+
         bus_raw = self._read_be_u16(INA226_ADDR, INA226_BUS_VOLTAGE)
-        power_raw = self._read_be_u16(INA226_ADDR, INA226_POWER)
         current_raw = self._read_be_s16(INA226_ADDR, INA226_CURRENT)
+        pack_voltage_mv = (bus_raw * INA226_BUS_VOLTAGE_LSB_UV + 500) // 1000
+        current_ma = (current_raw * INA226_CURRENT_LSB_UA) // 1000
         return {
-            "pack_voltage_mv": (bus_raw * INA226_BUS_VOLTAGE_LSB_UV + 500) // 1000,
-            "current_ma": (current_raw * INA226_CURRENT_LSB_UA) // 1000,
-            "power_mw": power_raw * INA226_POWER_LSB_MW,
+            "status": "ready",
+            "pack_voltage_mv": pack_voltage_mv,
+            "current_ma": current_ma,
+            "power_mw": (pack_voltage_mv * current_ma) // 1000,
         }
 
     def _try_read(self, address, reader, devices):
@@ -141,8 +164,6 @@ class PowerMonitor:
             and ticks_diff(sample_ms, self._last_sample_ms) < POWER_SAMPLE_INTERVAL_MS
         ):
             return self.snapshot()
-        self._last_sample_ms = sample_ms
-
         if not isinstance(self.series_count, int) or isinstance(self.series_count, bool):
             self._set_unknown("invalid_series_count")
             return self.snapshot()
@@ -161,9 +182,24 @@ class PowerMonitor:
                 print("power scan fallback:", exc)
 
         bq = self._try_read(BQ34Z100_ADDR, self._read_bq34z100, devices)
-        ina = self._try_read(INA226_ADDR, self._read_ina226, devices)
+        ina_result = self._try_read(
+            INA226_ADDR,
+            lambda: self._read_ina226(sample_ms),
+            devices,
+        )
+        if ina_result is not None and ina_result["status"] == "overflow":
+            source = "bq34z100+ina226" if bq is not None else "ina226_voltage_fallback"
+            self._set_unknown("ina226_overflow", source)
+            self._last_sample_ms = sample_ms
+            return self.snapshot()
+        ina_pending = ina_result is not None and ina_result["status"] == "pending"
+        ina = ina_result if ina_result is not None and ina_result["status"] == "ready" else None
         if bq is None and ina is None:
+            if ina_pending:
+                self._set_unknown(False, "ina226_voltage_fallback")
+                return self.snapshot()
             self._set_unknown("power_devices_unavailable")
+            self._last_sample_ms = sample_ms
             return self.snapshot()
 
         if bq is not None and ina is not None:
@@ -182,19 +218,32 @@ class PowerMonitor:
         self.power_mw = measurement.get("power_mw")
         if self.power_mw is None:
             self.power_mw = (self.pack_voltage_mv * self.current_ma) // 1000
-        self.charging = self.current_ma < 0
+        self.charging = bq["current_ma"] > 0 if bq is not None else self.current_ma < 0
         self.source = source
         self.flags = bq["flags"] if bq is not None else None
         self.battery_pct = bq["battery_pct"] if bq is not None else None
         self.soc_precise = bq is not None
 
+        if (
+            bq is not None
+            and ina is not None
+            and abs(bq["current_ma"]) >= CURRENT_POLARITY_CONFLICT_MIN_MA
+            and abs(ina["current_ma"]) >= CURRENT_POLARITY_CONFLICT_MIN_MA
+            and bq["current_ma"] * ina["current_ma"] > 0
+        ):
+            self._set_unknown("current_polarity_conflict", source)
+            self._last_sample_ms = sample_ms
+            return self.snapshot()
+
         pack_min_mv = BATTERY_CELL_MIN_MV * self.series_count
         pack_max_mv = BATTERY_CELL_MAX_MV * self.series_count
         if not pack_min_mv <= self.pack_voltage_mv <= pack_max_mv:
             self._set_unknown("voltage_series_mismatch", source)
+            self._last_sample_ms = sample_ms
             return self.snapshot()
         if self.flags is not None and self.flags & BQ34Z100_SAFETY_FLAGS:
             self._set_unknown("bq34z100_safety_flags", source)
+            self._last_sample_ms = sample_ms
             return self.snapshot()
 
         self.fault = False
@@ -203,6 +252,7 @@ class PowerMonitor:
             self.level = self._level_for_soc(self.battery_pct)
         else:
             self.level = self._level_for_cell_voltage(self.cell_voltage_mv)
+        self._last_sample_ms = sample_ms
         return self.snapshot()
 
     @staticmethod

@@ -193,7 +193,8 @@ class ActionPlayer:
             if name == "sleep":
                 return self._sleep()
             if name == "stop":
-                self.stop()
+                if not self.stop():
+                    return ActionResult(False, "servo shutdown failed")
                 return ActionResult(True)
         except Exception as exc:
             return ActionResult(False, str(exc))
@@ -310,13 +311,12 @@ class ActionPlayer:
         return ActionResult(True)
 
     def stop(self):
-        self.servos.stop()
+        return self.servos.stop()
 
     def emergency_stop(self):
         if hasattr(self.servos, "emergency_off"):
-            self.servos.emergency_off()
-        else:
-            self.servos.stop()
+            return self.servos.emergency_off()
+        return self.servos.stop()
 
     @property
     def emergency_latched(self):

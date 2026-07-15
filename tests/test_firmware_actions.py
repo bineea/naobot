@@ -11,6 +11,8 @@ from motion.action_player import ActionPlayer  # noqa: E402
 class FakeServos:
     def __init__(self):
         self.calls = []
+        self.emergency_result = True
+        self.stop_result = True
 
     def pose(self, positions):
         self.calls.append(("pose", dict(positions)))
@@ -22,7 +24,11 @@ class FakeServos:
 
     def stop(self):
         self.calls.append(("stop",))
-        return True
+        return self.stop_result
+
+    def emergency_off(self):
+        self.calls.append(("emergency_off",))
+        return self.emergency_result
 
 
 class FakeDisplay:
@@ -93,6 +99,19 @@ def test_sit_propagates_servo_pose_failure() -> None:
 
     assert result.accepted is False
     assert result.reason == "servo pose failed"
+
+
+def test_stop_and_emergency_stop_propagate_servo_shutdown_results() -> None:
+    player, servos, _, _ = make_player()
+    servos.stop_result = False
+    servos.emergency_result = False
+
+    assert player.stop() is False
+    assert player.emergency_stop() is False
+    stop_result = player.execute({"name": "stop", "args": {}})
+    assert stop_result.accepted is False
+    assert stop_result.reason == "servo shutdown failed"
+    assert servos.calls[-3:] == [("stop",), ("emergency_off",), ("stop",)]
 
 
 def test_wave_level_two_has_more_frames_than_level_one() -> None:

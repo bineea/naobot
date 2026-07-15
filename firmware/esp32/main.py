@@ -113,16 +113,19 @@ class FirmwareProtocol:
         state = state or {}
         media_state = state.get("media", state)
         payload = {
-            "source": "firmware",
+            "source": getattr(power, "source", "none"),
             "uptime_ms": now_ms(),
             "battery_pct": power.battery_pct,
-            "voltage_mv": getattr(power, "voltage_mv", None),
+            "soc_precise": getattr(power, "soc_precise", False),
+            "pack_voltage_mv": getattr(power, "pack_voltage_mv", None),
+            "cell_voltage_mv": getattr(power, "cell_voltage_mv", None),
             "current_ma": getattr(power, "current_ma", None),
+            "power_mw": getattr(power, "power_mw", None),
             "charging": getattr(power, "charging", None),
-            "external_power": getattr(power, "external_power", None),
+            "series_count": getattr(power, "series_count", None),
             "power_fault": getattr(power, "fault", "unknown"),
             "power_available": getattr(power, "available", False),
-            "power_level": getattr(power, "level", "unknown"),
+            "level": getattr(power, "level", "unknown"),
             "posture": getattr(imu, "posture", "unknown"),
             "servo_output_enabled": state.get("servo_output_enabled", False),
             "local_loop_ms": state.get("local_loop_ms", 0),

@@ -58,6 +58,7 @@ class ServoBank:
         self.enabled = False
         self.available = False
         self.emergency_latched = False
+        self._emergency_shutdown_result = None
         self.positions = {name: self.NEUTRAL_ANGLE for name in self.CHANNELS}
         self.output_gate = output_gate or ServoOutputGate(pin_factory=pin_factory)
         self._oe = self.output_gate._pin
@@ -154,7 +155,7 @@ class ServoBank:
 
     def emergency_off(self):
         if self.emergency_latched:
-            return False
+            return bool(self._emergency_shutdown_result)
         disabled = self.disable()
         cleared = False
         if disabled:
@@ -163,4 +164,5 @@ class ServoBank:
             except Exception as exc:
                 print("servo emergency clear failed:", exc)
         self.emergency_latched = True
-        return bool(disabled and cleared)
+        self._emergency_shutdown_result = bool(disabled and cleared)
+        return self._emergency_shutdown_result
