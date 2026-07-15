@@ -38,6 +38,7 @@ from media.runtime_worker import create_default_worker
 from motion.action_player import ActionPlayer
 from reflex.reflex_controller import ReflexController
 from safety.guard import MOVEMENT_ACTIONS, SafetyGuard
+from storage.storage_worker import create_default_worker as create_storage_worker
 
 
 def now_ms():
@@ -112,6 +113,7 @@ class FirmwareProtocol:
     def robot_payload(self, power, imu, reflex=None, motion=None, state=None):
         state = state or {}
         media_state = state.get("media", state)
+        storage_state = state.get("storage", {})
         payload = {
             "source": getattr(power, "source", "none"),
             "uptime_ms": now_ms(),
@@ -137,6 +139,11 @@ class FirmwareProtocol:
             "media_queue": media_state.get("media_queue", 0),
             "media_dropped": media_state.get("media_dropped", 0),
             "psram_free": media_state.get("psram_free", 0),
+            "sd_available": storage_state.get("available", False),
+            "sd_mounted": storage_state.get("mounted", False),
+            "storage_queue": storage_state.get("queue_depth", 0),
+            "storage_dropped": storage_state.get("dropped", 0),
+            "storage_last_error": storage_state.get("last_error"),
         }
         if reflex:
             motion_state = motion.motion_state if motion else "idle"
@@ -410,7 +417,9 @@ async def main():
     reflex = ReflexController(power, imu, actions, display, buzzer)
     protocol = FirmwareProtocol(SESSION_ID)
     media_worker = create_default_worker()
+    storage_worker = create_storage_worker()
     media_state = media_worker.snapshot()
+    storage_state = storage_worker.snapshot()
     network_state = {
         "ws": None,
         "agent_online": False,
@@ -422,6 +431,7 @@ async def main():
         "local_loop_overrun_ms": 0,
         "servo_output_enabled": servos.enabled,
         "media": media_state,
+        "storage": storage_state,
     }
 
     def _on_intent_done(intent_id, status, reason=""):
@@ -446,6 +456,7 @@ async def main():
             imu.read_posture()
             network_state["servo_output_enabled"] = servos.enabled
             network_state["media"] = media_worker.snapshot()
+            network_state["storage"] = storage_worker.snapshot()
             if previous_loop_start is not None:
                 network_state["local_loop_interval_ms"] = max(
                     0, ticks_diff(loop_start, previous_loop_start)
@@ -455,6 +466,7 @@ async def main():
                 motion.cancel("reflex")
                 reflex.run()
             motion.tick()
+            storage_worker.tick()
             event = adapter.poll()
             if event:
                 media_worker.request_event_boost(ticks_add(now_ms(), MEDIA_EVENT_BOOST_MS))
