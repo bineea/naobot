@@ -45,3 +45,17 @@
 4. `./.venv/Scripts/python.exe -m ruff check firmware/esp32/storage firmware/esp32/main.py firmware/esp32/config.py tests/test_firmware_storage.py`：通过。
 5. `./.venv/Scripts/python.exe -m py_compile firmware/esp32/storage/__init__.py firmware/esp32/storage/sd_storage.py firmware/esp32/storage/storage_worker.py firmware/esp32/main.py firmware/esp32/config.py tests/test_firmware_storage.py`：通过。
 6. `git diff --check`：通过。
+
+## 并发发布复审修复
+
+- 统一工作线程错误发布：日志失败、读取返回失败、读取异常和 shutdown `unmount()` 异常先保存为局部值，再由 `_publish_locked()` 在持锁状态下发布。
+- `_publish_item_result()` 与 `_publish_storage_snapshot()` 在同一临界区内更新 storage snapshot、`last_error`、`runtime_state` 和读取请求结果，主线程只能观察到完整快照。
+- 新增带所有权检测的锁替身与工作器子类，分别覆盖日志失败、读取失败、读取异常和 finally/unmount 异常；任何已初始化的 `_last_error` 未持锁写入都会使测试失败。
+
+## 并发发布验证
+
+1. RED：锁检测测试在旧实现中稳定捕获日志失败、读取异常与 finally/unmount 异常路径的未持锁 `_last_error` 写入。
+2. GREEN：`./.venv/Scripts/python.exe -m pytest tests/test_firmware_storage.py -q`：22 passed。
+3. `./.venv/Scripts/python.exe -m ruff check firmware/esp32/storage/storage_worker.py tests/test_firmware_storage.py`：通过。
+4. `./.venv/Scripts/python.exe -m py_compile firmware/esp32/storage/storage_worker.py tests/test_firmware_storage.py`：通过。
+5. `git diff --check`：通过。

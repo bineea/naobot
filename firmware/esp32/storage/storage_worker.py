@@ -10,6 +10,8 @@ except ImportError:
 
 from storage.sd_storage import SDStorage
 
+_UNSET = object()
+
 
 def sleep_ms(delay_ms):
     if hasattr(time, "sleep_ms"):
@@ -51,7 +53,7 @@ class StorageWorker:
             if self._state not in ("idle", "stopped"):
                 return False
             self._stop_requested = False
-            self._state = "starting"
+            self._publish_locked(runtime_state="starting")
         finally:
             self._release()
         try:
@@ -91,8 +93,7 @@ class StorageWorker:
         self._acquire()
         try:
             if len(self._queue) >= self.queue_limit:
-                self._last_error = "storage queue full"
-                self._update_queue_snapshot_locked()
+                self._publish_locked(error="storage queue full")
                 return {"accepted": False, "reason": "storage queue full"}
             request = {"accepted": True, "result": None, "error": None}
             self._queue.append(
@@ -131,6 +132,7 @@ class StorageWorker:
 
     def _run(self):
         self._set_state("running")
+        shutdown_error = _UNSET
         try:
             while not self._should_stop():
                 if not self._run_one():
@@ -139,8 +141,8 @@ class StorageWorker:
             try:
                 self._storage.unmount()
             except Exception as exc:
-                self._last_error = str(exc)
-            self._publish_storage_snapshot("stopped")
+                shutdown_error = str(exc)
+            self._publish_storage_snapshot("stopped", shutdown_error)
 
     def _run_one(self):
         self._acquire()
@@ -152,40 +154,40 @@ class StorageWorker:
         finally:
             self._release()
 
+        result = _UNSET
+        error = _UNSET
         try:
             if item["kind"] == "log":
                 if not self._storage.append_log(item["record"]):
-                    self._last_error = self._storage.snapshot()["last_error"]
+                    error = self._storage_error()
             else:
                 result = self._storage.read_update(
                     item["sequence"], item["filename"], item["offset"]
                 )
-                self._acquire()
-                try:
-                    item["request"]["result"] = result
-                    if result is None:
-                        item["request"]["error"] = self._storage.snapshot()["last_error"]
-                        self._last_error = item["request"]["error"]
-                finally:
-                    self._release()
+                if result is None:
+                    error = self._storage_error()
         except Exception as exc:
-            self._last_error = str(exc)
-            if item["kind"] == "update_read":
-                self._acquire()
-                try:
-                    item["request"]["error"] = self._last_error
-                finally:
-                    self._release()
-        self._publish_storage_snapshot()
+            error = str(exc)
+        self._publish_item_result(item, result, error)
         return True
 
-    def _publish_storage_snapshot(self, runtime_state=None):
+    def _publish_item_result(self, item, result, error):
         storage_snapshot = self._storage.snapshot()
         self._acquire()
         try:
-            if runtime_state is not None:
-                self._state = runtime_state
-            self._snapshot = self._snapshot_with_queue(storage_snapshot)
+            if item["kind"] == "update_read":
+                item["request"]["result"] = None if result is _UNSET else result
+                if error is not _UNSET:
+                    item["request"]["error"] = error
+            self._publish_locked(storage_snapshot, error=error)
+        finally:
+            self._release()
+
+    def _publish_storage_snapshot(self, runtime_state=None, error=_UNSET):
+        storage_snapshot = self._storage.snapshot()
+        self._acquire()
+        try:
+            self._publish_locked(storage_snapshot, runtime_state, error)
         finally:
             self._release()
 
@@ -207,27 +209,28 @@ class StorageWorker:
     def _set_main_error(self, error):
         self._acquire()
         try:
-            self._last_error = error
-            self._update_queue_snapshot_locked()
+            self._publish_locked(error=error)
         finally:
             self._release()
 
     def _publish_disabled(self, error):
-        self._acquire()
-        try:
-            self._state = "disabled"
-            self._last_error = error
-            self._snapshot = self._snapshot_with_queue(self._storage.snapshot())
-        finally:
-            self._release()
+        self._publish_storage_snapshot("disabled", error)
 
     def _set_state(self, state):
-        self._acquire()
-        try:
-            self._state = state
-            self._snapshot["runtime_state"] = state
-        finally:
-            self._release()
+        self._publish_storage_snapshot(runtime_state=state)
+
+    def _publish_locked(self, storage_snapshot=None, runtime_state=None, error=_UNSET):
+        if error is not _UNSET:
+            self._last_error = error
+        if runtime_state is not None:
+            self._state = runtime_state
+        if storage_snapshot is None:
+            self._update_queue_snapshot_locked()
+        else:
+            self._snapshot = self._snapshot_with_queue(storage_snapshot)
+
+    def _storage_error(self):
+        return self._storage.snapshot().get("last_error") or "storage operation failed"
 
     def _should_stop(self):
         self._acquire()

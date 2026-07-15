@@ -44,6 +44,33 @@ class GatedThread(ManualThread):
         self.thread.start()
 
 
+class InstrumentedLock:
+    def __init__(self):
+        self._lock = threading.RLock()
+        self.depth = 0
+
+    @property
+    def held(self):
+        return self.depth > 0
+
+    def acquire(self):
+        self._lock.acquire()
+        self.depth += 1
+
+    def release(self):
+        self.depth -= 1
+        self._lock.release()
+
+
+class InstrumentedThread(ManualThread):
+    def __init__(self):
+        super().__init__()
+        self.lock = InstrumentedLock()
+
+    def allocate_lock(self):
+        return self.lock
+
+
 def create_storage(tmp_path, **kwargs):
     from storage.sd_storage import SDStorage
 
@@ -66,6 +93,24 @@ def storage_worker_class():
     from storage.storage_worker import StorageWorker
 
     return StorageWorker
+
+
+def error_checked_worker_class():
+    worker_class = storage_worker_class()
+
+    class ErrorCheckedWorker(worker_class):
+        def __setattr__(self, name, value):
+            lock = self.__dict__.get("_lock")
+            if (
+                name == "_last_error"
+                and "_last_error" in self.__dict__
+                and lock is not None
+                and not lock.held
+            ):
+                raise AssertionError("_last_error must be published while holding the worker lock")
+            super().__setattr__(name, value)
+
+    return ErrorCheckedWorker
 
 
 def test_mounting_is_lazy_idempotent_and_uses_xiao_pins(tmp_path):
@@ -322,6 +367,52 @@ def test_main_side_worker_snapshot_tick_and_poll_do_not_run_blocking_storage(tmp
     worker.stop()
     storage.release.set()
     thread_module.thread.join(1)
+
+
+@pytest.mark.parametrize("mode", ["log_failure", "read_failure", "read_exception", "unmount_exception"])
+def test_worker_publishes_every_thread_error_under_lock(mode):
+    class ErrorStorage:
+        def append_log(self, _record):
+            return False
+
+        def read_update(self, *_args):
+            if mode == "read_exception":
+                raise OSError("read exploded")
+            return None
+
+        def unmount(self):
+            if mode == "unmount_exception":
+                raise OSError("unmount exploded")
+
+        @staticmethod
+        def snapshot():
+            return {
+                "available": False,
+                "mounted": False,
+                "log_bytes": 0,
+                "last_error": "storage failed",
+                "pins": {},
+            }
+
+    thread_module = InstrumentedThread()
+    worker = error_checked_worker_class()(ErrorStorage(), thread_module=thread_module)
+
+    assert worker.start() is True
+    if mode == "log_failure":
+        assert worker.submit_log({"event": "failed"}) is True
+        assert worker._run_one() is True
+    elif mode in ("read_failure", "read_exception"):
+        request = worker.submit_update_read("20260715", "firmware.bin")
+        assert worker._run_one() is True
+        assert worker.poll(request)["error"] in ("storage failed", "read exploded")
+    else:
+        assert thread_module.target is not None
+        assert worker.stop() is True
+        thread_module.target(*thread_module.args)
+
+    snapshot = worker.snapshot()
+    assert snapshot["runtime_state"] in ("starting", "stopped")
+    assert snapshot["last_error"] in ("storage failed", "read exploded", "unmount exploded")
 
 
 def test_protocol_heartbeat_includes_storage_telemetry():
