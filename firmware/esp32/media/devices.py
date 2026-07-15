@@ -5,6 +5,30 @@ PCM_CHUNK_BYTES = 640
 I2S_BUFFER_BYTES = 8000
 MAX_TRANSIENT_ERRORS = 3
 
+CAMERA_DIAGNOSTIC_DEFAULTS = {
+    "initialized": False,
+    "init_err": 0,
+    "sensor_pid": None,
+    "sensor_name": None,
+    "frame_size": None,
+    "pixel_format": None,
+    "jpeg_quality": None,
+    "fb_count": None,
+    "psram_free": 0,
+    "capture_errors": 0,
+}
+
+PDM_STATS_DEFAULTS = {
+    "initialized": False,
+    "rate_hz": 0,
+    "queued_bytes": 0,
+    "dropped_bytes": 0,
+    "read_bytes": 0,
+    "read_calls": 0,
+    "overruns": 0,
+    "last_error": 0,
+}
+
 
 def _load_camera_module():
     try:
@@ -40,6 +64,9 @@ class Camera:
         self.last_error = None
         self._closed = False
         self._error_count = 0
+        self.sensor_name = None
+        self.sensor_pid = None
+        self.health = dict(CAMERA_DIAGNOSTIC_DEFAULTS)
         if self.module is None:
             return
         try:
@@ -73,9 +100,13 @@ class Camera:
             initialized = self.module.init(config)
             dma_enabled = self.module.set_psram_dma(True)
             self.available = initialized is not False and dma_enabled is not False
+            has_diagnostics = self._refresh_diagnostics()
+            if has_diagnostics:
+                self.available = self.available and bool(self.health["initialized"])
         except Exception as exc:
             self.last_error = exc
             self.available = False
+            self._refresh_diagnostics()
 
     def capture(self):
         if not self.available:
@@ -101,6 +132,29 @@ class Camera:
         except Exception:
             return 0
 
+    def diagnostics(self):
+        self._refresh_diagnostics()
+        return dict(self.health)
+
+    def _refresh_diagnostics(self):
+        if self.module is None or not hasattr(self.module, "diagnostics"):
+            return False
+        try:
+            diagnostics = self.module.diagnostics()
+        except Exception as exc:
+            self.last_error = exc
+            return False
+        if not isinstance(diagnostics, dict):
+            return False
+        updated = dict(CAMERA_DIAGNOSTIC_DEFAULTS)
+        for key in updated:
+            if key in diagnostics:
+                updated[key] = diagnostics[key]
+        self.health = updated
+        self.sensor_name = updated["sensor_name"]
+        self.sensor_pid = updated["sensor_pid"]
+        return True
+
     def close(self):
         if self._closed:
             return
@@ -120,6 +174,7 @@ class AudioInput:
         self.chunk_bytes = chunk_bytes
         self.last_error = None
         self._error_count = 0
+        self.health = dict(PDM_STATS_DEFAULTS)
         if self.pdm is None:
             return
         try:
@@ -134,6 +189,9 @@ class AudioInput:
                 buffer_bytes=I2S_BUFFER_BYTES,
             )
             self.available = initialized is not False
+            has_stats = self._refresh_stats()
+            if has_stats:
+                self.available = self.available and bool(self.health["initialized"])
         except Exception as exc:
             self.last_error = exc
             self._deinit()
@@ -142,7 +200,11 @@ class AudioInput:
         if not self.available or self.pdm is None:
             return None
         try:
+            if hasattr(self.pdm, "available") and not self.pdm.available():
+                self._refresh_stats()
+                return None
             payload = self.pdm.read(self.chunk_bytes)
+            self._refresh_stats()
             if not payload:
                 return None
             self._error_count = 0
@@ -154,6 +216,27 @@ class AudioInput:
                 self.available = False
             return None
 
+    def stats(self):
+        self._refresh_stats()
+        return dict(self.health)
+
+    def _refresh_stats(self):
+        if self.pdm is None or not hasattr(self.pdm, "stats"):
+            return False
+        try:
+            stats = self.pdm.stats()
+        except Exception as exc:
+            self.last_error = exc
+            return False
+        if not isinstance(stats, dict):
+            return False
+        updated = dict(PDM_STATS_DEFAULTS)
+        for key in updated:
+            if key in stats:
+                updated[key] = stats[key]
+        self.health = updated
+        return True
+
     def close(self):
         self.available = False
         self._deinit()
@@ -164,6 +247,7 @@ class AudioInput:
         try:
             if hasattr(self.pdm, "deinit"):
                 self.pdm.deinit()
+                self._refresh_stats()
         except Exception as exc:
             self.last_error = exc
         self.pdm = None

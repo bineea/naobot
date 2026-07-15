@@ -93,7 +93,7 @@ class MediaRuntimeWorker:
     def snapshot(self):
         self._acquire()
         try:
-            return dict(self._snapshot)
+            return self._copy_snapshot(self._snapshot)
         finally:
             self._release()
 
@@ -114,6 +114,7 @@ class MediaRuntimeWorker:
             while not self._should_stop():
                 private_state["event_boost_until_ms"] = self._read_event_boost()
                 connected = bool(client.step())
+                self._sample_diagnostics(client, private_state)
                 self._publish(private_state, "running")
                 delay = self.active_delay_ms if connected else self.reconnect_delay_ms
                 self._sleep_interruptibly(delay)
@@ -152,6 +153,10 @@ class MediaRuntimeWorker:
             "psram_free": int(client_state.get("psram_free", 0)),
             "last_error": error,
         }
+        if "camera_sensor" in client_state:
+            snapshot["camera_sensor"] = self._copy_dict(client_state["camera_sensor"])
+        if "pdm" in client_state:
+            snapshot["pdm"] = self._copy_dict(client_state["pdm"])
         self._acquire()
         try:
             self._snapshot = snapshot
@@ -172,9 +177,46 @@ class MediaRuntimeWorker:
 
     @staticmethod
     def _with_runtime(snapshot, runtime_state):
-        updated = dict(snapshot)
+        updated = MediaRuntimeWorker._copy_snapshot(snapshot)
         updated["runtime_state"] = runtime_state
         return updated
+
+    @staticmethod
+    def _copy_dict(value):
+        return dict(value) if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _copy_snapshot(snapshot):
+        updated = dict(snapshot)
+        if "camera_sensor" in snapshot:
+            updated["camera_sensor"] = MediaRuntimeWorker._copy_dict(snapshot["camera_sensor"])
+        if "pdm" in snapshot:
+            updated["pdm"] = MediaRuntimeWorker._copy_dict(snapshot["pdm"])
+        return updated
+
+    @staticmethod
+    def _sample_diagnostics(client, client_state):
+        camera = getattr(client, "camera", None)
+        diagnostics = getattr(camera, "diagnostics", None)
+        if diagnostics is not None:
+            try:
+                client_state["camera_sensor"] = MediaRuntimeWorker._copy_dict(diagnostics())
+            except Exception as exc:
+                client_state["camera_sensor"] = {
+                    "initialized": False,
+                    "last_error": str(exc),
+                }
+
+        audio_input = getattr(client, "audio_input", None)
+        stats = getattr(audio_input, "stats", None)
+        if stats is not None:
+            try:
+                client_state["pdm"] = MediaRuntimeWorker._copy_dict(stats())
+            except Exception as exc:
+                client_state["pdm"] = {
+                    "initialized": False,
+                    "last_error": str(exc),
+                }
 
     def _should_stop(self):
         self._acquire()

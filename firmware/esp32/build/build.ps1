@@ -56,4 +56,15 @@ make -C (Join-Path $MicroPythonDir "ports/esp32") `
     USER_C_MODULES=$UserModule `
     all
 
-Write-Host "构建流程完成；请自行检查 ports/esp32/build-XIAO_ESP32S3_SENSE-SPIRAM_OCT/。"
+$BuildDir = Join-Path $MicroPythonDir "ports/esp32/build-XIAO_ESP32S3_SENSE-SPIRAM_OCT"
+$FirmwareBin = Join-Path $BuildDir "firmware.bin"
+$MaxFirmwareSize = 0x280000
+if (-not (Test-Path -LiteralPath $FirmwareBin)) {
+    throw "构建失败：未生成 firmware.bin。"
+}
+$FirmwareSize = (Get-Item -LiteralPath $FirmwareBin).Length
+if ($FirmwareSize -gt $MaxFirmwareSize) {
+    throw "构建失败：firmware.bin 大小 $FirmwareSize 字节，超过 0x280000 字节上限。"
+}
+
+Write-Host "构建流程完成：firmware.bin 大小 $FirmwareSize 字节。"

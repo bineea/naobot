@@ -55,6 +55,9 @@ class FakeCameraModule:
         self.frame_ready = True
         self.capture_calls = 0
         self.deinit_calls = 0
+        self.sensor_pid_value = 0x2642
+        self.sensor_name_value = "OV2640"
+        self.capture_errors = 0
 
     def init(self, config):
         self.config = dict(config)
@@ -66,13 +69,30 @@ class FakeCameraModule:
 
     def capture(self):
         self.capture_calls += 1
-        return self.frames.pop(0) if self.frames else None
+        if not self.frames:
+            self.capture_errors += 1
+            return None
+        return self.frames.pop(0)
 
     def available_frames(self):
         return self.frame_ready
 
     def psram_free(self):
         return 7_654_321
+
+    def diagnostics(self):
+        return {
+            "initialized": self.deinit_calls == 0,
+            "init_err": 0,
+            "sensor_pid": self.sensor_pid_value,
+            "sensor_name": self.sensor_name_value,
+            "frame_size": self.FRAME_QVGA,
+            "pixel_format": self.PIXFORMAT_JPEG,
+            "jpeg_quality": 12,
+            "fb_count": 2,
+            "psram_free": self.psram_free(),
+            "capture_errors": self.capture_errors,
+        }
 
     def deinit(self):
         self.deinit_calls += 1
@@ -118,21 +138,44 @@ class FakePDMModule:
         self.config = None
         self.chunks = list(chunks if chunks is not None else [b"\x01\x02" * 320])
         self.deinit_calls = 0
+        self.read_calls = 0
+        self.read_bytes = 0
+        self.initialized = False
 
     def init(self, **kwargs):
         self.config = dict(kwargs)
-        return True
+        self.initialized = True
+        return None
 
     def read(self, chunk_bytes):
+        self.read_calls += 1
         if not self.chunks:
             return None
         payload = self.chunks.pop(0)
         if payload is None:
             return None
-        return bytes(payload[:chunk_bytes])
+        result = bytes(payload[:chunk_bytes])
+        self.read_bytes += len(result)
+        return result
+
+    def available(self):
+        return self.initialized and bool(self.chunks)
+
+    def stats(self):
+        return {
+            "initialized": self.initialized,
+            "rate_hz": 16_000 if self.initialized else 0,
+            "queued_bytes": sum(len(chunk) for chunk in self.chunks if chunk),
+            "dropped_bytes": 0,
+            "read_bytes": self.read_bytes,
+            "read_calls": self.read_calls,
+            "overruns": 0,
+            "last_error": 0,
+        }
 
     def deinit(self):
         self.deinit_calls += 1
+        self.initialized = False
 
 
 class FakeTransport:
@@ -377,6 +420,19 @@ def test_camera_configures_qvga_jpeg_double_buffer_psram_dma_latest() -> None:
     assert camera.psram_free() == 7_654_321
 
 
+def test_camera_consumes_native_diagnostics_and_exposes_sensor_health() -> None:
+    module = FakeCameraModule()
+    camera = Camera(camera_module=module)
+
+    assert camera.sensor_name == "OV2640"
+    assert camera.sensor_pid == 0x2642
+    assert camera.health["initialized"] is True
+    assert camera.health["capture_errors"] == 0
+    diagnostics = camera.diagnostics()
+    diagnostics["sensor_name"] = "mutated"
+    assert camera.diagnostics()["sensor_name"] == "OV2640"
+
+
 def test_camera_skips_fb_get_until_driver_reports_frame_ready() -> None:
     module = FakeCameraModule()
     module.frame_ready = False
@@ -452,6 +508,19 @@ def test_pdm_input_and_i2s_output_use_xiao_fixed_pins() -> None:
     tx.trigger_ready()
     assert audio_out.write(b"pcm16") == 5
     assert tx.writes == [b"pcm16"]
+
+
+def test_audio_input_consumes_pdm_stats_without_exposing_mutable_driver_state() -> None:
+    pdm = FakePDMModule(chunks=[b"\x01\x02" * 320])
+    audio_in = AudioInput(pdm_module=pdm)
+
+    assert audio_in.read_chunk() == b"\x01\x02" * 320
+    stats = audio_in.stats()
+    assert stats["initialized"] is True
+    assert stats["read_bytes"] == 640
+    assert stats["read_calls"] == 1
+    stats["read_bytes"] = 0
+    assert audio_in.stats()["read_bytes"] == 640
 
 
 def test_audio_input_recovers_after_one_transient_read_error() -> None:

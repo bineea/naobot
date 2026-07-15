@@ -7,6 +7,21 @@
 #include "py/mpthread.h"
 #include "py/runtime.h"
 
+static bool camera_initialized;
+static esp_err_t camera_init_error;
+static uint16_t camera_detected_pid;
+static framesize_t camera_frame_size;
+static pixformat_t camera_pixel_format;
+static int camera_jpeg_quality;
+static int camera_fb_count;
+static uint64_t camera_capture_errors;
+
+static const char *camera_sensor_name_from_pid(uint16_t pid);
+
+static bool camera_sensor_supported(uint16_t pid) {
+    return pid == OV2640_PID || pid == OV3660_PID || pid == OV5640_PID;
+}
+
 static int camera_dict_get_int(mp_obj_dict_t *config, qstr key, int default_value) {
     mp_map_elem_t *element = mp_map_lookup(
         &config->map,
@@ -60,16 +75,48 @@ static mp_obj_t camera_init(mp_obj_t config_in) {
     config.grab_mode = camera_dict_get_int(values, MP_QSTR_grab_mode, CAMERA_GRAB_LATEST);
     config.sccb_i2c_port = camera_dict_get_int(values, MP_QSTR_sccb_i2c_port, -1);
 
+    camera_initialized = false;
+    camera_init_error = ESP_OK;
+    camera_detected_pid = 0;
+    camera_frame_size = config.frame_size;
+    camera_pixel_format = config.pixel_format;
+    camera_jpeg_quality = config.jpeg_quality;
+    camera_fb_count = config.fb_count;
+    camera_capture_errors = 0;
+
     esp_err_t result = esp_camera_init(&config);
+    camera_init_error = result;
     if (result != ESP_OK) {
         mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT("camera init failed: 0x%x"), result);
     }
+
+    sensor_t *sensor = esp_camera_sensor_get();
+    if (sensor == NULL) {
+        esp_camera_deinit();
+        camera_init_error = ESP_ERR_NOT_FOUND;
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("camera sensor unavailable"));
+    }
+    camera_detected_pid = sensor->id.PID;
+    if (!camera_sensor_supported(camera_detected_pid)) {
+        esp_camera_deinit();
+        camera_init_error = ESP_ERR_NOT_SUPPORTED;
+        mp_raise_msg_varg(
+            &mp_type_OSError,
+            MP_ERROR_TEXT("unsupported camera sensor: 0x%x"),
+            camera_detected_pid
+        );
+    }
+    camera_initialized = true;
     return mp_const_true;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(camera_init_obj, camera_init);
 
 static mp_obj_t camera_deinit(void) {
-    return mp_obj_new_bool(esp_camera_deinit() == ESP_OK);
+    esp_err_t result = esp_camera_deinit();
+    if (result == ESP_OK) {
+        camera_initialized = false;
+    }
+    return mp_obj_new_bool(result == ESP_OK);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(camera_deinit_obj, camera_deinit);
 
@@ -78,6 +125,7 @@ static mp_obj_t camera_capture(void) {
     camera_fb_t *frame = esp_camera_fb_get();
     MP_THREAD_GIL_ENTER();
     if (frame == NULL) {
+        camera_capture_errors++;
         return mp_const_none;
     }
     mp_obj_t payload = mp_obj_new_bytes(frame->buf, frame->len);
@@ -134,6 +182,67 @@ static mp_obj_t camera_sensor_name(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(camera_sensor_name_obj, camera_sensor_name);
 
+static void camera_diagnostics_store(mp_obj_t diagnostics, qstr key, mp_obj_t value) {
+    mp_obj_dict_store(diagnostics, MP_OBJ_NEW_QSTR(key), value);
+}
+
+static mp_obj_t camera_diagnostics(void) {
+    mp_obj_t diagnostics = mp_obj_new_dict(10);
+    const char *sensor_name = camera_sensor_name_from_pid(camera_detected_pid);
+    camera_diagnostics_store(
+        diagnostics,
+        MP_QSTR_initialized,
+        mp_obj_new_bool(camera_initialized)
+    );
+    camera_diagnostics_store(
+        diagnostics,
+        MP_QSTR_init_err,
+        mp_obj_new_int(camera_init_error)
+    );
+    camera_diagnostics_store(
+        diagnostics,
+        MP_QSTR_sensor_pid,
+        camera_detected_pid == 0 ? mp_const_none : mp_obj_new_int(camera_detected_pid)
+    );
+    camera_diagnostics_store(
+        diagnostics,
+        MP_QSTR_sensor_name,
+        mp_obj_new_str(sensor_name, strlen(sensor_name))
+    );
+    camera_diagnostics_store(
+        diagnostics,
+        MP_QSTR_frame_size,
+        mp_obj_new_int(camera_frame_size)
+    );
+    camera_diagnostics_store(
+        diagnostics,
+        MP_QSTR_pixel_format,
+        mp_obj_new_int(camera_pixel_format)
+    );
+    camera_diagnostics_store(
+        diagnostics,
+        MP_QSTR_jpeg_quality,
+        mp_obj_new_int(camera_jpeg_quality)
+    );
+    camera_diagnostics_store(
+        diagnostics,
+        MP_QSTR_fb_count,
+        mp_obj_new_int(camera_fb_count)
+    );
+    camera_diagnostics_store(
+        diagnostics,
+        MP_QSTR_psram_free,
+        mp_obj_new_int_from_uint(heap_caps_get_free_size(MALLOC_CAP_SPIRAM))
+    );
+    camera_diagnostics_store(
+        diagnostics,
+        MP_QSTR_capture_errors,
+        mp_obj_new_int_from_ull(camera_capture_errors)
+    );
+    return diagnostics;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(camera_diagnostics_obj, camera_diagnostics);
+
 static const mp_rom_map_elem_t camera_module_globals_table[] = {
     {MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_camera)},
     {MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&camera_init_obj)},
@@ -144,6 +253,7 @@ static const mp_rom_map_elem_t camera_module_globals_table[] = {
     {MP_ROM_QSTR(MP_QSTR_psram_free), MP_ROM_PTR(&camera_psram_free_obj)},
     {MP_ROM_QSTR(MP_QSTR_sensor_pid), MP_ROM_PTR(&camera_sensor_pid_obj)},
     {MP_ROM_QSTR(MP_QSTR_sensor_name), MP_ROM_PTR(&camera_sensor_name_obj)},
+    {MP_ROM_QSTR(MP_QSTR_diagnostics), MP_ROM_PTR(&camera_diagnostics_obj)},
     {MP_ROM_QSTR(MP_QSTR_FRAME_QVGA), MP_ROM_INT(FRAMESIZE_QVGA)},
     {MP_ROM_QSTR(MP_QSTR_PIXFORMAT_JPEG), MP_ROM_INT(PIXFORMAT_JPEG)},
     {MP_ROM_QSTR(MP_QSTR_CAMERA_FB_IN_PSRAM), MP_ROM_INT(CAMERA_FB_IN_PSRAM)},
