@@ -185,7 +185,8 @@ class ActionPlayer:
             if name == "gentle_nudge":
                 return self._gentle_nudge(args)
             if name == "sit":
-                self.servos.pose(SIT)
+                if not self.servos.pose(SIT):
+                    return ActionResult(False, "servo pose failed")
                 return ActionResult(True)
             if name == "chirp":
                 return self._chirp(args)

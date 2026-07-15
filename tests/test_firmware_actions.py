@@ -14,12 +14,15 @@ class FakeServos:
 
     def pose(self, positions):
         self.calls.append(("pose", dict(positions)))
+        return True
 
     def sequence(self, frames, delay_ms=180):
         self.calls.append(("sequence", [dict(frame) for frame in frames], delay_ms))
+        return True
 
     def stop(self):
         self.calls.append(("stop",))
+        return True
 
 
 class FakeDisplay:
@@ -80,6 +83,16 @@ def test_all_host_actions_are_implemented() -> None:
     assert ("pose", {"lf": 78, "rf": 102, "lr": 78, "rr": 102}) in servos.calls
     assert "happy" in buzzer.tones
     assert ("stop",) in servos.calls
+
+
+def test_sit_propagates_servo_pose_failure() -> None:
+    player, servos, _, _ = make_player()
+    servos.pose = lambda positions: False
+
+    result = player.execute({"name": "sit", "args": {}})
+
+    assert result.accepted is False
+    assert result.reason == "servo pose failed"
 
 
 def test_wave_level_two_has_more_frames_than_level_one() -> None:

@@ -1,5 +1,8 @@
+import asyncio
 import sys
 from pathlib import Path
+
+import pytest
 
 FIRMWARE_ROOT = Path(__file__).resolve().parents[1] / "firmware" / "esp32"
 if str(FIRMWARE_ROOT) not in sys.path:
@@ -10,7 +13,7 @@ from hardware.display import Display  # noqa: E402
 from hardware.i2c import SharedI2C  # noqa: E402
 from hardware.imu import IMU  # noqa: E402
 from hardware.power import PowerMonitor  # noqa: E402
-from hardware.servo import PCA9685, ServoBank  # noqa: E402
+from hardware.servo import PCA9685, ServoBank, ServoOutputGate  # noqa: E402
 from hardware.touch import TouchInputs  # noqa: E402
 
 
@@ -90,14 +93,13 @@ def test_shared_i2c_factory_creates_xiao_i2c0_once(monkeypatch) -> None:
 
 def test_hardware_consumers_default_to_the_shared_raw_i2c(monkeypatch) -> None:
     bus = FakeI2C(
-        devices=(0x3C, 0x40, 0x55, 0x5A, 0x68, 0x6A),
+        devices=(0x3C, 0x40, 0x55, 0x5A, 0x68),
         values={
             (0x68, 0x3F): b"\x40\x00",
-            (0x55, 0x1C): le16(50),
-            (0x55, 0x04): le16(3900),
-            (0x55, 0x10): le16(-100),
-            (0x6A, 0x0B): b"\x00",
-            (0x6A, 0x0C): b"\x00",
+            (0x55, 0x02): b"\x32",
+            (0x55, 0x08): le16(7600),
+            (0x55, 0x0A): le16(-100),
+            (0x55, 0x0E): le16(0),
         },
     )
     monkeypatch.setattr(SharedI2C, "get", classmethod(lambda cls: bus))
@@ -226,6 +228,61 @@ def test_servo_runtime_i2c_failure_disables_oe_before_write() -> None:
     assert servos.enabled is False
 
 
+def test_servo_oe_high_failure_preserves_enabled_and_blocks_pca_write() -> None:
+    class FailingHighPin:
+        OUT = 1
+        fail_high = False
+
+        def __init__(self, number, mode=None):
+            self.number = number
+
+        def value(self, value=None):
+            if value == 1 and self.fail_high:
+                raise OSError("oe stuck low")
+            return value
+
+    bus = FakeI2C(devices=(0x40,))
+    servos = ServoBank(i2c=bus, pin_factory=FailingHighPin)
+    assert servos.pose({"lf": 90}) is True
+    writes_before_failure = len(bus.writes)
+    FailingHighPin.fail_high = True
+
+    assert servos.pose({"rf": 100}) is False
+    assert servos.enabled is True
+    assert len(bus.writes) == writes_before_failure
+
+
+def test_servo_emergency_latch_blocks_every_future_pwm_write() -> None:
+    events = []
+    FakePin.events = events
+    bus = FakeI2C(devices=(0x40,), events=events)
+    servos = ServoBank(i2c=bus, pin_factory=FakePin)
+    assert servos.pose({"lf": 90}) is True
+
+    assert servos.emergency_off() is True
+    writes_after_emergency = len(bus.writes)
+    events_after_emergency = len(events)
+
+    assert servos.pose({"lf": 100}) is False
+    assert servos.set("rf", 100) is False
+    assert servos.neutral() is False
+    assert servos.sequence(({"lr": 100},), delay_ms=0) is False
+    assert servos.stop() is False
+    assert len(bus.writes) == writes_after_emergency
+    assert ("oe", 1, 0) not in events[events_after_emergency:]
+
+
+def test_servo_output_gate_raises_oe_during_construction() -> None:
+    events = []
+    FakePin.events = events
+
+    gate = ServoOutputGate(pin_factory=FakePin)
+
+    assert gate.available is True
+    assert gate.disabled is True
+    assert events == [("oe", 1, 1)]
+
+
 def test_mpr121_debounces_two_samples_and_emits_rising_edges_only() -> None:
     bus = FakeI2C(
         devices=(0x5A,),
@@ -242,6 +299,7 @@ def test_mpr121_debounces_two_samples_and_emits_rising_edges_only() -> None:
     assert touch.poll() == "touch_head"
     assert (0x5A, 0x41, b"\x0c") in bus.writes
     assert (0x5A, 0x42, b"\x06") in bus.writes
+    assert bus.writes[-1] == (0x5A, 0x5E, b"\x82")
 
 
 def test_mpr121_maps_electrode_one_to_touch_back_and_missing_device_is_safe() -> None:
@@ -259,30 +317,34 @@ def test_mpr121_maps_electrode_one_to_touch_back_and_missing_device_is_safe() ->
     assert missing.poll() is None
 
 
-def make_power_bus(soc=50, voltage=3900, current=-120, status=0x30, fault=0):
+def make_power_bus(soc=50, voltage=7600, current=-120, flags=0):
     return FakeI2C(
-        devices=(0x55, 0x6A),
+        devices=(0x55,),
         values={
-            (0x55, 0x1C): le16(soc),
-            (0x55, 0x04): le16(voltage),
-            (0x55, 0x10): le16(current),
-            (0x6A, 0x0B): bytes((status,)),
-            (0x6A, 0x0C): bytes((fault,)),
+            (0x55, 0x02): bytes((soc,)),
+            (0x55, 0x08): le16(voltage),
+            (0x55, 0x0A): le16(current),
+            (0x55, 0x0E): le16(flags),
         },
     )
 
 
-def test_power_monitor_reads_gauge_and_charger_snapshot() -> None:
+def test_power_monitor_reads_multicell_gauge_snapshot() -> None:
     power = PowerMonitor(i2c=make_power_bus())
 
     assert power.snapshot() == {
         "battery_pct": 50,
-        "voltage_mv": 3900,
+        "soc_precise": True,
+        "pack_voltage_mv": 7600,
+        "cell_voltage_mv": 3800,
         "current_ma": -120,
+        "power_mw": -912,
         "charging": True,
-        "external_power": True,
+        "series_count": 2,
         "fault": False,
         "available": True,
+        "source": "bq34z100",
+        "flags": 0,
         "level": "normal",
     }
     assert power.is_low() is False
@@ -298,11 +360,11 @@ def test_power_monitor_applies_warning_low_and_critical_thresholds() -> None:
 
 
 def test_power_monitor_missing_or_failed_devices_fail_closed() -> None:
-    missing = PowerMonitor(i2c=FakeI2C(devices=(0x55,)))
+    missing = PowerMonitor(i2c=FakeI2C(devices=()))
 
     assert missing.available is False
     assert missing.battery_pct is None
-    assert missing.fault == "unknown"
+    assert missing.fault == "power_devices_unavailable"
     assert missing.level == "unknown"
     assert missing.is_low() is True
     assert missing.is_critical() is True
@@ -328,4 +390,30 @@ def test_main_explicitly_injects_one_shared_i2c_into_all_consumers() -> None:
     assert "IMU(i2c=shared_i2c)" in source
     assert "PowerMonitor(i2c=shared_i2c)" in source
     assert "TouchInputs(i2c=shared_i2c)" in source
-    assert "ServoBank(i2c=shared_i2c)" in source
+    assert "ServoBank(i2c=shared_i2c, output_gate=servo_gate)" in source
+
+
+def test_main_raises_servo_oe_before_attempting_i2c_initialization(monkeypatch) -> None:
+    import main as firmware_main
+
+    events = []
+    gates = []
+
+    class Gate:
+        def __init__(self):
+            self.disabled = True
+            gates.append(self)
+            events.append("oe_high")
+
+    def fail_i2c(cls):
+        events.append("i2c")
+        raise OSError("i2c init failed")
+
+    monkeypatch.setattr(firmware_main, "ServoOutputGate", Gate)
+    monkeypatch.setattr(firmware_main.SharedI2C, "get", classmethod(fail_i2c))
+
+    with pytest.raises(OSError, match="i2c init failed"):
+        asyncio.run(firmware_main.main())
+
+    assert events == ["oe_high", "i2c"]
+    assert gates[0].disabled is True

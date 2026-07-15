@@ -30,7 +30,7 @@ from hardware.display import Display
 from hardware.i2c import SharedI2C
 from hardware.imu import IMU
 from hardware.power import PowerMonitor
-from hardware.servo import ServoBank
+from hardware.servo import ServoBank, ServoOutputGate
 from hardware.touch import TouchInputs
 from interaction.event_adapter import EventAdapter
 from interaction.local_fallback import LocalFallback
@@ -394,12 +394,13 @@ async def network_loop(display, power, imu, actions, safety, protocol, state, mo
 
 
 async def main():
+    servo_gate = ServoOutputGate()
     shared_i2c = SharedI2C.get()
     display = Display(i2c=shared_i2c)
     imu = IMU(i2c=shared_i2c)
     power = PowerMonitor(i2c=shared_i2c)
     touch = TouchInputs(i2c=shared_i2c)
-    servos = ServoBank(i2c=shared_i2c)
+    servos = ServoBank(i2c=shared_i2c, output_gate=servo_gate)
     buzzer = Buzzer()
     actions = ActionPlayer(servos, display, buzzer)
     safety = SafetyGuard(power, imu)

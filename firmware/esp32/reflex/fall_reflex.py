@@ -1,6 +1,6 @@
 def run_fall_reflex(actions, display, buzzer=None):
-    actions.stop()
+    actions.emergency_stop()
     display.set_face("alert")
     if buzzer:
         buzzer.chirp("alert")
-    return "brace_and_sit"
+    return "fall_emergency_off"

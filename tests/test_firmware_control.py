@@ -98,12 +98,12 @@ def test_reflex_controller_runs_fall_reflex_locally() -> None:
     assert reflex.check() is True
     assert reflex.run() is True
 
-    assert ("stop",) in servos.calls
+    assert ("emergency_off",) in servos.calls
     assert not any(call[0] == "pose" for call in servos.calls)
     assert "alert" in display.faces
     assert "alert" in buzzer.tones
     assert reflex.status()["control_authority"] == "reflex"
-    assert reflex.status()["last_reflex"] == "brace_and_sit"
+    assert reflex.status()["last_reflex"] == "fall_emergency_off"
 
 
 def test_emergency_stop_latches_servo_output_before_display() -> None:
@@ -132,7 +132,7 @@ def test_emergency_stop_latches_servo_output_before_display() -> None:
     assert servos.emergency_latched is True
 
 
-def test_low_battery_safe_sit_is_disabled_after_pose() -> None:
+def test_low_battery_stops_immediately_without_claiming_sit() -> None:
     servos = FakeServos()
     display = FakeDisplay()
     actions = ActionPlayer(servos, display, FakeBuzzer())
@@ -140,9 +140,9 @@ def test_low_battery_safe_sit_is_disabled_after_pose() -> None:
 
     assert reflex.check() and reflex.run()
 
-    assert [call[0] for call in servos.calls] == ["stop", "pose", "stop"]
+    assert [call[0] for call in servos.calls] == ["emergency_off"]
     assert servos.enabled is False
-    assert reflex.last_reflex == "low_battery_sit"
+    assert reflex.last_reflex == "low_battery_stop"
 
 
 def test_critical_battery_never_reenables_servo_for_sit() -> None:
@@ -158,8 +158,8 @@ def test_critical_battery_never_reenables_servo_for_sit() -> None:
 
     assert reflex.check() and reflex.run()
 
-    assert [call[0] for call in servos.calls] == ["stop"]
-    assert reflex.last_reflex == "low_battery_off"
+    assert [call[0] for call in servos.calls] == ["emergency_off"]
+    assert reflex.last_reflex == "low_battery_stop"
 
 
 def test_reflex_controller_can_trigger_same_fall_again_after_recovery() -> None:
@@ -173,12 +173,12 @@ def test_reflex_controller_can_trigger_same_fall_again_after_recovery() -> None:
     assert reflex.check() and reflex.run()
     imu.fault = False
     assert reflex.check() is False
-    assert reflex.last_reflex == "brace_and_sit"
+    assert reflex.last_reflex == "fall_emergency_off"
     imu.fault = True
     assert reflex.check() and reflex.run()
 
     assert buzzer.tones.count("alert") == 2
-    assert reflex.last_reflex == "brace_and_sit"
+    assert reflex.last_reflex == "fall_emergency_off"
 
 
 def test_reflex_controller_can_trigger_low_battery_again_after_recovery() -> None:

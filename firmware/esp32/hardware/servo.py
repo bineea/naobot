@@ -20,38 +20,54 @@ def sleep_ms(ms):
         time.sleep(ms / 1000)
 
 
+class ServoOutputGate:
+    def __init__(self, pin_factory=Pin):
+        self._pin = None
+        self.available = False
+        self.disabled = None
+        if pin_factory is None:
+            return
+        try:
+            self._pin = pin_factory(PCA9685_OE_PIN, pin_factory.OUT)
+            if not self.set_disabled(True):
+                raise RuntimeError("servo oe did not go high")
+        except Exception as exc:
+            self.available = False
+            print("servo oe fallback:", exc)
+
+    def set_disabled(self, disabled):
+        if self._pin is None:
+            return False
+        try:
+            self._pin.value(1 if disabled else 0)
+        except Exception as exc:
+            print("servo oe write failed:", exc)
+            return False
+        self.disabled = bool(disabled)
+        self.available = True
+        return True
+
+
 class ServoBank:
     CHANNELS = {"lf": 0, "rf": 1, "lr": 2, "rr": 3}
     MIN_ANGLE = 30
     MAX_ANGLE = 150
     NEUTRAL_ANGLE = 90
 
-    def __init__(self, i2c=None, pin_factory=Pin):
+    def __init__(self, i2c=None, pin_factory=Pin, output_gate=None):
         self.enabled = False
         self.available = False
         self.emergency_latched = False
         self.positions = {name: self.NEUTRAL_ANGLE for name in self.CHANNELS}
-        self._oe = None
-        self._init_oe(pin_factory)
+        self.output_gate = output_gate or ServoOutputGate(pin_factory=pin_factory)
+        self._oe = self.output_gate._pin
         self.i2c = i2c if i2c is not None else SharedI2C.get()
-        self.driver = PCA9685(self.i2c)
-        self.available = self._oe is not None and self.driver.available
-
-    def _init_oe(self, pin_factory):
-        if pin_factory is None:
-            return
-        try:
-            self._oe = pin_factory(PCA9685_OE_PIN, pin_factory.OUT)
-            self._set_oe(True)
-        except Exception as exc:
-            self._oe = None
-            print("servo oe fallback:", exc)
+        driver_i2c = self.i2c if self.output_gate.available else None
+        self.driver = PCA9685(driver_i2c)
+        self.available = self.output_gate.available and self.driver.available
 
     def _set_oe(self, disabled):
-        if self._oe is None:
-            return False
-        self._oe.value(1 if disabled else 0)
-        return True
+        return self.output_gate.set_disabled(disabled)
 
     @classmethod
     def _clamp(cls, degrees):
@@ -71,12 +87,10 @@ class ServoBank:
             return False
 
     def disable(self):
-        self.enabled = False
-        try:
-            return self._set_oe(True)
-        except Exception as exc:
-            print("servo disable failed:", exc)
+        if not self._set_oe(True):
             return False
+        self.enabled = False
+        return True
 
     def neutral(self):
         return self.set_all(self.NEUTRAL_ANGLE)
@@ -84,10 +98,12 @@ class ServoBank:
     def _write_positions(self, positions):
         if self.emergency_latched or not self.available:
             return False
-        self.disable()
+        if not self.disable():
+            return False
         try:
             for name, degrees in positions.items():
-                self.driver.set_angle(self.CHANNELS[name], degrees)
+                if not self.driver.set_angle(self.CHANNELS[name], degrees):
+                    return False
         except Exception as exc:
             print("servo write failed:", exc)
             return False
@@ -126,13 +142,25 @@ class ServoBank:
         return True
 
     def stop(self):
-        self.disable()
+        if self.emergency_latched or not self.available:
+            return False
+        if not self.disable():
+            return False
         try:
-            self.driver.all_off()
+            return self.driver.all_off()
         except Exception as exc:
             print("servo clear failed:", exc)
-        return True
+            return False
 
     def emergency_off(self):
+        if self.emergency_latched:
+            return False
+        disabled = self.disable()
+        cleared = False
+        if disabled:
+            try:
+                cleared = self.driver.all_off()
+            except Exception as exc:
+                print("servo emergency clear failed:", exc)
         self.emergency_latched = True
-        return self.stop()
+        return bool(disabled and cleared)

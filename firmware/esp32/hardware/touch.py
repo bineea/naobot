@@ -32,7 +32,7 @@ class TouchInputs:
         for electrode in (0, 1):
             self._write(0x41 + electrode * 2, self.touch_threshold)
             self._write(0x42 + electrode * 2, self.release_threshold)
-        self._write(0x5E, 0x8C)
+        self._write(0x5E, 0x82)
 
     def _read_mask(self):
         data = self.i2c.readfrom_mem(MPR121_ADDR, 0x00, 2)
