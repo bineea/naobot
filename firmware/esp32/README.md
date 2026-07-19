@@ -68,6 +68,19 @@ Camera/I2S 单次瞬态异常会记录但允许后续采集恢复；连续 3 次
 
 50 ms 安全循环按 deadline 补偿睡眠，并额外记录实际调度间隔和 overrun。控制 client 只把 DNS/TCP/WebSocket 握手交给 `ConnectionWorker`；媒体链路则由独立 `MediaRuntimeWorker` 线程从头到尾独占 Camera、I2S 和媒体 WebSocket，主循环只发送事件加速截止时间并读取标量快照。`_thread` 不可用时媒体直接标记为 disabled，不会退化到安全循环中同步执行。媒体连接失败也不能改变反射控制权。当前实现仍不提供 FreeRTOS 高优先级隔离保证；真实硬件驱动、GC、线程调度或底层网络栈仍可能引入抖动，必须通过板上 stall probe 验证。
 
+## OTA 原生 API 契约
+
+Stage 1 的原生写入入口是
+`begin(image_size, expected_sha256_bytes, sequence)`。第三个 `sequence` 是有意增加的
+安全参数，必须来自已验签 manifest，并由原生 NVS anti-rollback 状态再次校验。
+不提供两参数兼容入口；旧调用方必须显式传入已验签且严格递增的 uint32 sequence，
+不能用默认值绕过防降级检查。
+
+`finish()` 和 `activate()` 可能触发 ESP-IDF 整镜像同步验证，只能由专属
+`OtaWorker` 串行执行。50 ms 主循环只 submit/poll，并在 worker pending、异常或
+超时时保持 OE disabled。后台操作完成前，协调器不得并发调用同一 OTA session 的
+`begin()`、`write()` 或 `abort()`。
+
 ## 定制 MicroPython 镜像
 
 `build/` 提供固定上游版本的可复现配方：

@@ -25,6 +25,7 @@ RUNTIME_API = 1
 TOUCH_HOLD_MS = 3000
 RELEASE_HOLD_MS = 500
 READ_TIMEOUT_MS = 5000
+NATIVE_OPERATION_TIMEOUT_MS = 5000
 UINT32_MAX = 0xFFFFFFFF
 MANIFEST_FIELDS = {
     "schema",
@@ -171,6 +172,7 @@ class UpdateCoordinator:
         reflex,
         touch,
         ota_module=default_ota_module,
+        ota_worker=None,
         clock_ms=now_ms,
         chunk_size=MAX_CHUNK_SIZE,
         reboot=default_reboot,
@@ -182,13 +184,15 @@ class UpdateCoordinator:
         self.reflex = reflex
         self.touch = touch
         self.ota = ota_module
+        self.ota_worker = ota_worker
         self.clock_ms = clock_ms
         self.reboot = reboot
         self.chunk_size = int(chunk_size)
         if not 1 <= self.chunk_size <= MAX_CHUNK_SIZE:
             raise ValueError("OTA chunk size must be between 1 and 4096 bytes")
-        self._state = "idle" if ota_module is not None else "unavailable"
-        self._error = None if ota_module is not None else "nao_ota unavailable"
+        available = ota_module is not None and ota_worker is not None
+        self._state = "idle" if available else "unavailable"
+        self._error = None if available else "nao_ota or OTA worker unavailable"
         self._sequence = None
         self._current_sequence = None
         self._manifest = None
@@ -200,17 +204,29 @@ class UpdateCoordinator:
         self._release_started_ms = None
         self._activation_touch_started_ms = None
         self._storage_start_wait_started_ms = None
+        self._native_request = None
+        self._native_started_ms = None
+        self._native_gate_error = None
+        self._native_timed_out = False
 
     def request_install(self, sequence):
-        if self.ota is None or self._state in (
+        if self.ota is None or self.ota_worker is None or self._state in (
             "loading_manifest",
             "loading_signature",
             "waiting_for_gates",
             "installing",
+            "finalizing",
+            "finalize_timeout",
             "awaiting_activation_release",
             "waiting_for_activation",
+            "activating",
+            "activation_timeout",
             "activated",
+            "activated_reboot_failed",
         ):
+            return False
+        worker = self.ota_worker.snapshot()
+        if worker.get("runtime_state") not in ("starting", "running") or worker.get("busy"):
             return False
         if not _is_integer(sequence) or not 0 <= sequence <= UINT32_MAX:
             return False
@@ -240,6 +256,7 @@ class UpdateCoordinator:
         self._release_started_ms = None
         self._activation_touch_started_ms = None
         self._storage_start_wait_started_ms = None
+        self._clear_native_request()
         return True
 
     def tick(self):
@@ -259,10 +276,14 @@ class UpdateCoordinator:
                 self._tick_waiting()
             elif self._state == "installing":
                 self._tick_installing()
+            elif self._state in ("finalizing", "finalize_timeout"):
+                self._tick_native_operation("finish")
             elif self._state == "awaiting_activation_release":
                 self._tick_activation_release()
             elif self._state == "waiting_for_activation":
                 self._tick_activation_wait()
+            elif self._state in ("activating", "activation_timeout"):
+                self._tick_native_operation("activate")
         except Exception as exc:
             self._fail_closed_exception(exc)
         return self.status()
@@ -273,7 +294,7 @@ class UpdateCoordinator:
             progress = min(100, (self._offset * 100) // self._manifest["image_size"])
         pending = False
         pending_error = None
-        if self.ota is not None:
+        if self.ota is not None and self._native_request is None:
             try:
                 native_pending = self.ota.pending_verify()
                 pending = native_pending if native_pending in (True, False) else "unknown"
@@ -418,16 +439,7 @@ class UpdateCoordinator:
         if trailing:
             self._abort("firmware exceeds manifest size")
             return
-        try:
-            if self.ota.finish() is not True:
-                raise OSError("OTA finish failed")
-        except Exception as exc:
-            self._fail(str(exc), abort=True)
-            return
-        self._state = "awaiting_activation_release"
-        self._error = None
-        self._release_started_ms = None
-        self._activation_touch_started_ms = None
+        self._submit_native_operation("finish")
 
     def _tick_activation_release(self):
         error = self._gate_error(require_touch_hold=False)
@@ -466,13 +478,74 @@ class UpdateCoordinator:
             return
         try:
             self.motion.cancel("ota_activate")
-            if self.ota.activate() is not True:
-                raise OSError("OTA activate failed")
         except Exception as exc:
             self._fail(str(exc), abort=True)
             return
+        self._submit_native_operation("activate")
+
+    def _submit_native_operation(self, operation):
+        request = self.ota_worker.submit(operation)
+        if not request.get("accepted"):
+            self._abort(request.get("reason") or "OTA worker request rejected")
+            return
+        self._native_request = request
+        self._native_started_ms = self.clock_ms()
+        self._native_gate_error = None
+        self._native_timed_out = False
+        self._state = "finalizing" if operation == "finish" else "activating"
+        self._error = None
+
+    def _tick_native_operation(self, operation):
+        gate_error = self._gate_error(require_touch_hold=False)
+        if gate_error is not None and self._native_gate_error is None:
+            self._native_gate_error = gate_error
+
+        result = self.ota_worker.poll(self._native_request)
+        if result.get("done") is not True:
+            if (
+                not self._native_timed_out
+                and ticks_diff(self.clock_ms(), self._native_started_ms)
+                >= NATIVE_OPERATION_TIMEOUT_MS
+            ):
+                self._native_timed_out = True
+                self._state = (
+                    "finalize_timeout"
+                    if operation == "finish"
+                    else "activation_timeout"
+                )
+                self._error = "OTA " + operation + " timeout"
+            return
+
+        worker_error = result.get("error")
+        native_result = result.get("result")
+        gate_error = self._native_gate_error
+        timed_out = self._native_timed_out
+        self._clear_native_request()
+
+        if worker_error:
+            self._fail(worker_error)
+            return
+        if native_result is not True:
+            self._fail("OTA " + operation + " failed")
+            return
+        if operation == "finish":
+            if timed_out or gate_error is not None:
+                reason = "OTA finish timeout" if timed_out else gate_error
+                self._abort(reason)
+                return
+            self._state = "awaiting_activation_release"
+            self._error = None
+            self._release_started_ms = None
+            self._activation_touch_started_ms = None
+            return
+
         self._state = "activated"
         self._error = None
+        if timed_out or gate_error is not None:
+            detail = "activation timeout" if timed_out else gate_error
+            self._state = "activated_reboot_failed"
+            self._error = "activated but reboot suppressed: " + detail
+            return
         try:
             self.reboot()
         except Exception as exc:
@@ -577,6 +650,10 @@ class UpdateCoordinator:
         self._clear_request()
 
     def _fail_closed_exception(self, exc):
+        if self._native_request is not None:
+            self._native_gate_error = str(exc) or "OTA coordinator failed"
+            self._error = self._native_gate_error
+            return
         if self._state in ("activated", "activated_reboot_failed"):
             self._state = "activated_reboot_failed"
             self._error = "activated but coordinator failed: " + (
@@ -654,3 +731,9 @@ class UpdateCoordinator:
     def _clear_request(self):
         self._request = None
         self._request_started_ms = None
+
+    def _clear_native_request(self):
+        self._native_request = None
+        self._native_started_ms = None
+        self._native_gate_error = None
+        self._native_timed_out = False

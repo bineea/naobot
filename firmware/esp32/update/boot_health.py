@@ -42,6 +42,7 @@ class BootHealthMonitor:
         self._pending = False
         self._pending_sequence = None
         self._phase = None
+        self._running_target = False
         self._pending_started_ms = None
         self._healthy_started_ms = None
 
@@ -75,6 +76,7 @@ class BootHealthMonitor:
             "pending_verify": self._pending,
             "pending_sequence": self._pending_sequence,
             "phase": self._phase,
+            "running_target": self._running_target,
         }
 
     def _tick_pending(self):
@@ -97,6 +99,17 @@ class BootHealthMonitor:
             self._pending_sequence = "unknown"
             self._phase = "unknown"
             metadata_error = str(exc) or "OTA transaction metadata unavailable"
+        try:
+            running_target = self.ota.running_target()
+            self._running_target = (
+                running_target if running_target in (True, False) else "unknown"
+            )
+            if self._running_target == "unknown" and metadata_error is None:
+                metadata_error = "OTA target partition state unavailable"
+        except Exception as exc:
+            self._running_target = "unknown"
+            if metadata_error is None:
+                metadata_error = str(exc) or "OTA target partition state unavailable"
 
         if not self._is_protected_boot():
             self._pending = False
@@ -125,6 +138,15 @@ class BootHealthMonitor:
         if self._phase == "rollback":
             self._rollback("persisted OTA rollback phase")
             return
+        if (
+            self._phase == "activated"
+            and self._pending is False
+            and self._running_target is False
+        ):
+            self._healthy_started_ms = None
+            self._state = "waiting_reboot"
+            self._error = "activated OTA target is not running"
+            return
 
         power = self.power.snapshot()
         if power.get("available") is not True or power.get("fault") is not False:
@@ -139,9 +161,18 @@ class BootHealthMonitor:
             self._rollback("pending verify health deadline exceeded")
             return
         if self._phase == "confirming" and self._pending is False:
+            if self._running_target is not True:
+                self._healthy_started_ms = None
+                self._state = "error"
+                self._error = "confirming OTA target is not running"
+                return
             self._mark_healthy()
             return
-        if self._pending == "unknown" or metadata_error is not None:
+        if (
+            self._pending == "unknown"
+            or metadata_error is not None
+            or self._running_target is not True
+        ):
             self._healthy_started_ms = None
             self._state = "error"
             self._error = pending_error or metadata_error or "OTA boot state unavailable"
@@ -175,9 +206,11 @@ class BootHealthMonitor:
         try:
             self._pending_sequence = self.ota.pending_sequence()
             self._phase = self.ota.phase()
+            self._running_target = self.ota.running_target()
         except Exception:
             self._pending_sequence = "unknown"
             self._phase = "unknown"
+            self._running_target = "unknown"
         self._state = "healthy"
         self._error = None
 

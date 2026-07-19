@@ -28,6 +28,9 @@ class FakeOta:
         self.mark_error = None
         self.sequence = 2
         self.phase_value = "activated"
+        self.running_target_value = True
+        self.running_target_error = None
+        self.running_target_calls = 0
 
     def pending_verify(self):
         if self.pending_error:
@@ -41,6 +44,12 @@ class FakeOta:
 
     def phase(self):
         return self.phase_value
+
+    def running_target(self):
+        self.running_target_calls += 1
+        if self.running_target_error:
+            raise OSError(self.running_target_error)
+        return self.running_target_value
 
     def mark_healthy(self):
         self.mark_calls += 1
@@ -106,7 +115,7 @@ def make_monitor():
     return module.BootHealthMonitor(**dependencies), dependencies, clock
 
 
-def test_pending_boot_is_quiesced_and_marked_healthy_after_ten_continuous_seconds() -> None:
+def test_running_target_pending_verify_is_marked_healthy_after_ten_seconds() -> None:
     monitor, dependencies, clock = make_monitor()
 
     monitor.tick()
@@ -123,6 +132,41 @@ def test_pending_boot_is_quiesced_and_marked_healthy_after_ten_continuous_second
     assert dependencies["ota_module"].mark_calls == 1
     assert dependencies["ota_module"].rollback_calls == 0
     assert monitor.status()["state"] == "healthy"
+
+
+def test_activated_boot_target_does_not_confirm_while_old_partition_is_running() -> None:
+    monitor, dependencies, clock = make_monitor()
+    dependencies["ota_module"].pending = False
+    dependencies["ota_module"].running_target_value = False
+
+    first = monitor.tick()
+    clock[0] = 10000
+    second = monitor.tick()
+
+    assert first["state"] == "waiting_reboot"
+    assert second["state"] == "waiting_reboot"
+    assert dependencies["ota_module"].mark_calls == 0
+    assert dependencies["ota_module"].sequence == 2
+    assert dependencies["motion"].cancelled == [
+        "ota_pending_verify",
+        "ota_pending_verify",
+    ]
+
+
+def test_running_target_already_valid_recovers_after_full_health_window() -> None:
+    monitor, dependencies, clock = make_monitor()
+    dependencies["ota_module"].pending = False
+
+    first = monitor.tick()
+    clock[0] = 9999
+    monitor.tick()
+    clock[0] = 10000
+    result = monitor.tick()
+
+    assert first["state"] == "monitoring"
+    assert dependencies["ota_module"].running_target_calls >= 1
+    assert dependencies["ota_module"].mark_calls == 1
+    assert result["state"] == "healthy"
 
 
 def test_health_window_resets_when_a_condition_is_temporarily_unknown() -> None:

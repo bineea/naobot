@@ -116,6 +116,26 @@ def test_xiao_build_recipe_pins_versions_memory_usb_and_partitions() -> None:
     assert partition_rows["coredump"][1:5] == ["data", "coredump", "0x7C0000", "0x40000"]
 
 
+def test_xiao_build_fails_after_each_native_make_and_removes_stale_application() -> None:
+    script = (BUILD_ROOT / "build.ps1").read_text(encoding="utf-8")
+    submodules_make = script.index(
+        'make -C (Join-Path $MicroPythonDir "ports/esp32") submodules'
+    )
+    submodules_check = script.index("if ($LASTEXITCODE -ne 0)", submodules_make)
+    cross_make = script.index('make -C (Join-Path $MicroPythonDir "mpy-cross")')
+    cross_check = script.index("if ($LASTEXITCODE -ne 0)", cross_make)
+    stale_remove = script.index("Remove-Item -LiteralPath $ApplicationBin")
+    firmware_make = script.index(
+        'make -C (Join-Path $MicroPythonDir "ports/esp32") `',
+        cross_make,
+    )
+    firmware_check = script.index("if ($LASTEXITCODE -ne 0)", firmware_make)
+
+    assert submodules_make < submodules_check < cross_make
+    assert cross_make < cross_check < stale_remove < firmware_make
+    assert firmware_make < firmware_check
+
+
 def test_xiao_micropython_board_header_declares_mcu_and_external_i2c() -> None:
     board_header = (
         BUILD_ROOT / "XIAO_ESP32S3_SENSE" / "mpconfigboard.h"

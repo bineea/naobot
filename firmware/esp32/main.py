@@ -42,6 +42,7 @@ from reflex.reflex_controller import ReflexController
 from safety.guard import MOVEMENT_ACTIONS, SafetyGuard
 from storage.storage_worker import create_default_worker as create_storage_worker
 from update.boot_health import BootHealthMonitor
+from update.ota_worker import create_default_worker as create_ota_worker
 from update.update_coordinator import UpdateCoordinator
 
 
@@ -61,6 +62,13 @@ def ticks_add(start, delta):
     if hasattr(time, "ticks_add"):
         return time.ticks_add(start, delta)
     return start + delta
+
+
+def merge_ota_status(coordinator_status, boot_health_status):
+    merged = dict(coordinator_status or {})
+    if not merged.get("ota_error") and boot_health_status:
+        merged["ota_error"] = boot_health_status.get("error")
+    return merged
 
 
 async def sleep_ms(ms):
@@ -457,6 +465,8 @@ async def main():
             ws.send_json(protocol.ack(intent_id, status, reason if reason else None))
 
     motion = MotionController(actions, safety, reflex, now_ms, on_intent_done=_on_intent_done)
+    ota_worker = create_ota_worker()
+    ota_worker.start()
     ota = UpdateCoordinator(
         storage_worker,
         power,
@@ -464,6 +474,8 @@ async def main():
         servo_gate,
         reflex,
         touch,
+        ota_module=ota_worker.ota,
+        ota_worker=ota_worker,
         clock_ms=now_ms,
         chunk_size=OTA_CHUNK_BYTES,
     )
@@ -497,7 +509,7 @@ async def main():
             if reflex.check():
                 motion.cancel("reflex")
                 reflex.run()
-            boot_health.tick()
+            boot_health_status = boot_health.tick()
             motion.tick()
             event = adapter.poll()
             if event:
@@ -511,11 +523,12 @@ async def main():
                     if not ws or not ws.connected or not ws.send_json(envelope):
                         fallback.handle(event)
             ota.tick()
-            network_state["ota"] = ota.status()
+            network_state["ota"] = merge_ota_status(ota.status(), boot_health_status)
             await sleep_to_safety_deadline(loop_start, network_state)
     finally:
         media_worker.stop()
         storage_worker.stop()
+        ota_worker.stop()
 
 
 if __name__ == "__main__":

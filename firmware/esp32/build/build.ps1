@@ -70,20 +70,32 @@ if ($LASTEXITCODE -ne 0) {
     throw "OTA 公钥必须是可解析的 ECDSA P-256 public key。"
 }
 $env:NAOBOT_OTA_PUBLIC_KEY_HEADER = $SelectedOtaPublicKeyHeader
+$BuildDir = Join-Path $MicroPythonDir "ports/esp32/build-XIAO_ESP32S3_SENSE-SPIRAM_OCT"
+$ApplicationBin = Join-Path $BuildDir "micropython.bin"
 
 Copy-Item -LiteralPath $Partitions -Destination $PartitionTarget -Force
 
 make -C (Join-Path $MicroPythonDir "ports/esp32") submodules
+if ($LASTEXITCODE -ne 0) {
+    throw "构建失败：ESP32 submodules make 返回 $LASTEXITCODE。"
+}
 make -C (Join-Path $MicroPythonDir "mpy-cross")
+if ($LASTEXITCODE -ne 0) {
+    throw "构建失败：mpy-cross make 返回 $LASTEXITCODE。"
+}
+if (Test-Path -LiteralPath $ApplicationBin) {
+    Remove-Item -LiteralPath $ApplicationBin -Force
+}
 make -C (Join-Path $MicroPythonDir "ports/esp32") `
     BOARD_DIR=$BoardDir `
     BOARD_VARIANT=SPIRAM_OCT `
     FROZEN_MANIFEST=$Manifest `
     USER_C_MODULES=$UserModule `
     all
+if ($LASTEXITCODE -ne 0) {
+    throw "构建失败：ESP32 firmware make 返回 $LASTEXITCODE。"
+}
 
-$BuildDir = Join-Path $MicroPythonDir "ports/esp32/build-XIAO_ESP32S3_SENSE-SPIRAM_OCT"
-$ApplicationBin = Join-Path $BuildDir "micropython.bin"
 $MaxFirmwareSize = 0x280000
 if (-not (Test-Path -LiteralPath $ApplicationBin)) {
     throw "构建失败：未生成 OTA 应用镜像 micropython.bin。"

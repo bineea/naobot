@@ -11,6 +11,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 FIRMWARE_ROOT = ROOT / "firmware" / "esp32"
 COORDINATOR_PATH = FIRMWARE_ROOT / "update" / "update_coordinator.py"
+OTA_WORKER_PATH = FIRMWARE_ROOT / "update" / "ota_worker.py"
 NATIVE_ROOT = FIRMWARE_ROOT / "build" / "ota_module"
 if str(FIRMWARE_ROOT) not in sys.path:
     sys.path.insert(0, str(FIRMWARE_ROOT))
@@ -150,6 +151,7 @@ class FakeOta:
         self.staged = False
         self.boot_selected = False
         self.activate_calls = 0
+        self.running_target_value = False
 
     def verify_manifest(self, manifest_bytes, signature_der):
         assert isinstance(manifest_bytes, bytes)
@@ -197,10 +199,59 @@ class FakeOta:
     def phase(self):
         return self.phase_value
 
+    def running_target(self):
+        return self.running_target_value
+
     def status(self):
         return {
             "state": "ready_to_reboot" if self.boot_selected else "idle",
         }
+
+
+class FakeOtaWorker:
+    def __init__(self, ota):
+        self.ota = ota
+        self.runtime_state = "running"
+        self.pending = None
+        self.stalled_operations = set()
+
+    def snapshot(self):
+        return {
+            "runtime_state": self.runtime_state,
+            "busy": self.pending is not None,
+            "last_error": None,
+        }
+
+    def submit(self, operation):
+        if self.runtime_state != "running":
+            return {"accepted": False, "reason": "OTA worker not running"}
+        if self.pending is not None:
+            return {"accepted": False, "reason": "OTA worker busy"}
+        request = {
+            "accepted": True,
+            "operation": operation,
+            "done": False,
+            "result": None,
+            "error": None,
+        }
+        self.pending = request
+        return request
+
+    @staticmethod
+    def poll(request):
+        return dict(request)
+
+    def complete_pending(self):
+        request = self.pending
+        if request is None or request["operation"] in self.stalled_operations:
+            return False
+        try:
+            request["result"] = getattr(self.ota, request["operation"])()
+        except Exception as exc:
+            request["error"] = str(exc)
+        request["done"] = True
+        self.pending = None
+        return True
 
 
 def make_system(image=b"abcdefgh", sequence=2, **coordinator_kwargs):
@@ -227,6 +278,7 @@ def make_system(image=b"abcdefgh", sequence=2, **coordinator_kwargs):
             "reboot_calls", dependencies["ota_module"].reboot_calls + 1
         ),
     }
+    dependencies["ota_worker"] = FakeOtaWorker(dependencies["ota_module"])
     dependencies.update(coordinator_kwargs)
     coordinator = module.UpdateCoordinator(**dependencies)
     assert coordinator.request_install(sequence) is True
@@ -235,10 +287,18 @@ def make_system(image=b"abcdefgh", sequence=2, **coordinator_kwargs):
 
 def tick_until(coordinator, state, limit=30):
     for _ in range(limit):
+        worker = getattr(coordinator, "ota_worker", None)
+        if hasattr(worker, "complete_pending"):
+            worker.complete_pending()
         coordinator.tick()
         if coordinator.status()["ota_state"] == state:
             return
     pytest.fail(f"OTA state did not reach {state}: {coordinator.status()}")
+
+
+def complete_native_operation(coordinator):
+    assert coordinator.ota_worker.complete_pending() is True
+    return coordinator.tick()
 
 
 def test_manifest_validation_is_exact_canonical_and_rejects_stale_sequence() -> None:
@@ -421,6 +481,11 @@ def test_staged_image_requires_full_release_then_second_three_second_touch() -> 
 
     clock[0] = 8000
     coordinator.tick()
+    assert coordinator.status()["ota_state"] == "activating"
+    assert ota.activate_calls == 0
+    assert coordinator.tick()["ota_state"] == "activating"
+    assert ota.activate_calls == 0
+    complete_native_operation(coordinator)
     assert ota.activate_calls == 1
     assert ota.boot_selected is True
     assert ota.pending_sequence() == 2
@@ -447,6 +512,8 @@ def test_reboot_callback_failure_after_activate_preserves_boot_and_pending_metad
     coordinator.tick()
     clock[0] = 8000
     coordinator.tick()
+    assert dependencies["ota_module"].activate_calls == 0
+    complete_native_operation(coordinator)
 
     ota = dependencies["ota_module"]
     status = coordinator.status()
@@ -488,6 +555,9 @@ def test_second_touch_must_also_be_continuous() -> None:
     assert dependencies["ota_module"].activate_calls == 0
     clock[0] = 10500
     coordinator.tick()
+    assert coordinator.status()["ota_state"] == "activating"
+    assert dependencies["ota_module"].activate_calls == 0
+    complete_native_operation(coordinator)
     assert dependencies["ota_module"].activate_calls == 1
 
 
@@ -709,6 +779,78 @@ def test_trailing_firmware_byte_is_rejected_before_finish() -> None:
     assert dependencies["ota_module"].boot_selected is False
 
 
+def test_finish_is_submitted_and_pending_ticks_never_call_native_synchronously() -> None:
+    coordinator, dependencies, clock = make_system()
+    dependencies["ota_worker"].stalled_operations.add("finish")
+    tick_until(coordinator, "waiting_for_gates")
+    clock[0] = 3000
+    tick_until(coordinator, "finalizing")
+
+    assert dependencies["ota_module"].finish_calls == 0
+    pending = coordinator.tick()
+    assert pending["ota_state"] == "finalizing"
+    assert dependencies["ota_module"].finish_calls == 0
+
+    dependencies["ota_worker"].stalled_operations.clear()
+    complete_native_operation(coordinator)
+    assert coordinator.status()["ota_state"] == "awaiting_activation_release"
+    assert dependencies["ota_module"].finish_calls == 1
+
+
+def test_gate_loss_during_background_finish_defers_abort_until_worker_completes() -> None:
+    coordinator, dependencies, clock = make_system()
+    dependencies["ota_worker"].stalled_operations.add("finish")
+    tick_until(coordinator, "waiting_for_gates")
+    clock[0] = 3000
+    tick_until(coordinator, "finalizing")
+    dependencies["power"].values["charging"] = False
+
+    coordinator.tick()
+
+    assert dependencies["ota_module"].finish_calls == 0
+    assert dependencies["ota_module"].abort_calls == 0
+    assert dependencies["servo_gate"].disabled is True
+
+    dependencies["ota_worker"].stalled_operations.clear()
+    complete_native_operation(coordinator)
+    assert dependencies["ota_module"].finish_calls == 1
+    assert dependencies["ota_module"].abort_calls == 1
+    assert "charging not confirmed" in coordinator.status()["ota_error"]
+
+
+def test_background_finish_timeout_is_fail_closed_without_concurrent_abort() -> None:
+    coordinator, dependencies, clock = make_system()
+    dependencies["ota_worker"].stalled_operations.add("finish")
+    tick_until(coordinator, "waiting_for_gates")
+    clock[0] = 3000
+    tick_until(coordinator, "finalizing")
+
+    clock[0] = 7999
+    coordinator.tick()
+    assert coordinator.status()["ota_state"] == "finalizing"
+    clock[0] = 8000
+    result = coordinator.tick()
+
+    assert result["ota_state"] == "finalize_timeout"
+    assert "finish timeout" in result["ota_error"]
+    assert dependencies["ota_module"].finish_calls == 0
+    assert dependencies["ota_module"].abort_calls == 0
+    assert dependencies["servo_gate"].disabled is True
+
+
+def test_unavailable_ota_worker_aborts_before_native_finish() -> None:
+    coordinator, dependencies, clock = make_system()
+    dependencies["ota_worker"].runtime_state = "disabled"
+    tick_until(coordinator, "waiting_for_gates")
+    clock[0] = 3000
+    tick_until(coordinator, "aborted")
+
+    assert "OTA worker not running" in coordinator.status()["ota_error"]
+    assert dependencies["ota_module"].finish_calls == 0
+    assert dependencies["ota_module"].abort_calls == 1
+    assert dependencies["servo_gate"].disabled is True
+
+
 @pytest.mark.parametrize("operation", ["begin", "write", "finish", "activate"])
 def test_native_operation_errors_are_fail_closed(operation) -> None:
     coordinator, dependencies, clock = make_system()
@@ -734,6 +876,7 @@ def test_native_operation_errors_are_fail_closed(operation) -> None:
         coordinator.tick()
         clock[0] = 8000
         coordinator.tick()
+        complete_native_operation(coordinator)
     else:
         tick_until(coordinator, "failed")
 
@@ -794,6 +937,7 @@ def test_native_module_surface_build_chain_and_rollback_config() -> None:
         "current_sequence",
         "pending_sequence",
         "phase",
+        "running_target",
         "mark_healthy",
         "rollback_and_reboot",
     ):
@@ -872,11 +1016,13 @@ def test_native_sequence_promotion_and_rollback_are_fail_closed() -> None:
     assert "OTA sequence must be uint32" in begin_body
     assert "NAOBOT_OTA_CURRENT_SEQUENCE_KEY" in source
     assert "NAOBOT_OTA_PENDING_SEQUENCE_KEY" in source
+    assert "transaction.target_found" in mark_body
+    target_check = mark_body.index("running->address != transaction.target_address")
     assert "NAOBOT_OTA_PHASE_CONFIRMING" in mark_body
     confirming_commit = mark_body.index("naobot_nvs_begin_confirming")
     mark_valid = mark_body.index("esp_ota_mark_app_valid_cancel_rollback")
     clear_transaction = mark_body.index("naobot_nvs_clear_transaction")
-    assert confirming_commit < mark_valid < clear_transaction
+    assert target_check < confirming_commit < mark_valid < clear_transaction
     assert "naobot_nvs_clear_transaction" in rollback_body
     assert rollback_body.index("naobot_nvs_clear_transaction") < rollback_body.index(
         "esp_ota_mark_app_invalid_rollback_and_reboot"
@@ -914,6 +1060,27 @@ def test_native_activation_transaction_and_recovery_are_persistent_and_idempoten
         "esp_ota_mark_app_valid_cancel_rollback",
     ):
         assert symbol in recovery_body
+
+
+def test_native_long_image_validation_releases_the_micropython_gil() -> None:
+    source = (NATIVE_ROOT / "modnao_ota.c").read_text(encoding="utf-8")
+    finish_body = source[
+        source.index("static mp_obj_t nao_ota_finish")
+        : source.index("static MP_DEFINE_CONST_FUN_OBJ_0(nao_ota_finish_obj")
+    ]
+    activate_body = source[
+        source.index("static mp_obj_t nao_ota_activate")
+        : source.index("static MP_DEFINE_CONST_FUN_OBJ_0(nao_ota_activate_obj")
+    ]
+
+    for body, native_call in (
+        (finish_body, "esp_ota_end(ota_handle)"),
+        (activate_body, "esp_ota_set_boot_partition(ota_partition)"),
+    ):
+        release = body.index("MP_THREAD_GIL_EXIT()")
+        call = body.index(native_call)
+        acquire = body.index("MP_THREAD_GIL_ENTER()")
+        assert release < call < acquire
 
 
 def test_native_abort_is_limited_to_writing_or_staged_and_checks_native_result() -> None:
@@ -968,9 +1135,41 @@ def test_main_status_exposes_ota_health_fields() -> None:
     assert {key: payload[key] for key in ota} == ota
 
 
+def test_main_merges_boot_health_error_without_overwriting_coordinator_error() -> None:
+    import main as firmware_main
+
+    coordinator_error = firmware_main.merge_ota_status(
+        {"ota_state": "failed", "ota_error": "coordinator failed"},
+        {"state": "error", "error": "boot health failed"},
+    )
+    boot_error = firmware_main.merge_ota_status(
+        {"ota_state": "idle", "ota_error": None},
+        {"state": "error", "error": "boot health failed"},
+    )
+
+    assert coordinator_error["ota_error"] == "coordinator failed"
+    assert boot_error["ota_error"] == "boot health failed"
+
+
 def test_main_integrates_boot_health_before_motion_tick() -> None:
     source = (FIRMWARE_ROOT / "main.py").read_text(encoding="utf-8")
     assert "from update.boot_health import BootHealthMonitor" in source
+    assert "from update.ota_worker import create_default_worker as create_ota_worker" in source
     assert "boot_health = BootHealthMonitor(" in source
+    assert "ota_worker = create_ota_worker()" in source
+    assert "ota_worker=ota_worker" in source
+    assert "ota_worker.start()" in source
+    assert "ota_worker.stop()" in source
     assert "OTA_CURRENT_SEQUENCE" not in source
-    assert source.index("boot_health.tick()") < source.index("motion.tick()", source.index("while True:"))
+    assert "boot_health_status = boot_health.tick()" in source
+    assert "merge_ota_status(ota.status(), boot_health_status)" in source
+    assert source.index("boot_health.tick()") < source.index(
+        "motion.tick()", source.index("while True:")
+    )
+
+
+def test_three_argument_begin_is_documented_as_intentional_security_contract() -> None:
+    readme = (FIRMWARE_ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "begin(image_size, expected_sha256_bytes, sequence)" in readme
+    assert "不提供两参数兼容入口" in readme
