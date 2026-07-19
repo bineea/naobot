@@ -92,6 +92,8 @@ class StorageWorker:
     def submit_update_read(self, sequence, filename, offset=0, max_bytes=None):
         self._acquire()
         try:
+            if self._state != "running":
+                return {"accepted": False, "reason": "storage worker not running"}
             if len(self._queue) >= self.queue_limit:
                 self._publish_locked(error="storage queue full")
                 return {"accepted": False, "reason": "storage queue full"}

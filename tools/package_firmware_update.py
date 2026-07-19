@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import struct
 from hashlib import sha256
 from pathlib import Path
 
@@ -16,6 +17,11 @@ MAX_IMAGE_SIZE = 0x280000
 MAX_MANIFEST_SIZE = 1024
 MAX_SIGNATURE_SIZE = 128
 MAX_TEXT_LENGTH = 64
+ESP_IMAGE_MAGIC = 0xE9
+ESP_IMAGE_HEADER_SIZE = 24
+ESP_SEGMENT_HEADER_SIZE = 8
+ESP_MAX_SEGMENTS = 16
+UINT32_MAX = 0xFFFFFFFF
 
 
 def _bounded_text(name: str, value: object) -> str:
@@ -37,8 +43,12 @@ def _load_private_key(path: Path):
 
 
 def _canonical_manifest(image: bytes, sequence: int, version: str, key_id: str) -> bytes:
-    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
-        raise ValueError("sequence must be a non-negative integer")
+    if (
+        not isinstance(sequence, int)
+        or isinstance(sequence, bool)
+        or not 0 <= sequence <= UINT32_MAX
+    ):
+        raise ValueError("sequence must be a uint32 integer")
     version = _bounded_text("version", version)
     key_id = _bounded_text("key_id", key_id)
     manifest = {
@@ -58,6 +68,26 @@ def _canonical_manifest(image: bytes, sequence: int, version: str, key_id: str) 
         separators=(",", ":"),
         ensure_ascii=True,
     ).encode("utf-8")
+
+
+def _validate_esp_image(image: bytes) -> None:
+    if len(image) < ESP_IMAGE_HEADER_SIZE:
+        raise ValueError("firmware must be a valid ESP image with a complete header")
+    if image[0] != ESP_IMAGE_MAGIC:
+        raise ValueError("firmware must be an ESP image with magic 0xE9")
+    segment_count = image[1]
+    if not 1 <= segment_count <= ESP_MAX_SEGMENTS:
+        raise ValueError("firmware ESP image has an invalid segment count")
+
+    offset = ESP_IMAGE_HEADER_SIZE
+    for _ in range(segment_count):
+        if offset + ESP_SEGMENT_HEADER_SIZE > len(image):
+            raise ValueError("firmware ESP image has a truncated segment header")
+        _load_address, data_size = struct.unpack_from("<II", image, offset)
+        offset += ESP_SEGMENT_HEADER_SIZE
+        if data_size > MAX_IMAGE_SIZE or offset + data_size >= len(image):
+            raise ValueError("firmware ESP image has a truncated segment")
+        offset += data_size
 
 
 def create_update_package(
@@ -81,6 +111,7 @@ def create_update_package(
     image = image_path.read_bytes()
     if len(image) != image_size:
         raise ValueError("firmware image changed while being read")
+    _validate_esp_image(image)
     private_key = _load_private_key(private_key_path)
     manifest_bytes = _canonical_manifest(image, sequence, version, key_id)
     if len(manifest_bytes) > MAX_MANIFEST_SIZE:

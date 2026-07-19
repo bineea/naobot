@@ -51,15 +51,25 @@ $UserModule = (Resolve-Path (Join-Path $PSScriptRoot "camera_module/micropython.
 $BoardDir = (Resolve-Path (Join-Path $PSScriptRoot "XIAO_ESP32S3_SENSE")).Path
 $Partitions = Join-Path $BoardDir "partitions.csv"
 $PartitionTarget = Join-Path $MicroPythonDir "ports/esp32/partitions.csv"
+$SelectedOtaPublicKeyHeader = (Resolve-Path (
+    Join-Path $PSScriptRoot "ota_module/ota_public_key_dev.h"
+)).Path
 
 if ($OtaPublicKeyHeader) {
-    $OtaPublicKeyHeader = (Resolve-Path -LiteralPath $OtaPublicKeyHeader).Path
-    $publicKeySource = Get-Content -Raw -LiteralPath $OtaPublicKeyHeader
-    if ($publicKeySource -notmatch "BEGIN PUBLIC KEY" -or $publicKeySource -match "PRIVATE KEY") {
-        throw "OTA 公钥头文件必须只包含 public key material。"
-    }
-    $env:NAOBOT_OTA_PUBLIC_KEY_HEADER = $OtaPublicKeyHeader
+    $SelectedOtaPublicKeyHeader = (Resolve-Path -LiteralPath $OtaPublicKeyHeader).Path
 }
+$OtaKeyValidator = (Resolve-Path (
+    Join-Path $PSScriptRoot "../../../tools/validate_ota_public_key.py"
+)).Path
+$ProjectPython = Join-Path $PSScriptRoot "../../../.venv/Scripts/python.exe"
+if (-not (Test-Path -LiteralPath $ProjectPython)) {
+    throw "请先创建项目 Python 3.11 虚拟环境并安装 requirements.txt。"
+}
+& $ProjectPython $OtaKeyValidator $SelectedOtaPublicKeyHeader
+if ($LASTEXITCODE -ne 0) {
+    throw "OTA 公钥必须是可解析的 ECDSA P-256 public key。"
+}
+$env:NAOBOT_OTA_PUBLIC_KEY_HEADER = $SelectedOtaPublicKeyHeader
 
 Copy-Item -LiteralPath $Partitions -Destination $PartitionTarget -Force
 

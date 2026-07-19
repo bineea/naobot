@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import struct
 from pathlib import Path
 
 import pytest
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL_PATH = ROOT / "tools" / "package_firmware_update.py"
+KEY_VALIDATOR_PATH = ROOT / "tools" / "validate_ota_public_key.py"
 MAX_IMAGE_SIZE = 0x280000
 
 
@@ -21,6 +23,23 @@ def load_packager():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def load_key_validator():
+    assert KEY_VALIDATOR_PATH.exists(), "OTA 构建公钥校验器尚未实现"
+    spec = importlib.util.spec_from_file_location("validate_ota_public_key", KEY_VALIDATOR_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def minimal_esp_image(payload: bytes = b"\x00") -> bytes:
+    header = bytearray(24)
+    header[0] = 0xE9
+    header[1] = 1
+    segment = struct.pack("<II", 0x3F400020, len(payload)) + payload
+    return bytes(header) + segment + b"\xEF"
 
 
 def write_private_key(path: Path):
@@ -40,7 +59,7 @@ def test_package_is_canonical_signed_and_self_verifiable(tmp_path: Path) -> None
     image = tmp_path / "input.bin"
     private_key = tmp_path / "signing-key.pem"
     output = tmp_path / "package"
-    image.write_bytes(b"signed firmware image")
+    image.write_bytes(minimal_esp_image(b"signed firmware image"))
     public_key = write_private_key(private_key)
 
     result = packager.create_update_package(
@@ -95,7 +114,7 @@ def test_package_rejects_wrong_key_curve_empty_and_oversized_images(tmp_path: Pa
         stream.seek(MAX_IMAGE_SIZE)
         stream.write(b"x")
     valid = tmp_path / "valid.bin"
-    valid.write_bytes(b"image")
+    valid.write_bytes(minimal_esp_image())
 
     with pytest.raises(ValueError, match="image size"):
         packager.create_update_package(empty, private_key, tmp_path / "empty-out", 1, "1", "dev")
@@ -132,13 +151,14 @@ def test_package_rejects_wrong_key_curve_empty_and_oversized_images(tmp_path: Pa
 def test_package_rejects_invalid_manifest_inputs_and_bad_private_key(tmp_path: Path) -> None:
     packager = load_packager()
     image = tmp_path / "valid.bin"
-    image.write_bytes(b"image")
+    image.write_bytes(minimal_esp_image())
     private_key = tmp_path / "signing-key.pem"
     write_private_key(private_key)
 
     invalid_values = (
         {"sequence": -1},
         {"sequence": True},
+        {"sequence": 0x1_0000_0000},
         {"version": ""},
         {"version": "v" * 65},
         {"key_id": ""},
@@ -166,7 +186,7 @@ def test_package_rejects_manifest_that_exceeds_device_limit_after_ascii_escaping
 ) -> None:
     packager = load_packager()
     image = tmp_path / "valid.bin"
-    image.write_bytes(b"image")
+    image.write_bytes(minimal_esp_image())
     private_key = tmp_path / "signing-key.pem"
     write_private_key(private_key)
 
@@ -184,7 +204,7 @@ def test_package_rejects_manifest_that_exceeds_device_limit_after_ascii_escaping
 def test_mutated_package_signature_is_rejected(tmp_path: Path) -> None:
     packager = load_packager()
     image = tmp_path / "valid.bin"
-    image.write_bytes(b"image")
+    image.write_bytes(minimal_esp_image())
     private_key = tmp_path / "signing-key.pem"
     public_key = write_private_key(private_key)
     output = tmp_path / "package"
@@ -196,3 +216,60 @@ def test_mutated_package_signature_is_rejected(tmp_path: Path) -> None:
             (output / "manifest.json").read_bytes() + b" ",
             ec.ECDSA(hashes.SHA256()),
         )
+
+
+@pytest.mark.parametrize(
+    "image_bytes",
+    [
+        b"not an esp image",
+        b"\xE9\x01" + b"\x00" * 21,
+        b"\x00\x01" + b"\x00" * 31,
+        b"\xE9\x00" + b"\x00" * 31,
+        b"\xE9\x11" + b"\x00" * 31,
+        bytes(bytearray([0xE9, 1]) + bytearray(22)) + struct.pack("<II", 0, 8) + b"\x00",
+    ],
+)
+def test_package_rejects_non_esp_images(tmp_path: Path, image_bytes: bytes) -> None:
+    packager = load_packager()
+    image = tmp_path / "invalid.bin"
+    image.write_bytes(image_bytes)
+    private_key = tmp_path / "signing-key.pem"
+    write_private_key(private_key)
+
+    with pytest.raises(ValueError, match="ESP image"):
+        packager.create_update_package(image, private_key, tmp_path / "out", 1, "1", "dev")
+
+
+def _write_public_key_header(path: Path, public_key) -> None:
+    pem = public_key.public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode("ascii")
+    lines = "".join(f'"{line}\\n" \\\n' for line in pem.splitlines())
+    path.write_text(
+        "#define NAOBOT_OTA_PUBLIC_KEY_PEM \\\n" + lines.rstrip(" \\\n") + "\n",
+        encoding="ascii",
+    )
+
+
+def test_build_public_key_validator_accepts_only_p256(tmp_path: Path) -> None:
+    validator = load_key_validator()
+    p256 = tmp_path / "p256.h"
+    p384 = tmp_path / "p384.h"
+    rsa_header = tmp_path / "rsa.h"
+    malformed = tmp_path / "malformed.h"
+    _write_public_key_header(p256, ec.generate_private_key(ec.SECP256R1()).public_key())
+    _write_public_key_header(p384, ec.generate_private_key(ec.SECP384R1()).public_key())
+    _write_public_key_header(
+        rsa_header,
+        rsa.generate_private_key(public_exponent=65537, key_size=2048).public_key(),
+    )
+    malformed.write_text(
+        '#define NAOBOT_OTA_PUBLIC_KEY_PEM "-----BEGIN PUBLIC KEY-----\\ninvalid\\n"\n',
+        encoding="ascii",
+    )
+
+    validator.validate_public_key_header(p256)
+    for rejected in (p384, rsa_header, malformed):
+        with pytest.raises(ValueError, match="P-256"):
+            validator.validate_public_key_header(rejected)

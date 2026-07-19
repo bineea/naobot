@@ -23,6 +23,9 @@ MAX_SIGNATURE_SIZE = 128
 MAX_TEXT_LENGTH = 64
 RUNTIME_API = 1
 TOUCH_HOLD_MS = 3000
+RELEASE_HOLD_MS = 500
+READ_TIMEOUT_MS = 5000
+UINT32_MAX = 0xFFFFFFFF
 MANIFEST_FIELDS = {
     "schema",
     "board_id",
@@ -46,6 +49,12 @@ def ticks_diff(end, start):
     if hasattr(time, "ticks_diff"):
         return time.ticks_diff(end, start)
     return end - start
+
+
+def default_reboot():
+    import machine
+
+    machine.reset()
 
 
 def _is_integer(value):
@@ -118,9 +127,17 @@ def validate_manifest(manifest_bytes, requested_sequence, current_sequence):
         if not isinstance(value, str) or not value or len(value) > MAX_TEXT_LENGTH:
             raise ValueError("invalid " + name)
     sequence = manifest.get("sequence")
-    if not _is_integer(sequence) or sequence < 0 or sequence != requested_sequence:
+    if (
+        not _is_integer(sequence)
+        or not 0 <= sequence <= UINT32_MAX
+        or sequence != requested_sequence
+    ):
         raise ValueError("invalid sequence")
-    if not _is_integer(current_sequence) or current_sequence < 0 or sequence <= current_sequence:
+    if (
+        not _is_integer(current_sequence)
+        or not 0 <= current_sequence <= UINT32_MAX
+        or sequence <= current_sequence
+    ):
         raise ValueError("stale update sequence")
     image_size = manifest.get("image_size")
     if not _is_integer(image_size) or not 0 < image_size <= MAX_IMAGE_SIZE:
@@ -156,7 +173,7 @@ class UpdateCoordinator:
         ota_module=default_ota_module,
         clock_ms=now_ms,
         chunk_size=MAX_CHUNK_SIZE,
-        current_sequence=0,
+        reboot=default_reboot,
     ):
         self.storage = storage
         self.power = power
@@ -166,46 +183,86 @@ class UpdateCoordinator:
         self.touch = touch
         self.ota = ota_module
         self.clock_ms = clock_ms
+        self.reboot = reboot
         self.chunk_size = int(chunk_size)
         if not 1 <= self.chunk_size <= MAX_CHUNK_SIZE:
             raise ValueError("OTA chunk size must be between 1 and 4096 bytes")
-        if not _is_integer(current_sequence) or current_sequence < 0:
-            raise ValueError("current_sequence must be a non-negative integer")
-        self.current_sequence = current_sequence
         self._state = "idle" if ota_module is not None else "unavailable"
         self._error = None if ota_module is not None else "nao_ota unavailable"
         self._sequence = None
+        self._current_sequence = None
         self._manifest = None
         self._manifest_bytes = None
         self._request = None
+        self._request_started_ms = None
         self._offset = 0
         self._touch_started_ms = None
+        self._release_started_ms = None
+        self._activation_touch_started_ms = None
 
     def request_install(self, sequence):
-        if self.ota is None or self._state in ("loading_manifest", "loading_signature", "waiting_for_gates", "installing"):
+        if self.ota is None or self._state in (
+            "loading_manifest",
+            "loading_signature",
+            "waiting_for_gates",
+            "installing",
+            "awaiting_activation_release",
+            "waiting_for_activation",
+            "activated",
+        ):
             return False
-        if not _is_integer(sequence) or sequence < 0:
+        if not _is_integer(sequence) or not 0 <= sequence <= UINT32_MAX:
+            return False
+        try:
+            current_sequence = self.ota.current_sequence()
+            pending_sequence = self.ota.pending_sequence()
+            pending_verify = self.ota.pending_verify()
+        except Exception:
+            return False
+        if (
+            not _is_integer(current_sequence)
+            or not 0 <= current_sequence <= UINT32_MAX
+            or sequence <= current_sequence
+            or pending_sequence is not None
+            or pending_verify is not False
+        ):
             return False
         self._state = "loading_manifest"
         self._error = None
         self._sequence = sequence
+        self._current_sequence = current_sequence
         self._manifest = None
         self._manifest_bytes = None
-        self._request = None
+        self._clear_request()
         self._offset = 0
         self._touch_started_ms = self.clock_ms() if self._both_touched() else None
+        self._release_started_ms = None
+        self._activation_touch_started_ms = None
         return True
 
     def tick(self):
-        self._update_touch_hold()
-        if self._state == "loading_manifest":
-            self._tick_file("manifest.json", MAX_MANIFEST_SIZE, self._manifest_loaded)
-        elif self._state == "loading_signature":
-            self._tick_file("signature.der", MAX_SIGNATURE_SIZE, self._signature_loaded)
-        elif self._state == "waiting_for_gates":
-            self._tick_waiting()
-        elif self._state == "installing":
-            self._tick_installing()
+        try:
+            if self._state in (
+                "loading_manifest",
+                "loading_signature",
+                "waiting_for_gates",
+                "installing",
+            ):
+                self._update_touch_hold()
+            if self._state == "loading_manifest":
+                self._tick_file("manifest.json", MAX_MANIFEST_SIZE, self._manifest_loaded)
+            elif self._state == "loading_signature":
+                self._tick_file("signature.der", MAX_SIGNATURE_SIZE, self._signature_loaded)
+            elif self._state == "waiting_for_gates":
+                self._tick_waiting()
+            elif self._state == "installing":
+                self._tick_installing()
+            elif self._state == "awaiting_activation_release":
+                self._tick_activation_release()
+            elif self._state == "waiting_for_activation":
+                self._tick_activation_wait()
+        except Exception as exc:
+            self._fail_closed_exception(exc)
         return self.status()
 
     def status(self):
@@ -213,29 +270,30 @@ class UpdateCoordinator:
         if self._manifest is not None and self._manifest["image_size"]:
             progress = min(100, (self._offset * 100) // self._manifest["image_size"])
         pending = False
+        pending_error = None
         if self.ota is not None:
             try:
-                pending = self.ota.pending_verify() is True
-            except Exception:
-                pending = False
+                native_pending = self.ota.pending_verify()
+                pending = native_pending if native_pending in (True, False) else "unknown"
+                if pending == "unknown":
+                    pending_error = "pending verify state unavailable"
+            except Exception as exc:
+                pending = "unknown"
+                pending_error = str(exc) or "pending verify state unavailable"
         return {
             "ota_state": self._state,
             "ota_progress_pct": progress,
-            "ota_error": self._error,
+            "ota_error": self._error or pending_error,
             "ota_pending_verify": pending,
             "ota_sequence": self._sequence,
         }
 
     def _tick_file(self, filename, max_size, callback):
         if self._request is None:
-            self._request = self.storage.submit_update_read(
-                self._sequence,
-                filename,
-                0,
-                max_size + 1,
-            )
-            if not self._request.get("accepted"):
-                self._deny(self._request.get("reason") or "storage request rejected")
+            request = self._submit_read(filename, 0, max_size + 1)
+            if request is None:
+                return
+            self._request = request
             return
         result = self.storage.poll(self._request)
         if result.get("error"):
@@ -243,8 +301,10 @@ class UpdateCoordinator:
             return
         data = result.get("result")
         if data is None:
+            if self._request_timed_out():
+                self._deny(filename + " read timeout")
             return
-        self._request = None
+        self._clear_request()
         if not isinstance(data, bytes) or not 0 < len(data) <= max_size:
             self._deny("invalid " + filename + " size")
             return
@@ -266,7 +326,7 @@ class UpdateCoordinator:
             self._manifest = validate_manifest(
                 self._manifest_bytes,
                 requested_sequence=self._sequence,
-                current_sequence=self.current_sequence,
+                current_sequence=self._current_sequence,
             )
         except ValueError as exc:
             self._deny(str(exc))
@@ -284,13 +344,14 @@ class UpdateCoordinator:
             self.ota.begin(
                 self._manifest["image_size"],
                 bytes.fromhex(self._manifest["sha256"]),
+                self._sequence,
             )
         except Exception as exc:
             self._fail(str(exc))
             return
         self._state = "installing"
         self._error = None
-        self._request = None
+        self._clear_request()
         self._offset = 0
 
     def _tick_installing(self):
@@ -304,14 +365,10 @@ class UpdateCoordinator:
             return
         if self._request is None:
             read_size = min(self.chunk_size, image_size - self._offset)
-            self._request = self.storage.submit_update_read(
-                self._sequence,
-                IMAGE_NAME,
-                self._offset,
-                read_size,
-            )
-            if not self._request.get("accepted"):
-                self._abort(self._request.get("reason") or "storage request rejected")
+            request = self._submit_read(IMAGE_NAME, self._offset, read_size, abort=True)
+            if request is None:
+                return
+            self._request = request
             return
         result = self.storage.poll(self._request)
         if result.get("error"):
@@ -319,8 +376,10 @@ class UpdateCoordinator:
             return
         chunk = result.get("result")
         if chunk is None:
+            if self._request_timed_out():
+                self._abort("firmware read timeout")
             return
-        self._request = None
+        self._clear_request()
         if not isinstance(chunk, bytes) or not chunk or len(chunk) > self.chunk_size:
             self._abort("invalid firmware chunk")
             return
@@ -330,7 +389,7 @@ class UpdateCoordinator:
         try:
             written = self.ota.write(chunk)
         except Exception as exc:
-            self._abort(str(exc))
+            self._fail(str(exc), abort=True)
             return
         if written != len(chunk):
             self._abort("short OTA write")
@@ -339,14 +398,10 @@ class UpdateCoordinator:
 
     def _tick_trailing_byte_probe(self):
         if self._request is None:
-            self._request = self.storage.submit_update_read(
-                self._sequence,
-                IMAGE_NAME,
-                self._offset,
-                1,
-            )
-            if not self._request.get("accepted"):
-                self._abort(self._request.get("reason") or "storage request rejected")
+            request = self._submit_read(IMAGE_NAME, self._offset, 1, abort=True)
+            if request is None:
+                return
+            self._request = request
             return
         result = self.storage.poll(self._request)
         if result.get("error"):
@@ -354,8 +409,10 @@ class UpdateCoordinator:
             return
         trailing = result.get("result")
         if trailing is None:
+            if self._request_timed_out():
+                self._abort("firmware trailing-byte read timeout")
             return
-        self._request = None
+        self._clear_request()
         if trailing:
             self._abort("firmware exceeds manifest size")
             return
@@ -365,12 +422,64 @@ class UpdateCoordinator:
         except Exception as exc:
             self._fail(str(exc), abort=True)
             return
-        self._state = "ready_to_reboot"
+        self._state = "awaiting_activation_release"
+        self._error = None
+        self._release_started_ms = None
+        self._activation_touch_started_ms = None
+
+    def _tick_activation_release(self):
+        error = self._gate_error(require_touch_hold=False)
+        if error is not None:
+            self._abort(error)
+            return
+        if not self._fully_released():
+            self._release_started_ms = None
+            return
+        current_ms = self.clock_ms()
+        if self._release_started_ms is None:
+            self._release_started_ms = current_ms
+            return
+        if ticks_diff(current_ms, self._release_started_ms) < RELEASE_HOLD_MS:
+            return
+        self._state = "waiting_for_activation"
+        self._activation_touch_started_ms = None
+        self._error = None
+
+    def _tick_activation_wait(self):
+        error = self._gate_error(require_touch_hold=False)
+        if error is not None:
+            self._abort(error)
+            return
+        current_ms = self.clock_ms()
+        if not self._both_touched():
+            self._activation_touch_started_ms = None
+            self._error = "dual touch activation incomplete"
+            return
+        if self._activation_touch_started_ms is None:
+            self._activation_touch_started_ms = current_ms
+            self._error = "dual touch activation incomplete"
+            return
+        if ticks_diff(current_ms, self._activation_touch_started_ms) < TOUCH_HOLD_MS:
+            self._error = "dual touch activation incomplete"
+            return
+        try:
+            self.motion.cancel("ota_activate")
+            if self.ota.activate() is not True:
+                raise OSError("OTA activate failed")
+            self.reboot()
+        except Exception as exc:
+            self._fail(str(exc), abort=True)
+            return
+        self._state = "activated"
         self._error = None
 
     def _gate_error(self, require_touch_hold):
         storage = self.storage.snapshot()
-        if storage.get("available") is not True or storage.get("mounted") is not True:
+        if (
+            storage.get("runtime_state") != "running"
+            or storage.get("available") is not True
+            or storage.get("mounted") is not True
+        ):
             return "SD unavailable"
         power = self.power.snapshot()
         if power.get("available") is not True or power.get("fault") is not False:
@@ -421,6 +530,13 @@ class UpdateCoordinator:
             and getattr(self.touch, "touch_mask", None) == 0x03
         )
 
+    def _fully_released(self):
+        return (
+            getattr(self.touch, "available", False) is True
+            and getattr(self.touch, "both_touched", True) is False
+            and getattr(self.touch, "touch_mask", None) == 0
+        )
+
     def _update_touch_hold(self):
         if not self._both_touched():
             self._touch_started_ms = None
@@ -435,27 +551,78 @@ class UpdateCoordinator:
     def _deny(self, error):
         self._state = "denied"
         self._error = error
-        self._request = None
+        self._clear_request()
 
     def _abort(self, error):
-        try:
-            self.servo_gate.set_disabled(True)
-        except Exception:
-            pass
-        try:
-            self.ota.abort()
-        except Exception:
-            pass
-        self._state = "aborted"
-        self._error = error or "OTA aborted"
-        self._request = None
+        cleanup_errors = self._cleanup()
+        errors = [error or "OTA aborted"] + cleanup_errors
+        self._state = "failed" if cleanup_errors else "aborted"
+        self._error = "; ".join(errors)
+        self._clear_request()
 
     def _fail(self, error, abort=False):
+        errors = [error or "OTA failed"]
         if abort:
-            try:
-                self.ota.abort()
-            except Exception:
-                pass
+            errors.extend(self._cleanup())
         self._state = "failed"
-        self._error = error or "OTA failed"
+        self._error = "; ".join(errors)
+        self._clear_request()
+
+    def _fail_closed_exception(self, exc):
+        errors = [str(exc) or "OTA coordinator failed"]
+        errors.extend(self._cleanup())
+        self._state = "failed"
+        self._error = "; ".join(errors)
+        self._clear_request()
+
+    def _cleanup(self):
+        errors = []
+        try:
+            if self.servo_gate.set_disabled(True) is not True:
+                errors.append("OE cleanup unconfirmed")
+            elif (
+                not hasattr(self.servo_gate, "confirm_disabled")
+                or self.servo_gate.confirm_disabled() is not True
+            ):
+                errors.append("OE cleanup readback failed")
+        except Exception as exc:
+            errors.append(str(exc) or "OE cleanup failed")
+        try:
+            if self.ota.abort() is not True:
+                errors.append("native abort unconfirmed")
+        except Exception as exc:
+            errors.append(str(exc) or "native abort failed")
+        return errors
+
+    def _submit_read(self, filename, offset, max_bytes, abort=False):
+        request = self.storage.submit_update_read(
+            self._sequence,
+            filename,
+            offset,
+            max_bytes,
+        )
+        if not request.get("accepted"):
+            error = request.get("reason") or "storage request rejected"
+            if (
+                error == "storage worker not running"
+                and self.storage.snapshot().get("runtime_state") == "starting"
+            ):
+                self._error = error
+                return None
+            if abort:
+                self._abort(error)
+            else:
+                self._deny(error)
+            return None
+        self._request_started_ms = self.clock_ms()
+        return request
+
+    def _request_timed_out(self):
+        return (
+            self._request_started_ms is not None
+            and ticks_diff(self.clock_ms(), self._request_started_ms) >= READ_TIMEOUT_MS
+        )
+
+    def _clear_request(self):
         self._request = None
+        self._request_started_ms = None

@@ -25,5 +25,6 @@ target_include_directories(usermod_ota INTERFACE
 target_link_libraries(usermod_ota INTERFACE
     __idf_app_update
     __idf_mbedtls
+    __idf_nvs_flash
 )
 target_link_libraries(usermod INTERFACE usermod_ota)

@@ -18,7 +18,6 @@ from config import (
     FIRMWARE_HEARTBEAT_INTERVAL_MS,
     MEDIA_EVENT_BOOST_MS,
     OTA_CHUNK_BYTES,
-    OTA_CURRENT_SEQUENCE,
     OTA_UPDATE_SEQUENCE,
     SAFETY_LOOP_PERIOD_MS,
     SESSION_ID,
@@ -42,6 +41,7 @@ from motion.action_player import ActionPlayer
 from reflex.reflex_controller import ReflexController
 from safety.guard import MOVEMENT_ACTIONS, SafetyGuard
 from storage.storage_worker import create_default_worker as create_storage_worker
+from update.boot_health import BootHealthMonitor
 from update.update_coordinator import UpdateCoordinator
 
 
@@ -466,8 +466,8 @@ async def main():
         touch,
         clock_ms=now_ms,
         chunk_size=OTA_CHUNK_BYTES,
-        current_sequence=OTA_CURRENT_SEQUENCE,
     )
+    boot_health = BootHealthMonitor(ota.ota, power, imu, motion, servo_gate, clock_ms=now_ms)
     if OTA_UPDATE_SEQUENCE is not None:
         ota.request_install(OTA_UPDATE_SEQUENCE)
     network_state["ota"] = ota.status()
@@ -497,6 +497,7 @@ async def main():
             if reflex.check():
                 motion.cancel("reflex")
                 reflex.run()
+            boot_health.tick()
             motion.tick()
             event = adapter.poll()
             if event:

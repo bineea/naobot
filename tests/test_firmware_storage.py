@@ -299,6 +299,7 @@ def test_worker_drops_logs_under_queue_pressure_and_rejects_updates(tmp_path):
     worker = storage_worker_class()(create_storage(tmp_path), queue_limit=1, thread_module=ManualThread())
 
     assert worker.start() is True
+    worker._set_state("running")
     assert worker.submit_log({"event": "first"}) is True
     assert worker.submit_log({"event": "second"}) is False
     rejected = worker.submit_update_read("20260715", "firmware.bin")
@@ -321,11 +322,30 @@ def test_worker_processes_bounded_update_reads_cooperatively(tmp_path):
     (update_dir / "firmware.bin").write_bytes(b"abcdef")
 
     assert worker.start() is True
+    worker._set_state("running")
     request = worker.submit_update_read("20260715", "firmware.bin")
 
     assert worker.poll(request) == {"accepted": True, "result": None, "error": None}
     assert worker._run_one() is True
     assert worker.poll(request) == {"accepted": True, "result": b"abc", "error": None}
+
+
+@pytest.mark.parametrize("runtime_state", ["idle", "starting", "stopped", "disabled"])
+def test_worker_rejects_update_reads_unless_running(tmp_path, runtime_state):
+    worker = storage_worker_class()(
+        create_storage(tmp_path),
+        queue_limit=2,
+        thread_module=ManualThread(),
+    )
+    worker._set_state(runtime_state)
+
+    request = worker.submit_update_read("20260715", "firmware.bin")
+
+    assert request == {
+        "accepted": False,
+        "reason": "storage worker not running",
+    }
+    assert worker.snapshot()["queue_depth"] == 0
 
 
 def test_main_side_worker_snapshot_tick_and_poll_do_not_run_blocking_storage(tmp_path):
@@ -402,6 +422,7 @@ def test_worker_publishes_every_thread_error_under_lock(mode):
         assert worker.submit_log({"event": "failed"}) is True
         assert worker._run_one() is True
     elif mode in ("read_failure", "read_exception"):
+        worker._set_state("running")
         request = worker.submit_update_read("20260715", "firmware.bin")
         assert worker._run_one() is True
         assert worker.poll(request)["error"] in ("storage failed", "read exploded")
@@ -411,7 +432,7 @@ def test_worker_publishes_every_thread_error_under_lock(mode):
         thread_module.target(*thread_module.args)
 
     snapshot = worker.snapshot()
-    assert snapshot["runtime_state"] in ("starting", "stopped")
+    assert snapshot["runtime_state"] in ("starting", "running", "stopped")
     assert snapshot["last_error"] in ("storage failed", "read exploded", "unmount exploded")
 
 
