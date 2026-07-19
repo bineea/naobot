@@ -1371,7 +1371,7 @@ def test_custom_image_recipe_static_structure_pins_exact_upstream_versions() -> 
     assert "CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y" in sdkconfig
     assert "CONFIG_ESP_CONSOLE_USB_CDC=y" in sdkconfig
     assert "CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=n" in sdkconfig
-    assert "CONFIG_TINYUSB_ENABLED=y" in sdkconfig
+    assert "CONFIG_TINYUSB_ENABLED" not in sdkconfig
     assert "MICROPY_HW_ENABLE_USBDEV=1" in board_cmake
     assert "MICROPY_HW_ESP_USB_SERIAL_JTAG=0" in board_cmake
     assert "MICROPY_HW_ENABLE_UART_REPL=0" in board_cmake

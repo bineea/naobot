@@ -4,7 +4,13 @@ target_sources(usermod_camera INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/modcamera.c
 )
 
-# ESP-IDF component target 负责传递 esp_camera.h 及转换头文件路径。
+# MicroPython 的 usermod QSTR 扫描只读取接口 include，需显式暴露 Camera 公共头文件。
+target_include_directories(usermod_camera INTERFACE
+    ${MICROPY_PORT_DIR}/components/esp32-camera/driver/include
+    ${MICROPY_PORT_DIR}/components/esp32-camera/conversions/include
+    ${MICROPY_PORT_DIR}/managed_components/espressif__esp_jpeg/include
+)
+
 target_link_libraries(usermod_camera INTERFACE __idf_esp32-camera)
 target_link_libraries(usermod INTERFACE usermod_camera)
 

@@ -1,0 +1,4 @@
+#define MICROPY_HW_MCU_NAME "ESP32S3"
+
+#define MICROPY_HW_I2C0_SDA (5)
+#define MICROPY_HW_I2C0_SCL (6)

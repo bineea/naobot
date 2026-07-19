@@ -83,14 +83,14 @@ make -C (Join-Path $MicroPythonDir "ports/esp32") `
     all
 
 $BuildDir = Join-Path $MicroPythonDir "ports/esp32/build-XIAO_ESP32S3_SENSE-SPIRAM_OCT"
-$FirmwareBin = Join-Path $BuildDir "firmware.bin"
+$ApplicationBin = Join-Path $BuildDir "micropython.bin"
 $MaxFirmwareSize = 0x280000
-if (-not (Test-Path -LiteralPath $FirmwareBin)) {
-    throw "构建失败：未生成 firmware.bin。"
+if (-not (Test-Path -LiteralPath $ApplicationBin)) {
+    throw "构建失败：未生成 OTA 应用镜像 micropython.bin。"
 }
-$FirmwareSize = (Get-Item -LiteralPath $FirmwareBin).Length
-if ($FirmwareSize -gt $MaxFirmwareSize) {
-    throw "构建失败：firmware.bin 大小 $FirmwareSize 字节，超过 0x280000 字节上限。"
+$ApplicationSize = (Get-Item -LiteralPath $ApplicationBin).Length
+if ($ApplicationSize -gt $MaxFirmwareSize) {
+    throw "构建失败：OTA 应用镜像大小 $ApplicationSize 字节，超过 0x280000 字节上限。"
 }
 
-Write-Host "构建流程完成：firmware.bin 大小 $FirmwareSize 字节。"
+Write-Host "构建流程完成：OTA 应用镜像 micropython.bin 大小 $ApplicationSize 字节。"

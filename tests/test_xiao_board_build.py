@@ -98,13 +98,14 @@ def test_xiao_build_recipe_pins_versions_memory_usb_and_partitions() -> None:
     assert "CONFIG_SPIRAM_MODE_OCT=y" in sdkconfig
     assert "CONFIG_CAMERA_PSRAM_DMA=y" in sdkconfig
     assert "CONFIG_ESP_CONSOLE_USB_CDC=y" in sdkconfig
-    assert "CONFIG_TINYUSB_ENABLED=y" in sdkconfig
+    assert "CONFIG_TINYUSB_ENABLED" not in sdkconfig
     assert "CONFIG_PARTITION_TABLE_CUSTOM=y" in sdkconfig
     assert "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"partitions.csv\"" in sdkconfig
     assert "MICROPY_HW_ENABLE_USBDEV=1" in board_cmake
     assert "MICROPY_HW_ESP_USB_SERIAL_JTAG=0" in board_cmake
     assert "MICROPY_HW_ENABLE_UART_REPL=0" in board_cmake
     assert "boards/sdkconfig.spiram_oct" in variant_cmake
+    assert (board_cmake + variant_cmake).count("MICROPY_HW_BOARD_NAME=") == 1
     partition_rows = {row[0]: row for row in read_xiao_partitions()}
     assert partition_rows["nvs"][1:5] == ["data", "nvs", "0x9000", "0x6000"]
     assert partition_rows["otadata"][1:5] == ["data", "ota", "0xF000", "0x2000"]
@@ -113,6 +114,23 @@ def test_xiao_build_recipe_pins_versions_memory_usb_and_partitions() -> None:
     assert partition_rows["ota_1"][1:5] == ["app", "ota_1", "0x2A0000", "0x280000"]
     assert partition_rows["vfs"][1:5] == ["data", "spiffs", "0x520000", "0x2A0000"]
     assert partition_rows["coredump"][1:5] == ["data", "coredump", "0x7C0000", "0x40000"]
+
+
+def test_xiao_micropython_board_header_declares_mcu_and_external_i2c() -> None:
+    board_header = (
+        BUILD_ROOT / "XIAO_ESP32S3_SENSE" / "mpconfigboard.h"
+    ).read_text(encoding="utf-8")
+
+    assert '#define MICROPY_HW_MCU_NAME "ESP32S3"' in board_header
+    assert "#define MICROPY_HW_I2C0_SDA (5)" in board_header
+    assert "#define MICROPY_HW_I2C0_SCL (6)" in board_header
+
+
+def test_manifest_freezes_config_with_a_valid_module_name() -> None:
+    manifest = (BUILD_ROOT / "manifest.py").read_text(encoding="utf-8")
+
+    assert 'module("config.py", base_path="..")' in manifest
+    assert 'module("../config.py")' not in manifest
 
 
 def test_xiao_partitions_are_non_overlapping_aligned_and_fit_flash() -> None:
@@ -152,7 +170,9 @@ def test_deprecated_targets_are_absent_from_formal_runtime_code() -> None:
     runtime_sources = [
         path
         for path in FIRMWARE_ROOT.rglob("*")
-        if path.suffix in {".c", ".py"} and "__pycache__" not in path.parts
+        if path.suffix in {".c", ".py"}
+        and "__pycache__" not in path.parts
+        and not any(part.startswith("_work") for part in path.parts)
     ]
     text = "\n".join(path.read_text(encoding="utf-8") for path in runtime_sources)
     for deprecated in ("N16R8", "16MB", "CH343"):

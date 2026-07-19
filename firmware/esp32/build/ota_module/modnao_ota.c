@@ -11,7 +11,6 @@
 #include "nvs.h"
 #include "py/binary.h"
 #include "py/obj.h"
-#include "py/objdict.h"
 #include "py/runtime.h"
 
 #include "ota_public_key_selected.h"

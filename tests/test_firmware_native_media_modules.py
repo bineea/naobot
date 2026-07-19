@@ -371,7 +371,7 @@ def test_camera_c_module_validates_sensor_and_exposes_complete_diagnostics() -> 
         assert required in source
 
 
-def test_build_recipe_registers_both_native_modules_and_checks_firmware_size() -> None:
+def test_build_recipe_registers_native_modules_and_checks_ota_application_size() -> None:
     script = (BUILD_ROOT / "build.ps1").read_text(encoding="utf-8")
     cmake = (BUILD_ROOT / "camera_module" / "micropython.cmake").read_text(
         encoding="utf-8"
@@ -386,9 +386,30 @@ def test_build_recipe_registers_both_native_modules_and_checks_firmware_size() -
     assert "modpdm.c" in pdm_cmake
     assert "__idf_esp32-camera" in cmake
     assert "__idf_esp_driver_i2s" in pdm_cmake
-    assert "firmware.bin" in script
+    assert 'Join-Path $BuildDir "micropython.bin"' in script
+    assert "OTA 应用镜像" in script
     assert "0x280000" in script
     assert "Length" in script
+
+
+def test_native_modules_use_v128_headers_and_qstr_visible_camera_includes() -> None:
+    native_sources = [
+        BUILD_ROOT / "camera_module" / "modcamera.c",
+        BUILD_ROOT / "pdm_module" / "modpdm.c",
+        BUILD_ROOT / "ota_module" / "modnao_ota.c",
+    ]
+    camera_cmake = (BUILD_ROOT / "camera_module" / "micropython.cmake").read_text(
+        encoding="utf-8"
+    )
+
+    for source_path in native_sources:
+        assert '#include "py/objdict.h"' not in source_path.read_text(encoding="utf-8")
+    assert "${MICROPY_PORT_DIR}/components/esp32-camera/driver/include" in camera_cmake
+    assert "${MICROPY_PORT_DIR}/components/esp32-camera/conversions/include" in camera_cmake
+    assert (
+        "${MICROPY_PORT_DIR}/managed_components/espressif__esp_jpeg/include"
+        in camera_cmake
+    )
 
 
 def test_build_recipe_distinguishes_micropython_tag_object_from_commit() -> None:

@@ -3,7 +3,6 @@
 #include "esp_camera.h"
 #include "esp_heap_caps.h"
 #include "py/obj.h"
-#include "py/objdict.h"
 #include "py/mpthread.h"
 #include "py/nlr.h"
 #include "py/runtime.h"

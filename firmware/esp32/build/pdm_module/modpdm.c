@@ -8,7 +8,6 @@
 #include "py/mpthread.h"
 #include "py/nlr.h"
 #include "py/obj.h"
-#include "py/objdict.h"
 #include "py/runtime.h"
 
 #define PDM_SAMPLE_RATE_HZ (16000)
