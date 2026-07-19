@@ -146,6 +146,7 @@ class FakeOta:
         self.activate_error = None
         self.current = 1
         self.pending_sequence_value = None
+        self.phase_value = None
         self.staged = False
         self.boot_selected = False
         self.activate_calls = 0
@@ -175,6 +176,7 @@ class FakeOta:
         if self.activate_error:
             raise OSError(self.activate_error)
         self.pending_sequence_value = self.begin_args[2]
+        self.phase_value = "activated"
         self.boot_selected = True
         return True
 
@@ -192,8 +194,13 @@ class FakeOta:
     def pending_sequence(self):
         return self.pending_sequence_value
 
+    def phase(self):
+        return self.phase_value
+
     def status(self):
-        return {"state": "idle"}
+        return {
+            "state": "ready_to_reboot" if self.boot_selected else "idle",
+        }
 
 
 def make_system(image=b"abcdefgh", sequence=2, **coordinator_kwargs):
@@ -420,6 +427,37 @@ def test_staged_image_requires_full_release_then_second_three_second_touch() -> 
     assert ota.reboot_calls == 1
 
 
+def test_reboot_callback_failure_after_activate_preserves_boot_and_pending_metadata() -> None:
+    def fail_reboot():
+        raise OSError("reboot callback failed")
+
+    coordinator, dependencies, clock = make_system(reboot=fail_reboot)
+    tick_until(coordinator, "waiting_for_gates")
+    clock[0] = 3000
+    tick_until(coordinator, "awaiting_activation_release")
+    dependencies["touch"].both_touched = False
+    dependencies["touch"].touch_mask = 0
+    clock[0] = 4000
+    coordinator.tick()
+    clock[0] = 4500
+    coordinator.tick()
+    dependencies["touch"].both_touched = True
+    dependencies["touch"].touch_mask = 3
+    clock[0] = 5000
+    coordinator.tick()
+    clock[0] = 8000
+    coordinator.tick()
+
+    ota = dependencies["ota_module"]
+    status = coordinator.status()
+    assert status["ota_state"] == "activated_reboot_failed"
+    assert "activated but reboot failed" in status["ota_error"]
+    assert ota.boot_selected is True
+    assert ota.pending_sequence() == 2
+    assert ota.phase() == "activated"
+    assert ota.abort_calls == 0
+
+
 def test_second_touch_must_also_be_continuous() -> None:
     coordinator, dependencies, clock = make_system()
     tick_until(coordinator, "waiting_for_gates")
@@ -593,6 +631,21 @@ def test_storage_worker_stopped_rejects_update_request() -> None:
     assert "not running" in coordinator.status()["ota_error"]
 
 
+def test_storage_worker_starting_has_total_five_second_deadline() -> None:
+    coordinator, dependencies, clock = make_system()
+    dependencies["storage"].runtime_state = "starting"
+    coordinator.tick()
+    clock[0] = 4999
+    coordinator.tick()
+    assert coordinator.status()["ota_state"] == "loading_manifest"
+
+    clock[0] = 5000
+    coordinator.tick()
+
+    assert coordinator.status()["ota_state"] == "denied"
+    assert "startup timeout" in coordinator.status()["ota_error"]
+
+
 def test_tick_is_top_level_fail_closed() -> None:
     coordinator, dependencies, _clock = make_system()
 
@@ -740,6 +793,7 @@ def test_native_module_surface_build_chain_and_rollback_config() -> None:
         "pending_verify",
         "current_sequence",
         "pending_sequence",
+        "phase",
         "mark_healthy",
         "rollback_and_reboot",
     ):
@@ -758,6 +812,8 @@ def test_native_module_surface_build_chain_and_rollback_config() -> None:
         "nvs_erase_key",
         "nvs_commit",
         "MBEDTLS_ECP_DP_SECP256R1",
+        "esp_ota_get_boot_partition",
+        "MBEDTLS_PRIVATE(grp).id",
     ):
         assert symbol in source
     verify_body = source[
@@ -767,7 +823,7 @@ def test_native_module_surface_build_chain_and_rollback_config() -> None:
     assert "mbedtls_pk_get_type" in verify_body
     assert "result = -1" in verify_body
     assert "MBEDTLS_PK_ECKEY" in verify_body
-    assert "MBEDTLS_ECP_DP_SECP256R1" in verify_body
+    assert "ec_key->MBEDTLS_PRIVATE(grp).id == MBEDTLS_ECP_DP_SECP256R1" in verify_body
     finish_body = source[
         source.index("static mp_obj_t nao_ota_finish")
         : source.index("static MP_DEFINE_CONST_FUN_OBJ_0(nao_ota_finish_obj")
@@ -778,8 +834,10 @@ def test_native_module_surface_build_chain_and_rollback_config() -> None:
     ]
     assert "esp_ota_set_boot_partition" not in finish_body
     assert "esp_ota_set_boot_partition" in activate_body
-    assert "NAOBOT_OTA_PENDING_SEQUENCE_KEY" in activate_body
+    assert "naobot_nvs_write_transaction" in activate_body
+    assert "NAOBOT_OTA_PENDING_SEQUENCE_KEY" in source
     assert "static MP_DEFINE_CONST_FUN_OBJ_3(nao_ota_begin_obj" in source
+    assert "static MP_DEFINE_CONST_FUN_OBJ_2(nao_ota_begin_obj" not in source
     assert "MP_REGISTER_MODULE(MP_QSTR_nao_ota" in source
     assert "target_link_libraries(usermod INTERFACE usermod_ota)" in cmake
     assert "__idf_nvs_flash" in cmake
@@ -809,14 +867,64 @@ def test_native_sequence_promotion_and_rollback_are_fail_closed() -> None:
     assert "uint32_t sequence" in begin_body
     assert "naobot_get_uint32" in begin_body
     assert "sequence <= current_sequence" in begin_body
-    assert "NAOBOT_OTA_CURRENT_SEQUENCE_KEY" in mark_body
-    assert "NAOBOT_OTA_PENDING_SEQUENCE_KEY" in mark_body
-    assert mark_body.index("nvs_set_u32") < mark_body.index("nvs_erase_key")
-    assert "nvs_commit" in mark_body
-    assert "nvs_erase_key" in rollback_body
-    assert rollback_body.index("nvs_erase_key") < rollback_body.index(
+    assert "OTA sequence must be uint32" in begin_body
+    assert "NAOBOT_OTA_CURRENT_SEQUENCE_KEY" in source
+    assert "NAOBOT_OTA_PENDING_SEQUENCE_KEY" in source
+    assert "NAOBOT_OTA_PHASE_CONFIRMING" in mark_body
+    confirming_commit = mark_body.index("naobot_nvs_begin_confirming")
+    mark_valid = mark_body.index("esp_ota_mark_app_valid_cancel_rollback")
+    clear_transaction = mark_body.index("naobot_nvs_clear_transaction")
+    assert confirming_commit < mark_valid < clear_transaction
+    assert "naobot_nvs_clear_transaction" in rollback_body
+    assert rollback_body.index("naobot_nvs_clear_transaction") < rollback_body.index(
         "esp_ota_mark_app_invalid_rollback_and_reboot"
     )
+
+
+def test_native_activation_transaction_and_recovery_are_persistent_and_idempotent() -> None:
+    source = (NATIVE_ROOT / "modnao_ota.c").read_text(encoding="utf-8")
+    activate_body = source[
+        source.index("static mp_obj_t nao_ota_activate")
+        : source.index("static MP_DEFINE_CONST_FUN_OBJ_0(nao_ota_activate_obj")
+    ]
+    recovery_body = source[
+        source.index("static esp_err_t naobot_ota_recover_transaction")
+        : source.index("static mp_obj_t nao_ota_verify_manifest")
+    ]
+
+    for phase in ("PREPARED", "ACTIVATED", "CONFIRMING", "ROLLBACK"):
+        assert f"NAOBOT_OTA_PHASE_{phase}" in source
+    prepared = activate_body.index("NAOBOT_OTA_PHASE_PREPARED")
+    select_boot = activate_body.index("esp_ota_set_boot_partition")
+    activated = activate_body.index("NAOBOT_OTA_PHASE_ACTIVATED")
+    assert prepared < select_boot < activated
+    assert "naobot_partition_state" in recovery_body
+    assert "transaction.target_address" in recovery_body
+    assert "esp_ota_get_state_partition" in source
+    assert "NAOBOT_OTA_TARGET_ADDRESS_KEY" in source
+    for symbol in (
+        "esp_ota_get_running_partition",
+        "esp_ota_get_boot_partition",
+        "NAOBOT_OTA_PHASE_PREPARED",
+        "NAOBOT_OTA_PHASE_ACTIVATED",
+        "NAOBOT_OTA_PHASE_CONFIRMING",
+        "NAOBOT_OTA_PHASE_ROLLBACK",
+        "esp_ota_mark_app_valid_cancel_rollback",
+    ):
+        assert symbol in recovery_body
+
+
+def test_native_abort_is_limited_to_writing_or_staged_and_checks_native_result() -> None:
+    source = (NATIVE_ROOT / "modnao_ota.c").read_text(encoding="utf-8")
+    abort_body = source[
+        source.index("static mp_obj_t nao_ota_abort")
+        : source.index("static MP_DEFINE_CONST_FUN_OBJ_0(nao_ota_abort_obj")
+    ]
+    assert "ota_state != NAOBOT_OTA_WRITING && ota_state != NAOBOT_OTA_STAGED" in abort_body
+    assert "esp_ota_abort" in abort_body
+    assert "abort_result != ESP_OK" in abort_body
+    assert "esp_ota_set_boot_partition" not in abort_body
+    assert "naobot_nvs_clear_transaction" not in abort_body
 
 
 def test_repository_contains_only_replaceable_non_production_public_key_material() -> None:

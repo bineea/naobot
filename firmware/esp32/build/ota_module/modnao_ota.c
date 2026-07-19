@@ -23,6 +23,25 @@
 #define NAOBOT_OTA_NVS_NAMESPACE "nao_ota"
 #define NAOBOT_OTA_CURRENT_SEQUENCE_KEY "current_seq"
 #define NAOBOT_OTA_PENDING_SEQUENCE_KEY "pending_seq"
+#define NAOBOT_OTA_PHASE_KEY "phase"
+#define NAOBOT_OTA_TARGET_ADDRESS_KEY "target_addr"
+
+typedef enum {
+    NAOBOT_OTA_PHASE_NONE = 0,
+    NAOBOT_OTA_PHASE_PREPARED = 1,
+    NAOBOT_OTA_PHASE_ACTIVATED = 2,
+    NAOBOT_OTA_PHASE_CONFIRMING = 3,
+    NAOBOT_OTA_PHASE_ROLLBACK = 4,
+} naobot_ota_phase_t;
+
+typedef struct {
+    bool pending_found;
+    uint32_t pending_sequence;
+    bool phase_found;
+    naobot_ota_phase_t phase;
+    bool target_found;
+    uint32_t target_address;
+} naobot_ota_transaction_t;
 
 typedef enum {
     NAOBOT_OTA_IDLE,
@@ -79,11 +98,7 @@ static void naobot_ota_free_sha256(void) {
     }
 }
 
-static esp_err_t naobot_nvs_get_optional_u32(
-    const char *key,
-    uint32_t *value,
-    bool *found
-) {
+static esp_err_t naobot_nvs_get_optional_u32(const char *key, uint32_t *value, bool *found) {
     nvs_handle_t handle = 0;
     esp_err_t result = nvs_open(NAOBOT_OTA_NVS_NAMESPACE, NVS_READONLY, &handle);
     if (result == ESP_ERR_NVS_NOT_FOUND) {
@@ -105,33 +120,256 @@ static esp_err_t naobot_nvs_get_optional_u32(
     return result;
 }
 
-static esp_err_t naobot_nvs_clear_pending(void) {
+static esp_err_t naobot_nvs_erase_optional(nvs_handle_t handle, const char *key) {
+    esp_err_t result = nvs_erase_key(handle, key);
+    return result == ESP_ERR_NVS_NOT_FOUND ? ESP_OK : result;
+}
+
+static esp_err_t naobot_nvs_read_transaction(naobot_ota_transaction_t *transaction) {
+    memset(transaction, 0, sizeof(*transaction));
+    uint32_t phase = NAOBOT_OTA_PHASE_NONE;
+    esp_err_t result = naobot_nvs_get_optional_u32(
+        NAOBOT_OTA_PENDING_SEQUENCE_KEY,
+        &transaction->pending_sequence,
+        &transaction->pending_found
+    );
+    if (result == ESP_OK) {
+        result = naobot_nvs_get_optional_u32(
+            NAOBOT_OTA_PHASE_KEY,
+            &phase,
+            &transaction->phase_found
+        );
+    }
+    if (result == ESP_OK) {
+        result = naobot_nvs_get_optional_u32(
+            NAOBOT_OTA_TARGET_ADDRESS_KEY,
+            &transaction->target_address,
+            &transaction->target_found
+        );
+    }
+    transaction->phase = (naobot_ota_phase_t)phase;
+    return result;
+}
+
+static esp_err_t naobot_nvs_write_transaction(
+    uint32_t pending_sequence,
+    uint32_t target_address,
+    naobot_ota_phase_t phase
+) {
     nvs_handle_t handle = 0;
     esp_err_t result = nvs_open(NAOBOT_OTA_NVS_NAMESPACE, NVS_READWRITE, &handle);
-    if (result == ESP_ERR_NVS_NOT_FOUND) {
-        return ESP_OK;
+    if (result == ESP_OK) {
+        result = nvs_set_u32(handle, NAOBOT_OTA_PENDING_SEQUENCE_KEY, pending_sequence);
     }
-    if (result != ESP_OK) {
-        return result;
+    if (result == ESP_OK) {
+        result = nvs_set_u32(handle, NAOBOT_OTA_TARGET_ADDRESS_KEY, target_address);
     }
-    result = nvs_erase_key(handle, NAOBOT_OTA_PENDING_SEQUENCE_KEY);
-    if (result == ESP_ERR_NVS_NOT_FOUND) {
-        result = ESP_OK;
+    if (result == ESP_OK) {
+        result = nvs_set_u32(handle, NAOBOT_OTA_PHASE_KEY, (uint32_t)phase);
     }
     if (result == ESP_OK) {
         result = nvs_commit(handle);
     }
-    nvs_close(handle);
+    if (handle != 0) {
+        nvs_close(handle);
+    }
     return result;
 }
 
-static void naobot_ota_abort_active(void) {
+static esp_err_t naobot_nvs_set_phase(naobot_ota_phase_t phase) {
+    nvs_handle_t handle = 0;
+    esp_err_t result = nvs_open(NAOBOT_OTA_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (result == ESP_OK) {
+        result = nvs_set_u32(handle, NAOBOT_OTA_PHASE_KEY, (uint32_t)phase);
+    }
+    if (result == ESP_OK) {
+        result = nvs_commit(handle);
+    }
+    if (handle != 0) {
+        nvs_close(handle);
+    }
+    return result;
+}
+
+static esp_err_t naobot_nvs_begin_confirming(uint32_t pending_sequence) {
+    nvs_handle_t handle = 0;
+    esp_err_t result = nvs_open(NAOBOT_OTA_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (result == ESP_OK) {
+        result = nvs_set_u32(handle, NAOBOT_OTA_CURRENT_SEQUENCE_KEY, pending_sequence);
+    }
+    if (result == ESP_OK) {
+        result = nvs_set_u32(
+            handle,
+            NAOBOT_OTA_PHASE_KEY,
+            (uint32_t)NAOBOT_OTA_PHASE_CONFIRMING
+        );
+    }
+    if (result == ESP_OK) {
+        result = nvs_commit(handle);
+    }
+    if (handle != 0) {
+        nvs_close(handle);
+    }
+    return result;
+}
+
+static esp_err_t naobot_nvs_clear_transaction(void) {
+    nvs_handle_t handle = 0;
+    esp_err_t result = nvs_open(NAOBOT_OTA_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (result == ESP_OK) {
+        result = naobot_nvs_erase_optional(handle, NAOBOT_OTA_PENDING_SEQUENCE_KEY);
+    }
+    if (result == ESP_OK) {
+        result = naobot_nvs_erase_optional(handle, NAOBOT_OTA_PHASE_KEY);
+    }
+    if (result == ESP_OK) {
+        result = naobot_nvs_erase_optional(handle, NAOBOT_OTA_TARGET_ADDRESS_KEY);
+    }
+    if (result == ESP_OK) {
+        result = nvs_commit(handle);
+    }
+    if (handle != 0) {
+        nvs_close(handle);
+    }
+    return result;
+}
+
+static const char *naobot_ota_phase_name(naobot_ota_phase_t phase) {
+    switch (phase) {
+        case NAOBOT_OTA_PHASE_PREPARED:
+            return "prepared";
+        case NAOBOT_OTA_PHASE_ACTIVATED:
+            return "activated";
+        case NAOBOT_OTA_PHASE_CONFIRMING:
+            return "confirming";
+        case NAOBOT_OTA_PHASE_ROLLBACK:
+            return "rollback";
+        default:
+            return "none";
+    }
+}
+
+static esp_err_t naobot_partition_state(
+    const esp_partition_t *partition,
+    esp_ota_img_states_t *state,
+    bool *found
+) {
+    esp_err_t result = esp_ota_get_state_partition(partition, state);
+    if (result == ESP_ERR_NOT_FOUND || result == ESP_ERR_NOT_SUPPORTED) {
+        *found = false;
+        return ESP_OK;
+    }
+    *found = result == ESP_OK;
+    return result;
+}
+
+static esp_err_t naobot_ota_abort_active(void) {
+    esp_err_t result = ESP_OK;
     if (ota_active) {
-        esp_ota_abort(ota_handle);
+        result = esp_ota_abort(ota_handle);
         ota_active = false;
     }
     naobot_ota_free_sha256();
     ota_partition = NULL;
+    return result;
+}
+
+static void naobot_ota_record_failure_after_abort(const char *message) {
+    esp_err_t abort_result = naobot_ota_abort_active();
+    if (abort_result == ESP_OK) {
+        snprintf(ota_last_error, sizeof(ota_last_error), "%s", message);
+    } else {
+        snprintf(
+            ota_last_error,
+            sizeof(ota_last_error),
+            "%s; esp_ota_abort failed: 0x%x",
+            message,
+            abort_result
+        );
+    }
+    ota_state = NAOBOT_OTA_FAILED;
+}
+
+static esp_err_t naobot_ota_recover_transaction(void) {
+    naobot_ota_transaction_t transaction;
+    esp_err_t result = naobot_nvs_read_transaction(&transaction);
+    if (result != ESP_OK) {
+        return result;
+    }
+    if (!transaction.pending_found) {
+        if (transaction.phase_found || transaction.target_found) {
+            return naobot_nvs_clear_transaction();
+        }
+        return ESP_OK;
+    }
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *boot = esp_ota_get_boot_partition();
+    if (running == NULL || boot == NULL) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    esp_ota_img_states_t running_state = ESP_OTA_IMG_UNDEFINED;
+    bool running_state_found = false;
+    result = naobot_partition_state(running, &running_state, &running_state_found);
+    if (result != ESP_OK) {
+        return result;
+    }
+
+    if (!transaction.phase_found || !transaction.target_found) {
+        if (running_state_found && running_state == ESP_OTA_IMG_PENDING_VERIFY) {
+            return naobot_nvs_write_transaction(
+                transaction.pending_sequence,
+                running->address,
+                NAOBOT_OTA_PHASE_ACTIVATED
+            );
+        }
+        if (boot->address != running->address) {
+            return naobot_nvs_write_transaction(
+                transaction.pending_sequence,
+                boot->address,
+                NAOBOT_OTA_PHASE_ACTIVATED
+            );
+        }
+        return naobot_nvs_clear_transaction();
+    }
+
+    bool running_is_target = running->address == transaction.target_address;
+    bool boot_is_target = boot->address == transaction.target_address;
+    switch (transaction.phase) {
+        case NAOBOT_OTA_PHASE_PREPARED:
+            if (running_is_target || boot_is_target) {
+                return naobot_nvs_set_phase(NAOBOT_OTA_PHASE_ACTIVATED);
+            }
+            return naobot_nvs_clear_transaction();
+        case NAOBOT_OTA_PHASE_ACTIVATED:
+            if (running_is_target || boot_is_target) {
+                return ESP_OK;
+            }
+            return naobot_nvs_set_phase(NAOBOT_OTA_PHASE_ROLLBACK);
+        case NAOBOT_OTA_PHASE_CONFIRMING:
+            if (!running_is_target) {
+                return naobot_nvs_set_phase(NAOBOT_OTA_PHASE_ROLLBACK);
+            }
+            if (
+                running_state_found
+                && running_state == ESP_OTA_IMG_PENDING_VERIFY
+            ) {
+                result = esp_ota_mark_app_valid_cancel_rollback();
+                if (result != ESP_OK) {
+                    return result;
+                }
+            } else if (
+                !running_state_found
+                || running_state != ESP_OTA_IMG_VALID
+            ) {
+                return ESP_ERR_INVALID_STATE;
+            }
+            return naobot_nvs_clear_transaction();
+        case NAOBOT_OTA_PHASE_ROLLBACK:
+            return ESP_OK;
+        default:
+            return naobot_nvs_clear_transaction();
+    }
 }
 
 static bool naobot_constant_time_equal(const uint8_t *left, const uint8_t *right, size_t size) {
@@ -186,7 +424,7 @@ static mp_obj_t nao_ota_verify_manifest(mp_obj_t manifest_in, mp_obj_t signature
         mbedtls_ecp_keypair *ec_key = mbedtls_pk_ec(public_key);
         if (
             ec_key != NULL
-            && ec_key->grp.id == MBEDTLS_ECP_DP_SECP256R1
+            && ec_key->MBEDTLS_PRIVATE(grp).id == MBEDTLS_ECP_DP_SECP256R1
             && mbedtls_pk_can_do(&public_key, MBEDTLS_PK_ECDSA)
         ) {
             result = mbedtls_pk_verify(
@@ -226,11 +464,20 @@ static mp_obj_t nao_ota_begin(
         mp_raise_ValueError(MP_ERROR_TEXT("expected sha256 must be 32 bytes"));
     }
 
+    esp_err_t result = naobot_ota_recover_transaction();
+    if (result != ESP_OK) {
+        naobot_ota_set_esp_error("recover OTA transaction", result);
+        mp_raise_msg_varg(
+            &mp_type_OSError,
+            MP_ERROR_TEXT("recover OTA transaction failed: 0x%x"),
+            result
+        );
+    }
     uint32_t current_sequence = 0;
     uint32_t pending_sequence = 0;
     bool current_found = false;
     bool pending_found = false;
-    esp_err_t result = naobot_nvs_get_optional_u32(
+    result = naobot_nvs_get_optional_u32(
         NAOBOT_OTA_CURRENT_SEQUENCE_KEY,
         &current_sequence,
         &current_found
@@ -278,8 +525,7 @@ static mp_obj_t nao_ota_begin(
     mbedtls_sha256_init(&ota_sha256);
     ota_sha256_active = true;
     if (mbedtls_sha256_starts(&ota_sha256, 0) != 0) {
-        naobot_ota_abort_active();
-        naobot_ota_set_error("sha256 initialization failed");
+        naobot_ota_record_failure_after_abort("sha256 initialization failed");
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("sha256 initialization failed"));
     }
     ota_state = NAOBOT_OTA_WRITING;
@@ -297,19 +543,18 @@ static mp_obj_t nao_ota_write(mp_obj_t chunk_in) {
         chunk.len == 0 || chunk.len > NAOBOT_OTA_MAX_CHUNK_SIZE
         || chunk.len > ota_expected_size - ota_written_size
     ) {
-        naobot_ota_abort_active();
-        naobot_ota_set_error("invalid OTA chunk size");
+        naobot_ota_record_failure_after_abort("invalid OTA chunk size");
         mp_raise_ValueError(MP_ERROR_TEXT("invalid OTA chunk size"));
     }
     esp_err_t result = esp_ota_write(ota_handle, chunk.buf, chunk.len);
     if (result != ESP_OK) {
-        naobot_ota_abort_active();
-        naobot_ota_set_esp_error("esp_ota_write", result);
+        char message[64];
+        snprintf(message, sizeof(message), "esp_ota_write failed: 0x%x", result);
+        naobot_ota_record_failure_after_abort(message);
         mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT("esp_ota_write failed: 0x%x"), result);
     }
     if (mbedtls_sha256_update(&ota_sha256, chunk.buf, chunk.len) != 0) {
-        naobot_ota_abort_active();
-        naobot_ota_set_error("sha256 update failed");
+        naobot_ota_record_failure_after_abort("sha256 update failed");
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("sha256 update failed"));
     }
     ota_written_size += chunk.len;
@@ -322,20 +567,17 @@ static mp_obj_t nao_ota_finish(void) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("OTA is not active"));
     }
     if (ota_written_size != ota_expected_size) {
-        naobot_ota_abort_active();
-        naobot_ota_set_error("firmware size mismatch");
+        naobot_ota_record_failure_after_abort("firmware size mismatch");
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("firmware size mismatch"));
     }
     uint8_t actual_sha256[32];
     if (mbedtls_sha256_finish(&ota_sha256, actual_sha256) != 0) {
-        naobot_ota_abort_active();
-        naobot_ota_set_error("sha256 finish failed");
+        naobot_ota_record_failure_after_abort("sha256 finish failed");
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("sha256 finish failed"));
     }
     naobot_ota_free_sha256();
     if (!naobot_constant_time_equal(actual_sha256, ota_expected_sha256, sizeof(actual_sha256))) {
-        naobot_ota_abort_active();
-        naobot_ota_set_error("firmware digest mismatch");
+        naobot_ota_record_failure_after_abort("firmware digest mismatch");
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("firmware digest mismatch"));
     }
 
@@ -356,31 +598,31 @@ static mp_obj_t nao_ota_activate(void) {
     if (ota_state != NAOBOT_OTA_STAGED || ota_partition == NULL) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("OTA image is not staged"));
     }
-    nvs_handle_t handle = 0;
-    esp_err_t result = nvs_open(NAOBOT_OTA_NVS_NAMESPACE, NVS_READWRITE, &handle);
-    if (result == ESP_OK) {
-        result = nvs_set_u32(handle, NAOBOT_OTA_PENDING_SEQUENCE_KEY, ota_sequence);
-    }
-    if (result == ESP_OK) {
-        result = nvs_commit(handle);
-    }
-    if (handle != 0) {
-        nvs_close(handle);
-    }
+    esp_err_t result = naobot_nvs_write_transaction(
+        ota_sequence,
+        ota_partition->address,
+        NAOBOT_OTA_PHASE_PREPARED
+    );
     if (result != ESP_OK) {
-        naobot_ota_set_esp_error("save pending sequence", result);
-        mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT("save pending sequence failed: 0x%x"), result);
+        naobot_ota_set_esp_error("prepare OTA activation", result);
+        mp_raise_msg_varg(
+            &mp_type_OSError,
+            MP_ERROR_TEXT("prepare OTA activation failed: 0x%x"),
+            result
+        );
     }
 
     result = esp_ota_set_boot_partition(ota_partition);
     if (result != ESP_OK) {
-        esp_err_t clear_result = naobot_nvs_clear_pending();
+        esp_err_t phase_result = naobot_nvs_set_phase(NAOBOT_OTA_PHASE_ROLLBACK);
+        esp_err_t clear_result = naobot_nvs_clear_transaction();
         if (clear_result != ESP_OK) {
             snprintf(
                 ota_last_error,
                 sizeof(ota_last_error),
-                "set boot failed: 0x%x; clear pending failed: 0x%x",
+                "set boot failed: 0x%x; rollback phase: 0x%x; clear transaction: 0x%x",
                 result,
+                phase_result,
                 clear_result
             );
             ota_state = NAOBOT_OTA_FAILED;
@@ -393,48 +635,40 @@ static mp_obj_t nao_ota_activate(void) {
             result
         );
     }
-    ota_partition = NULL;
+
     ota_state = NAOBOT_OTA_ACTIVATED;
-    ota_last_error[0] = '\0';
+    ota_partition = NULL;
+    result = naobot_nvs_set_phase(NAOBOT_OTA_PHASE_ACTIVATED);
+    if (result == ESP_OK) {
+        ota_last_error[0] = '\0';
+    } else {
+        snprintf(
+            ota_last_error,
+            sizeof(ota_last_error),
+            "activated; phase commit pending recovery: 0x%x",
+            result
+        );
+    }
     return mp_const_true;
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(nao_ota_activate_obj, nao_ota_activate);
 
 static mp_obj_t nao_ota_abort(void) {
-    bool had_work = ota_active || ota_partition != NULL || ota_state == NAOBOT_OTA_ACTIVATED;
-    esp_err_t abort_result = ESP_OK;
-    if (ota_active) {
-        abort_result = esp_ota_abort(ota_handle);
-        ota_active = false;
+    if (ota_state != NAOBOT_OTA_WRITING && ota_state != NAOBOT_OTA_STAGED) {
+        return mp_const_false;
     }
-    naobot_ota_free_sha256();
-    ota_partition = NULL;
-
-    esp_err_t boot_result = ESP_OK;
-    if (ota_state == NAOBOT_OTA_ACTIVATED) {
-        const esp_partition_t *running = esp_ota_get_running_partition();
-        if (running == NULL) {
-            boot_result = ESP_ERR_NOT_FOUND;
-        } else {
-            boot_result = esp_ota_set_boot_partition(running);
-        }
-    }
-    esp_err_t clear_result = naobot_nvs_clear_pending();
-    if (abort_result != ESP_OK || boot_result != ESP_OK || clear_result != ESP_OK) {
-        snprintf(
-            ota_last_error,
-            sizeof(ota_last_error),
-            "abort=0x%x restore_boot=0x%x clear_pending=0x%x",
-            abort_result,
-            boot_result,
-            clear_result
+    esp_err_t abort_result = naobot_ota_abort_active();
+    if (abort_result != ESP_OK) {
+        naobot_ota_set_esp_error("esp_ota_abort", abort_result);
+        mp_raise_msg_varg(
+            &mp_type_OSError,
+            MP_ERROR_TEXT("esp_ota_abort failed: 0x%x"),
+            abort_result
         );
-        ota_state = NAOBOT_OTA_FAILED;
-        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("OTA abort cleanup failed"));
     }
     ota_state = NAOBOT_OTA_ABORTED;
     snprintf(ota_last_error, sizeof(ota_last_error), "OTA aborted");
-    return mp_obj_new_bool(had_work);
+    return mp_const_true;
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(nao_ota_abort_obj, nao_ota_abort);
 
@@ -466,6 +700,10 @@ static mp_obj_t nao_ota_status(void) {
 static MP_DEFINE_CONST_FUN_OBJ_0(nao_ota_status_obj, nao_ota_status);
 
 static mp_obj_t nao_ota_pending_verify(void) {
+    esp_err_t recovery_result = naobot_ota_recover_transaction();
+    if (recovery_result != ESP_OK) {
+        return mp_const_none;
+    }
     const esp_partition_t *running = esp_ota_get_running_partition();
     if (running == NULL) {
         return mp_const_none;
@@ -483,6 +721,14 @@ static mp_obj_t nao_ota_pending_verify(void) {
 static MP_DEFINE_CONST_FUN_OBJ_0(nao_ota_pending_verify_obj, nao_ota_pending_verify);
 
 static mp_obj_t nao_ota_current_sequence(void) {
+    esp_err_t recovery_result = naobot_ota_recover_transaction();
+    if (recovery_result != ESP_OK) {
+        mp_raise_msg_varg(
+            &mp_type_OSError,
+            MP_ERROR_TEXT("recover OTA transaction failed: 0x%x"),
+            recovery_result
+        );
+    }
     uint32_t sequence = 0;
     bool found = false;
     esp_err_t result = naobot_nvs_get_optional_u32(
@@ -498,6 +744,14 @@ static mp_obj_t nao_ota_current_sequence(void) {
 static MP_DEFINE_CONST_FUN_OBJ_0(nao_ota_current_sequence_obj, nao_ota_current_sequence);
 
 static mp_obj_t nao_ota_pending_sequence(void) {
+    esp_err_t recovery_result = naobot_ota_recover_transaction();
+    if (recovery_result != ESP_OK) {
+        mp_raise_msg_varg(
+            &mp_type_OSError,
+            MP_ERROR_TEXT("recover OTA transaction failed: 0x%x"),
+            recovery_result
+        );
+    }
     uint32_t sequence = 0;
     bool found = false;
     esp_err_t result = naobot_nvs_get_optional_u32(
@@ -512,70 +766,97 @@ static mp_obj_t nao_ota_pending_sequence(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(nao_ota_pending_sequence_obj, nao_ota_pending_sequence);
 
-static mp_obj_t nao_ota_mark_healthy(void) {
-    uint32_t pending_sequence = 0;
-    bool pending_found = false;
-    esp_err_t result = naobot_nvs_get_optional_u32(
-        NAOBOT_OTA_PENDING_SEQUENCE_KEY,
-        &pending_sequence,
-        &pending_found
-    );
-    if (result != ESP_OK) {
-        mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT("read pending sequence failed: 0x%x"), result);
+static mp_obj_t nao_ota_phase(void) {
+    esp_err_t recovery_result = naobot_ota_recover_transaction();
+    if (recovery_result != ESP_OK) {
+        mp_raise_msg_varg(
+            &mp_type_OSError,
+            MP_ERROR_TEXT("recover OTA transaction failed: 0x%x"),
+            recovery_result
+        );
     }
-    if (!pending_found) {
+    naobot_ota_transaction_t transaction;
+    esp_err_t result = naobot_nvs_read_transaction(&transaction);
+    if (result != ESP_OK) {
+        mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT("read OTA phase failed: 0x%x"), result);
+    }
+    if (!transaction.phase_found || transaction.phase == NAOBOT_OTA_PHASE_NONE) {
+        return mp_const_none;
+    }
+    const char *phase = naobot_ota_phase_name(transaction.phase);
+    return mp_obj_new_str(phase, strlen(phase));
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(nao_ota_phase_obj, nao_ota_phase);
+
+static mp_obj_t nao_ota_mark_healthy(void) {
+    esp_err_t result = naobot_ota_recover_transaction();
+    if (result != ESP_OK) {
+        mp_raise_msg_varg(
+            &mp_type_OSError,
+            MP_ERROR_TEXT("recover OTA transaction failed: 0x%x"),
+            result
+        );
+    }
+    naobot_ota_transaction_t transaction;
+    result = naobot_nvs_read_transaction(&transaction);
+    if (result != ESP_OK) {
+        mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT("read OTA transaction failed: 0x%x"), result);
+    }
+    if (!transaction.pending_found) {
         return mp_const_false;
     }
-
-    mp_obj_t pending_verify = nao_ota_pending_verify();
-    if (pending_verify == mp_const_none) {
-        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("pending verify state unavailable"));
+    if (transaction.phase == NAOBOT_OTA_PHASE_ACTIVATED) {
+        result = naobot_nvs_begin_confirming(transaction.pending_sequence);
+        if (result != ESP_OK) {
+            mp_raise_msg_varg(
+                &mp_type_OSError,
+                MP_ERROR_TEXT("begin confirming failed: 0x%x"),
+                result
+            );
+        }
+    } else if (transaction.phase != NAOBOT_OTA_PHASE_CONFIRMING) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("OTA transaction is not confirmable"));
     }
-    if (pending_verify == mp_const_true) {
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t running_state = ESP_OTA_IMG_UNDEFINED;
+    bool running_state_found = false;
+    if (running == NULL) {
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("running partition unavailable"));
+    }
+    result = naobot_partition_state(running, &running_state, &running_state_found);
+    if (result != ESP_OK || !running_state_found) {
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("running image state unavailable"));
+    }
+    if (running_state == ESP_OTA_IMG_PENDING_VERIFY) {
         result = esp_ota_mark_app_valid_cancel_rollback();
         if (result != ESP_OK) {
             mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT("mark healthy failed: 0x%x"), result);
         }
+    } else if (running_state != ESP_OTA_IMG_VALID) {
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("running image is not confirmable"));
     }
 
-    nvs_handle_t handle = 0;
-    result = nvs_open(NAOBOT_OTA_NVS_NAMESPACE, NVS_READWRITE, &handle);
-    if (result == ESP_OK) {
-        result = nvs_set_u32(handle, NAOBOT_OTA_CURRENT_SEQUENCE_KEY, pending_sequence);
-    }
-    if (result == ESP_OK) {
-        result = nvs_erase_key(handle, NAOBOT_OTA_PENDING_SEQUENCE_KEY);
-    }
-    if (result == ESP_OK) {
-        result = nvs_commit(handle);
-    }
-    if (handle != 0) {
-        nvs_close(handle);
-    }
+    result = naobot_nvs_clear_transaction();
     if (result != ESP_OK) {
-        mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT("promote sequence failed: 0x%x"), result);
+        mp_raise_msg_varg(
+            &mp_type_OSError,
+            MP_ERROR_TEXT("finish confirming failed: 0x%x"),
+            result
+        );
     }
     return mp_const_true;
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(nao_ota_mark_healthy_obj, nao_ota_mark_healthy);
 
 static mp_obj_t nao_ota_rollback_and_reboot(void) {
-    nvs_handle_t handle = 0;
-    esp_err_t result = nvs_open(NAOBOT_OTA_NVS_NAMESPACE, NVS_READWRITE, &handle);
-    if (result == ESP_OK) {
-        result = nvs_erase_key(handle, NAOBOT_OTA_PENDING_SEQUENCE_KEY);
-        if (result == ESP_ERR_NVS_NOT_FOUND) {
-            result = ESP_OK;
-        }
-    }
-    if (result == ESP_OK) {
-        result = nvs_commit(handle);
-    }
-    if (handle != 0) {
-        nvs_close(handle);
-    }
+    esp_err_t result = naobot_nvs_set_phase(NAOBOT_OTA_PHASE_ROLLBACK);
     if (result != ESP_OK) {
-        mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT("clear pending sequence failed: 0x%x"), result);
+        mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT("set rollback phase failed: 0x%x"), result);
+    }
+    result = naobot_nvs_clear_transaction();
+    if (result != ESP_OK) {
+        mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT("clear OTA transaction failed: 0x%x"), result);
     }
     result = esp_ota_mark_app_invalid_rollback_and_reboot();
     mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT("rollback failed: 0x%x"), result);
@@ -594,6 +875,7 @@ static const mp_rom_map_elem_t nao_ota_module_globals_table[] = {
     {MP_ROM_QSTR(MP_QSTR_pending_verify), MP_ROM_PTR(&nao_ota_pending_verify_obj)},
     {MP_ROM_QSTR(MP_QSTR_current_sequence), MP_ROM_PTR(&nao_ota_current_sequence_obj)},
     {MP_ROM_QSTR(MP_QSTR_pending_sequence), MP_ROM_PTR(&nao_ota_pending_sequence_obj)},
+    {MP_ROM_QSTR(MP_QSTR_phase), MP_ROM_PTR(&nao_ota_phase_obj)},
     {MP_ROM_QSTR(MP_QSTR_mark_healthy), MP_ROM_PTR(&nao_ota_mark_healthy_obj)},
     {MP_ROM_QSTR(MP_QSTR_rollback_and_reboot), MP_ROM_PTR(&nao_ota_rollback_and_reboot_obj)},
 };

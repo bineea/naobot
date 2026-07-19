@@ -21,6 +21,9 @@ ESP_IMAGE_MAGIC = 0xE9
 ESP_IMAGE_HEADER_SIZE = 24
 ESP_SEGMENT_HEADER_SIZE = 8
 ESP_MAX_SEGMENTS = 16
+ESP32_S3_CHIP_ID = 0x0009
+ESP_CHECKSUM_INITIAL = 0xEF
+ESP_HASH_SIZE = 32
 UINT32_MAX = 0xFFFFFFFF
 
 
@@ -78,8 +81,15 @@ def _validate_esp_image(image: bytes) -> None:
     segment_count = image[1]
     if not 1 <= segment_count <= ESP_MAX_SEGMENTS:
         raise ValueError("firmware ESP image has an invalid segment count")
+    chip_id = struct.unpack_from("<H", image, 12)[0]
+    if chip_id != ESP32_S3_CHIP_ID:
+        raise ValueError("firmware ESP image must target ESP32-S3")
+    hash_appended = image[23]
+    if hash_appended not in (0, 1):
+        raise ValueError("firmware ESP image has an invalid hash_appended flag")
 
     offset = ESP_IMAGE_HEADER_SIZE
+    checksum = ESP_CHECKSUM_INITIAL
     for _ in range(segment_count):
         if offset + ESP_SEGMENT_HEADER_SIZE > len(image):
             raise ValueError("firmware ESP image has a truncated segment header")
@@ -87,7 +97,26 @@ def _validate_esp_image(image: bytes) -> None:
         offset += ESP_SEGMENT_HEADER_SIZE
         if data_size > MAX_IMAGE_SIZE or offset + data_size >= len(image):
             raise ValueError("firmware ESP image has a truncated segment")
+        for value in image[offset : offset + data_size]:
+            checksum ^= value
         offset += data_size
+
+    checksum_position = offset + (-(offset + 1) % 16)
+    if checksum_position >= len(image):
+        raise ValueError("firmware ESP image has no aligned checksum")
+    if any(image[offset:checksum_position]):
+        raise ValueError("firmware ESP image has nonzero checksum padding")
+    if image[checksum_position] != checksum:
+        raise ValueError("firmware ESP image checksum mismatch")
+
+    image_end = checksum_position + 1
+    expected_size = image_end + (ESP_HASH_SIZE if hash_appended else 0)
+    if len(image) != expected_size:
+        raise ValueError("firmware ESP image has invalid aligned length")
+    if hash_appended:
+        expected_hash = sha256(image[:image_end]).digest()
+        if image[image_end:] != expected_hash:
+            raise ValueError("firmware ESP image appended SHA-256 mismatch")
 
 
 def create_update_package(

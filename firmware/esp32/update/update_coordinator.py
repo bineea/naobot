@@ -199,6 +199,7 @@ class UpdateCoordinator:
         self._touch_started_ms = None
         self._release_started_ms = None
         self._activation_touch_started_ms = None
+        self._storage_start_wait_started_ms = None
 
     def request_install(self, sequence):
         if self.ota is None or self._state in (
@@ -238,6 +239,7 @@ class UpdateCoordinator:
         self._touch_started_ms = self.clock_ms() if self._both_touched() else None
         self._release_started_ms = None
         self._activation_touch_started_ms = None
+        self._storage_start_wait_started_ms = None
         return True
 
     def tick(self):
@@ -466,12 +468,18 @@ class UpdateCoordinator:
             self.motion.cancel("ota_activate")
             if self.ota.activate() is not True:
                 raise OSError("OTA activate failed")
-            self.reboot()
         except Exception as exc:
             self._fail(str(exc), abort=True)
             return
         self._state = "activated"
         self._error = None
+        try:
+            self.reboot()
+        except Exception as exc:
+            self._state = "activated_reboot_failed"
+            self._error = "activated but reboot failed: " + (
+                str(exc) or "reboot callback failed"
+            )
 
     def _gate_error(self, require_touch_hold):
         storage = self.storage.snapshot()
@@ -569,6 +577,13 @@ class UpdateCoordinator:
         self._clear_request()
 
     def _fail_closed_exception(self, exc):
+        if self._state in ("activated", "activated_reboot_failed"):
+            self._state = "activated_reboot_failed"
+            self._error = "activated but coordinator failed: " + (
+                str(exc) or "OTA coordinator failed"
+            )
+            self._clear_request()
+            return
         errors = [str(exc) or "OTA coordinator failed"]
         errors.extend(self._cleanup())
         self._state = "failed"
@@ -607,6 +622,18 @@ class UpdateCoordinator:
                 error == "storage worker not running"
                 and self.storage.snapshot().get("runtime_state") == "starting"
             ):
+                current_ms = self.clock_ms()
+                if self._storage_start_wait_started_ms is None:
+                    self._storage_start_wait_started_ms = current_ms
+                elif ticks_diff(
+                    current_ms,
+                    self._storage_start_wait_started_ms,
+                ) >= READ_TIMEOUT_MS:
+                    if abort:
+                        self._abort("storage worker startup timeout")
+                    else:
+                        self._deny("storage worker startup timeout")
+                    return None
                 self._error = error
                 return None
             if abort:
@@ -614,6 +641,7 @@ class UpdateCoordinator:
             else:
                 self._deny(error)
             return None
+        self._storage_start_wait_started_ms = None
         self._request_started_ms = self.clock_ms()
         return request
 

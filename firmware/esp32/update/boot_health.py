@@ -40,6 +40,8 @@ class BootHealthMonitor:
         self._state = "idle"
         self._error = None
         self._pending = False
+        self._pending_sequence = None
+        self._phase = None
         self._pending_started_ms = None
         self._healthy_started_ms = None
 
@@ -48,8 +50,18 @@ class BootHealthMonitor:
             self._tick_pending()
         except Exception as exc:
             error = str(exc) or "boot health monitor failed"
-            if self._pending is True:
-                self._rollback("boot health exception: " + error)
+            if self._is_protected_boot():
+                current_ms = self.clock_ms()
+                if (
+                    self._pending_started_ms is not None
+                    and ticks_diff(current_ms, self._pending_started_ms)
+                    >= VERIFY_DEADLINE_MS
+                ):
+                    self._rollback("boot health deadline after exception: " + error)
+                else:
+                    self._state = "error"
+                    self._error = error
+                    self._healthy_started_ms = None
             else:
                 self._state = "error"
                 self._error = error
@@ -61,22 +73,32 @@ class BootHealthMonitor:
             "state": self._state,
             "error": self._error,
             "pending_verify": self._pending,
+            "pending_sequence": self._pending_sequence,
+            "phase": self._phase,
         }
 
     def _tick_pending(self):
+        pending_error = None
         try:
             pending = self.ota.pending_verify()
         except Exception as exc:
-            self._pending = "unknown"
-            self._state = "error"
-            self._error = str(exc) or "pending verify state unavailable"
-            return
+            pending = "unknown"
+            pending_error = str(exc) or "pending verify state unavailable"
         if pending is None:
-            self._pending = "unknown"
-            self._state = "error"
-            self._error = "pending verify state unavailable"
-            return
-        if pending is not True:
+            pending = "unknown"
+            pending_error = "pending verify state unavailable"
+        self._pending = pending if pending in (True, False) else "unknown"
+
+        metadata_error = None
+        try:
+            self._pending_sequence = self.ota.pending_sequence()
+            self._phase = self.ota.phase()
+        except Exception as exc:
+            self._pending_sequence = "unknown"
+            self._phase = "unknown"
+            metadata_error = str(exc) or "OTA transaction metadata unavailable"
+
+        if not self._is_protected_boot():
             self._pending = False
             self._pending_started_ms = None
             self._healthy_started_ms = None
@@ -86,7 +108,6 @@ class BootHealthMonitor:
             return
 
         current_ms = self.clock_ms()
-        self._pending = True
         if self._pending_started_ms is None:
             self._pending_started_ms = current_ms
         self.motion.cancel("ota_pending_verify")
@@ -101,6 +122,10 @@ class BootHealthMonitor:
             self._rollback("OE disable readback failed during pending verify")
             return
 
+        if self._phase == "rollback":
+            self._rollback("persisted OTA rollback phase")
+            return
+
         power = self.power.snapshot()
         if power.get("available") is not True or power.get("fault") is not False:
             self._rollback("critical power fault during pending verify")
@@ -112,6 +137,14 @@ class BootHealthMonitor:
 
         if ticks_diff(current_ms, self._pending_started_ms) >= VERIFY_DEADLINE_MS:
             self._rollback("pending verify health deadline exceeded")
+            return
+        if self._phase == "confirming" and self._pending is False:
+            self._mark_healthy()
+            return
+        if self._pending == "unknown" or metadata_error is not None:
+            self._healthy_started_ms = None
+            self._state = "error"
+            self._error = pending_error or metadata_error or "OTA boot state unavailable"
             return
         if getattr(self.imu, "available", False) is not True or posture not in SAFE_POSTURES:
             self._healthy_started_ms = None
@@ -125,6 +158,9 @@ class BootHealthMonitor:
         self._error = None
         if ticks_diff(current_ms, self._healthy_started_ms) < HEALTHY_WINDOW_MS:
             return
+        self._mark_healthy()
+
+    def _mark_healthy(self):
         try:
             marked = self.ota.mark_healthy()
         except Exception as exc:
@@ -136,8 +172,21 @@ class BootHealthMonitor:
             self._error = "mark healthy failed"
             return
         self._pending = False
+        try:
+            self._pending_sequence = self.ota.pending_sequence()
+            self._phase = self.ota.phase()
+        except Exception:
+            self._pending_sequence = "unknown"
+            self._phase = "unknown"
         self._state = "healthy"
         self._error = None
+
+    def _is_protected_boot(self):
+        return (
+            self._pending in (True, "unknown")
+            or self._pending_sequence not in (None, False)
+            or self._phase in ("prepared", "activated", "confirming", "rollback", "unknown")
+        )
 
     def _rollback(self, reason):
         self._state = "rollback"

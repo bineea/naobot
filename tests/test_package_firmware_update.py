@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import struct
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -34,12 +35,27 @@ def load_key_validator():
     return module
 
 
-def minimal_esp_image(payload: bytes = b"\x00") -> bytes:
+def minimal_esp_image(
+    payload: bytes = b"\x00",
+    *,
+    chip_id: int = 0x0009,
+    hash_appended: bool = False,
+) -> bytes:
     header = bytearray(24)
     header[0] = 0xE9
     header[1] = 1
+    struct.pack_into("<H", header, 12, chip_id)
+    header[23] = int(hash_appended)
     segment = struct.pack("<II", 0x3F400020, len(payload)) + payload
-    return bytes(header) + segment + b"\xEF"
+    checksum = 0xEF
+    for value in payload:
+        checksum ^= value
+    image_without_checksum = bytes(header) + segment
+    padding = b"\x00" * (-(len(image_without_checksum) + 1) % 16)
+    image = image_without_checksum + padding + bytes([checksum])
+    if hash_appended:
+        image += sha256(image).digest()
+    return image
 
 
 def write_private_key(path: Path):
@@ -240,6 +256,55 @@ def test_package_rejects_non_esp_images(tmp_path: Path, image_bytes: bytes) -> N
         packager.create_update_package(image, private_key, tmp_path / "out", 1, "1", "dev")
 
 
+@pytest.mark.parametrize(
+    ("image_bytes", "error"),
+    [
+        (minimal_esp_image(chip_id=0x0000), "ESP32-S3"),
+        (
+            minimal_esp_image()[:-1] + bytes([minimal_esp_image()[-1] ^ 0x01]),
+            "checksum",
+        ),
+        (
+            minimal_esp_image(hash_appended=True)[:-1]
+            + bytes([minimal_esp_image(hash_appended=True)[-1] ^ 0x01]),
+            "SHA-256",
+        ),
+    ],
+)
+def test_package_rejects_wrong_chip_checksum_and_appended_hash(
+    tmp_path: Path,
+    image_bytes: bytes,
+    error: str,
+) -> None:
+    packager = load_packager()
+    image = tmp_path / "invalid.bin"
+    image.write_bytes(image_bytes)
+    private_key = tmp_path / "signing-key.pem"
+    write_private_key(private_key)
+
+    with pytest.raises(ValueError, match=error):
+        packager.create_update_package(image, private_key, tmp_path / "out", 1, "1", "dev")
+
+
+def test_package_accepts_valid_s3_image_with_appended_hash(tmp_path: Path) -> None:
+    packager = load_packager()
+    image = tmp_path / "valid-hash.bin"
+    image.write_bytes(minimal_esp_image(b"hashed", hash_appended=True))
+    private_key = tmp_path / "signing-key.pem"
+    write_private_key(private_key)
+
+    manifest = packager.create_update_package(
+        image,
+        private_key,
+        tmp_path / "out",
+        1,
+        "1",
+        "dev",
+    )
+
+    assert manifest["image_size"] == len(image.read_bytes())
+
+
 def _write_public_key_header(path: Path, public_key) -> None:
     pem = public_key.public_bytes(
         serialization.Encoding.PEM,
@@ -273,3 +338,26 @@ def test_build_public_key_validator_accepts_only_p256(tmp_path: Path) -> None:
     for rejected in (p384, rsa_header, malformed):
         with pytest.raises(ValueError, match="P-256"):
             validator.validate_public_key_header(rejected)
+
+
+def test_build_public_key_validator_reads_only_one_named_macro(tmp_path: Path) -> None:
+    validator = load_key_validator()
+    valid_public_key = ec.generate_private_key(ec.SECP256R1()).public_key()
+    valid = tmp_path / "valid.h"
+    _write_public_key_header(valid, valid_public_key)
+    valid_macro = valid.read_text(encoding="ascii")
+
+    unrelated = tmp_path / "unrelated-strings.h"
+    unrelated.write_text(
+        '#define DECOY "-----BEGIN PUBLIC KEY-----\\n"\n'
+        + valid_macro.replace("#define NAOBOT_OTA_PUBLIC_KEY_PEM", "#define OTHER_PART")
+        + '#define NAOBOT_OTA_PUBLIC_KEY_PEM "invalid"\n',
+        encoding="ascii",
+    )
+    duplicate = tmp_path / "duplicate.h"
+    duplicate.write_text(valid_macro + valid_macro, encoding="ascii")
+
+    with pytest.raises(ValueError, match="P-256"):
+        validator.validate_public_key_header(unrelated)
+    with pytest.raises(ValueError, match="exactly one"):
+        validator.validate_public_key_header(duplicate)

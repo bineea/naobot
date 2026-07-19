@@ -24,18 +24,31 @@ class FakeOta:
         self.mark_calls = 0
         self.rollback_calls = 0
         self.pending_error = None
+        self.pending_none = False
         self.mark_error = None
+        self.sequence = 2
+        self.phase_value = "activated"
 
     def pending_verify(self):
         if self.pending_error:
             raise OSError(self.pending_error)
+        if self.pending_none:
+            return None
         return self.pending
+
+    def pending_sequence(self):
+        return self.sequence
+
+    def phase(self):
+        return self.phase_value
 
     def mark_healthy(self):
         self.mark_calls += 1
         if self.mark_error:
             raise OSError(self.mark_error)
         self.pending = False
+        self.sequence = None
+        self.phase_value = None
         return True
 
     def rollback_and_reboot(self):
@@ -180,15 +193,43 @@ def test_mark_healthy_failure_keeps_retrying_before_deadline() -> None:
     assert "NVS commit failed" in second["error"]
 
 
-def test_pending_verify_exception_is_unknown_and_never_escapes_tick() -> None:
+@pytest.mark.parametrize("unknown_mode", ["exception", "none"])
+def test_unknown_pending_state_quiesces_and_rolls_back_at_deadline(unknown_mode) -> None:
     monitor, dependencies, _clock = make_monitor()
-    dependencies["ota_module"].pending_error = "native state failed"
+    if unknown_mode == "exception":
+        dependencies["ota_module"].pending_error = "native state failed"
+    else:
+        dependencies["ota_module"].pending_none = True
 
     result = monitor.tick()
 
     assert result["pending_verify"] == "unknown"
     assert result["state"] == "error"
-    assert "native state failed" in result["error"]
+    assert dependencies["motion"].cancelled == ["ota_pending_verify"]
+    assert dependencies["servo_gate"].disabled is True
+    assert dependencies["servo_gate"].confirm_disabled() is True
+    assert dependencies["ota_module"].rollback_calls == 0
+
+    _clock[0] = 30000
+    result = monitor.tick()
+
+    assert dependencies["ota_module"].rollback_calls == 1
+    assert result["state"] == "rollback"
+
+
+def test_valid_confirming_metadata_is_completed_idempotently() -> None:
+    monitor, dependencies, _clock = make_monitor()
+    dependencies["ota_module"].pending = False
+    dependencies["ota_module"].phase_value = "confirming"
+
+    result = monitor.tick()
+
+    assert dependencies["motion"].cancelled == ["ota_pending_verify"]
+    assert dependencies["servo_gate"].disabled is True
+    assert dependencies["ota_module"].mark_calls == 1
+    assert result["state"] == "healthy"
+    assert result["phase"] is None
+    assert result["pending_sequence"] is None
 
 
 @pytest.mark.parametrize("dependency", ["motion", "servo_gate", "power", "imu"])
