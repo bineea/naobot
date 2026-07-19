@@ -840,7 +840,9 @@ def test_native_module_surface_build_chain_and_rollback_config() -> None:
     assert "static MP_DEFINE_CONST_FUN_OBJ_2(nao_ota_begin_obj" not in source
     assert "MP_REGISTER_MODULE(MP_QSTR_nao_ota" in source
     assert "target_link_libraries(usermod INTERFACE usermod_ota)" in cmake
-    assert "__idf_nvs_flash" in cmake
+    assert "target_link_libraries(usermod_ota" not in cmake
+    for idf_target in ("__idf_app_update", "__idf_mbedtls", "__idf_nvs_flash"):
+        assert idf_target not in cmake
     assert "ota_module/micropython.cmake" in camera_cmake
     assert "CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y" in sdkconfig
     assert "OtaPublicKeyHeader" in build_script
