@@ -174,7 +174,7 @@ def create_update_package(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="创建 XIAO ESP32S3 Sense 签名 OTA 包")
-    parser.add_argument("image", type=Path, help="待打包 firmware.bin 路径")
+    parser.add_argument("image", type=Path, help="待打包 OTA 应用镜像 micropython.bin 路径")
     parser.add_argument("--private-key", required=True, type=Path, help="显式 P-256 私钥路径")
     parser.add_argument("--output", required=True, type=Path, help="输出包目录")
     parser.add_argument("--sequence", required=True, type=int)

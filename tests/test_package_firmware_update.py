@@ -361,3 +361,9 @@ def test_build_public_key_validator_reads_only_one_named_macro(tmp_path: Path) -
         validator.validate_public_key_header(unrelated)
     with pytest.raises(ValueError, match="exactly one"):
         validator.validate_public_key_header(duplicate)
+
+
+def test_cli_identifies_the_ota_application_image() -> None:
+    source = TOOL_PATH.read_text(encoding="utf-8")
+
+    assert 'help="待打包 OTA 应用镜像 micropython.bin 路径"' in source
