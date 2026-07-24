@@ -738,18 +738,22 @@ def test_successful_native_abort_releases_motion_lock_and_actions_can_start_agai
     assert servos.enabled is True
 
 
-def test_failed_native_abort_keeps_motion_lock_fail_closed() -> None:
+def test_failed_native_abort_keeps_motion_lock_until_retry_is_confirmed() -> None:
     coordinator, dependencies, clock = make_system(image=b"x" * 8192)
     tick_until(coordinator, "waiting_for_gates")
     clock[0] = 3000
     tick_until(coordinator, "installing")
     dependencies["power"].values["charging"] = False
-    dependencies["ota_module"].abort = lambda: False
+    abort_results = iter((False, True))
+    dependencies["ota_module"].abort = lambda: next(abort_results)
 
     coordinator.tick()
 
     assert coordinator.status()["ota_state"] == "failed"
     assert dependencies["motion"].motion_inhibited is True
+
+    assert coordinator._cleanup() == []
+    assert dependencies["motion"].motion_inhibited is False
 
 
 @pytest.mark.parametrize("failing_dependency", ["servo_gate", "ota_module"])
@@ -1259,15 +1263,59 @@ def test_native_long_image_validation_releases_the_micropython_gil() -> None:
         assert release < call < acquire
 
 
-def test_native_abort_is_limited_to_writing_or_staged_and_checks_native_result() -> None:
+def test_native_failed_terminal_abort_confirms_prior_write_or_digest_cleanup() -> None:
+    source = (NATIVE_ROOT / "modnao_ota.c").read_text(encoding="utf-8")
+    write_body = source[
+        source.index("static mp_obj_t nao_ota_write")
+        : source.index("static MP_DEFINE_CONST_FUN_OBJ_1(nao_ota_write_obj")
+    ]
+    finish_body = source[
+        source.index("static mp_obj_t nao_ota_finish")
+        : source.index("static MP_DEFINE_CONST_FUN_OBJ_0(nao_ota_finish_obj")
+    ]
+    abort_body = source[
+        source.index("static mp_obj_t nao_ota_abort")
+        : source.index("static MP_DEFINE_CONST_FUN_OBJ_0(nao_ota_abort_obj")
+    ]
+
+    assert 'naobot_ota_record_failure_after_abort(message);' in write_body
+    assert 'naobot_ota_record_failure_after_abort("firmware digest mismatch");' in finish_body
+    assert "ota_state == NAOBOT_OTA_FAILED" in abort_body
+    assert "!ota_active && ota_partition == NULL" in abort_body
+    assert "return mp_const_true;" in abort_body
+
+
+def test_native_abort_failure_keeps_active_session_for_retry() -> None:
+    source = (NATIVE_ROOT / "modnao_ota.c").read_text(encoding="utf-8")
+    helper_body = source[
+        source.index("static esp_err_t naobot_ota_abort_active")
+        : source.index("static void naobot_ota_record_failure_after_abort")
+    ]
+    abort_body = source[
+        source.index("static mp_obj_t nao_ota_abort")
+        : source.index("static MP_DEFINE_CONST_FUN_OBJ_0(nao_ota_abort_obj")
+    ]
+
+    native_abort = helper_body.index("esp_ota_abort(ota_handle)")
+    failure_guard = helper_body.index("if (result != ESP_OK)")
+    clear_active = helper_body.index("ota_active = false")
+    clear_partition = helper_body.index("ota_partition = NULL")
+    assert native_abort < failure_guard < clear_active < clear_partition
+    assert "return result;" in helper_body[failure_guard:clear_active]
+    assert "ota_state == NAOBOT_OTA_FAILED" in abort_body
+    assert "esp_ota_abort" in abort_body
+    assert "abort_result != ESP_OK" in abort_body
+
+
+def test_native_abort_does_not_touch_activation_transaction_or_boot_partition() -> None:
     source = (NATIVE_ROOT / "modnao_ota.c").read_text(encoding="utf-8")
     abort_body = source[
         source.index("static mp_obj_t nao_ota_abort")
         : source.index("static MP_DEFINE_CONST_FUN_OBJ_0(nao_ota_abort_obj")
     ]
-    assert "ota_state != NAOBOT_OTA_WRITING && ota_state != NAOBOT_OTA_STAGED" in abort_body
-    assert "esp_ota_abort" in abort_body
-    assert "abort_result != ESP_OK" in abort_body
+
+    assert "NAOBOT_OTA_WRITING" in abort_body
+    assert "NAOBOT_OTA_STAGED" in abort_body
     assert "esp_ota_set_boot_partition" not in abort_body
     assert "naobot_nvs_clear_transaction" not in abort_body
 

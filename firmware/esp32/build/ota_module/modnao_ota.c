@@ -268,6 +268,9 @@ static esp_err_t naobot_ota_abort_active(void) {
     esp_err_t result = ESP_OK;
     if (ota_active) {
         result = esp_ota_abort(ota_handle);
+        if (result != ESP_OK) {
+            return result;
+        }
         ota_active = false;
     }
     naobot_ota_free_sha256();
@@ -681,17 +684,30 @@ static mp_obj_t nao_ota_abort(void) {
     if (ota_long_operation) {
         return mp_const_false;
     }
-    if (ota_state != NAOBOT_OTA_WRITING && ota_state != NAOBOT_OTA_STAGED) {
+    bool failed_cleanup = ota_state == NAOBOT_OTA_FAILED;
+    if (
+        ota_state != NAOBOT_OTA_WRITING && ota_state != NAOBOT_OTA_STAGED
+        && !failed_cleanup
+    ) {
         return mp_const_false;
+    }
+    if (failed_cleanup && !ota_active && ota_partition == NULL) {
+        naobot_ota_free_sha256();
+        return mp_const_true;
     }
     esp_err_t abort_result = naobot_ota_abort_active();
     if (abort_result != ESP_OK) {
-        naobot_ota_set_esp_error("esp_ota_abort", abort_result);
+        if (!failed_cleanup) {
+            naobot_ota_set_esp_error("esp_ota_abort", abort_result);
+        }
         mp_raise_msg_varg(
             &mp_type_OSError,
             MP_ERROR_TEXT("esp_ota_abort failed: 0x%x"),
             abort_result
         );
+    }
+    if (failed_cleanup) {
+        return mp_const_true;
     }
     ota_state = NAOBOT_OTA_ABORTED;
     snprintf(ota_last_error, sizeof(ota_last_error), "OTA aborted");
