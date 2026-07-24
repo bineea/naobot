@@ -692,6 +692,11 @@ static mp_obj_t nao_ota_abort(void) {
     if (ota_long_operation) {
         return mp_const_false;
     }
+    bool idle_cleanup = ota_state == NAOBOT_OTA_IDLE && !ota_active
+        && ota_partition == NULL && !ota_sha256_active;
+    if (idle_cleanup) {
+        return mp_const_true;
+    }
     bool failed_cleanup = ota_state == NAOBOT_OTA_FAILED;
     if (
         ota_state != NAOBOT_OTA_WRITING && ota_state != NAOBOT_OTA_STAGED

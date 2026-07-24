@@ -1012,6 +1012,42 @@ def test_cleanup_motion_release_error_is_contained_until_release_succeeds() -> N
     assert coordinator._cleanup_pending is False
 
 
+def test_pre_begin_exception_retries_false_idle_abort_then_unlocks_on_confirmation() -> None:
+    coordinator, dependencies, _clock = make_system()
+    coordinator.tick()
+    storage = dependencies["storage"]
+
+    def fail_manifest_poll(_request):
+        raise OSError("manifest poll failed")
+
+    storage.poll = fail_manifest_poll
+    dependencies["ota_module"].abort_results = [False, True]
+    coordinator.tick()
+
+    assert coordinator._cleanup_pending is True
+    assert dependencies["ota_module"].session_active() is False
+    assert dependencies["motion"].motion_inhibited is True
+
+    coordinator.tick()
+    assert dependencies["ota_worker"].pending["operation"] == "abort"
+    assert dependencies["ota_worker"].complete_pending() is True
+    coordinator.tick()
+
+    assert dependencies["ota_module"].abort_calls == 1
+    assert coordinator._cleanup_pending is True
+    assert dependencies["motion"].motion_inhibited is True
+    assert dependencies["servo_gate"].disabled is True
+
+    coordinator.tick()
+    assert dependencies["ota_worker"].complete_pending() is True
+    coordinator.tick()
+
+    assert dependencies["ota_module"].abort_calls == 2
+    assert coordinator._cleanup_pending is False
+    assert dependencies["motion"].motion_inhibited is False
+    assert "manifest poll failed" in coordinator.status()["ota_error"]
+
+
 def test_native_digest_failure_is_reported_and_does_not_reboot() -> None:
     coordinator, dependencies, clock = make_system()
     dependencies["ota_module"].finish_error = "firmware digest mismatch"
@@ -1522,6 +1558,35 @@ def test_native_failed_terminal_abort_confirms_prior_write_or_digest_cleanup() -
     assert "ota_state == NAOBOT_OTA_FAILED" in abort_body
     assert "!ota_active && ota_partition == NULL" in abort_body
     assert "return mp_const_true;" in abort_body
+
+
+def test_native_idle_abort_is_idempotent_only_when_no_cleanup_resources_exist() -> None:
+    source = (NATIVE_ROOT / "modnao_ota.c").read_text(encoding="utf-8")
+    abort_body = source[
+        source.index("static mp_obj_t nao_ota_abort")
+        : source.index("static MP_DEFINE_CONST_FUN_OBJ_0(nao_ota_abort_obj")
+    ]
+
+    idle_marker = "bool idle_cleanup = ota_state == NAOBOT_OTA_IDLE"
+    assert idle_marker in abort_body
+    idle_cleanup = abort_body.index(idle_marker)
+    reject_invalid_state = abort_body.index("ota_state != NAOBOT_OTA_WRITING")
+    assert idle_cleanup < reject_invalid_state
+    assert "!ota_active" in abort_body[idle_cleanup:reject_invalid_state]
+    assert "ota_partition == NULL" in abort_body[idle_cleanup:reject_invalid_state]
+    assert "!ota_sha256_active" in abort_body[idle_cleanup:reject_invalid_state]
+    assert "if (idle_cleanup)" in abort_body
+    assert "return mp_const_true;" in abort_body[
+        abort_body.index("if (idle_cleanup)") : reject_invalid_state
+    ]
+    state_guard = abort_body[
+        reject_invalid_state : abort_body.index(
+            "if (failed_cleanup && !ota_active"
+        )
+    ]
+    assert "NAOBOT_OTA_WRITING" in state_guard
+    assert "NAOBOT_OTA_STAGED" in state_guard
+    assert "NAOBOT_OTA_ACTIVATED" not in abort_body
 
 
 def test_native_session_active_reports_the_real_handle_state() -> None:
