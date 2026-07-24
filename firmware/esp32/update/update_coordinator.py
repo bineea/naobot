@@ -223,10 +223,29 @@ class UpdateCoordinator:
         self._native_gate_error = None
         self._native_timed_out = False
         self._motion_lock_held = False
-        self._native_session_active = False
+        self._cleanup_pending = False
+        self._cleanup_request = None
+        self._cleanup_abort_required = False
+        self._cleanup_target_state = None
+        self._cleanup_base_error = None
 
     def request_install(self, sequence):
-        if self.ota is None or self.ota_worker is None or self._state in MOTION_INHIBIT_STATES:
+        if (
+            self.ota is None
+            or self._state in MOTION_INHIBIT_STATES
+            or self._cleanup_pending
+        ):
+            return False
+        native_active, native_error = self._native_session_state()
+        if native_active is not False:
+            self._start_cleanup(
+                native_error or "native OTA session already active",
+                target_state="failed",
+                abort_required=True,
+            )
+            self._tick_cleanup()
+            return False
+        if self.ota_worker is None:
             return False
         worker = self.ota_worker.snapshot()
         if worker.get("runtime_state") not in ("starting", "running") or worker.get("busy"):
@@ -262,11 +281,23 @@ class UpdateCoordinator:
         self._activation_touch_started_ms = None
         self._storage_start_wait_started_ms = None
         self._clear_native_request()
-        self._native_session_active = False
         return True
 
     def tick(self):
         try:
+            if self._cleanup_pending:
+                self._tick_cleanup()
+                return self.status()
+            if self._state not in MOTION_INHIBIT_STATES and self.ota is not None:
+                native_active, native_error = self._native_session_state()
+                if native_active is not False:
+                    self._start_cleanup(
+                        native_error or "orphan native OTA session active",
+                        target_state="failed",
+                        abort_required=True,
+                    )
+                    self._tick_cleanup()
+                    return self.status()
             if self._state in MOTION_INHIBIT_STATES:
                 if not self._acquire_motion_lock():
                     raise RuntimeError("OTA motion inhibit unavailable")
@@ -303,7 +334,11 @@ class UpdateCoordinator:
             progress = min(100, (self._offset * 100) // self._manifest["image_size"])
         pending = False
         pending_error = None
-        if self.ota is not None and self._native_request is None:
+        if (
+            self.ota is not None
+            and self._native_request is None
+            and not self._cleanup_pending
+        ):
             try:
                 native_pending = self.ota.pending_verify()
                 pending = native_pending if native_pending in (True, False) else "unknown"
@@ -381,7 +416,13 @@ class UpdateCoordinator:
         except Exception as exc:
             self._fail(str(exc), abort=True)
             return
-        self._native_session_active = True
+        native_active, native_error = self._native_session_state()
+        if native_active is not True:
+            self._fail(
+                native_error or "native OTA session was not confirmed active",
+                abort=True,
+            )
+            return
         self._state = "installing"
         self._error = None
         self._clear_request()
@@ -549,7 +590,6 @@ class UpdateCoordinator:
             self._activation_touch_started_ms = None
             return
 
-        self._native_session_active = False
         self._state = "activated"
         self._error = None
         if timed_out or gate_error is not None:
@@ -642,28 +682,38 @@ class UpdateCoordinator:
         ) >= TOUCH_HOLD_MS
 
     def _deny(self, error):
-        cleanup_errors = self._cleanup_without_native_abort()
-        errors = [error] + cleanup_errors
-        self._state = "failed" if cleanup_errors else "denied"
-        self._error = "; ".join(errors)
-        self._clear_request()
+        self._start_cleanup(error, target_state="denied", abort_required=False)
+        self._tick_cleanup()
 
     def _abort(self, error):
-        cleanup_errors = self._cleanup()
-        errors = [error or "OTA aborted"] + cleanup_errors
-        self._state = "failed" if cleanup_errors else "aborted"
-        self._error = "; ".join(errors)
-        self._clear_request()
+        self._start_cleanup(
+            error or "OTA aborted",
+            target_state="aborted",
+            abort_required=True,
+        )
+        self._tick_cleanup()
 
     def _fail(self, error, abort=False):
-        errors = [error or "OTA failed"]
-        if abort or self._native_session_active:
-            errors.extend(self._cleanup())
-        elif self._state not in ("activated", "activated_reboot_failed"):
-            errors.extend(self._cleanup_without_native_abort())
-        self._state = "failed"
-        self._error = "; ".join(errors)
-        self._clear_request()
+        if self._state in ("activated", "activated_reboot_failed"):
+            self._state = "activated_reboot_failed"
+            self._error = error or "OTA failed"
+            self._clear_request()
+            return
+        abort_required = abort or self._state in (
+            "installing",
+            "finalizing",
+            "finalize_timeout",
+            "awaiting_activation_release",
+            "waiting_for_activation",
+            "activating",
+            "activation_timeout",
+        )
+        self._start_cleanup(
+            error or "OTA failed",
+            target_state="failed",
+            abort_required=abort_required,
+        )
+        self._tick_cleanup()
 
     def _fail_closed_exception(self, exc):
         if self._native_request is not None:
@@ -677,14 +727,39 @@ class UpdateCoordinator:
             )
             self._clear_request()
             return
-        errors = [str(exc) or "OTA coordinator failed"]
-        errors.extend(self._cleanup())
+        self._start_cleanup(
+            str(exc) or "OTA coordinator failed",
+            target_state="failed",
+            abort_required=self._state in MOTION_INHIBIT_STATES,
+        )
+        self._tick_cleanup()
+
+    def _start_cleanup(self, error, *, target_state, abort_required):
+        if self._cleanup_pending:
+            self._cleanup_target_state = "failed"
+            self._cleanup_base_error = self._join_errors(
+                self._cleanup_base_error,
+                error,
+            )
+            self._cleanup_abort_required = (
+                self._cleanup_abort_required or bool(abort_required)
+            )
+            return
+        self._cleanup_pending = True
+        self._cleanup_request = None
+        self._cleanup_abort_required = bool(abort_required)
+        self._cleanup_target_state = target_state
+        self._cleanup_base_error = error
         self._state = "failed"
-        self._error = "; ".join(errors)
+        self._error = error
         self._clear_request()
 
-    def _cleanup(self):
+    def _tick_cleanup(self):
+        if not self._cleanup_pending:
+            return
         errors = []
+        if not self._acquire_motion_lock():
+            errors.append("OTA motion inhibit unavailable")
         try:
             self.motion.cancel("ota")
         except Exception as exc:
@@ -694,32 +769,81 @@ class UpdateCoordinator:
                 errors.append("OE cleanup unconfirmed")
         except Exception as exc:
             errors.append(str(exc) or "OE cleanup failed")
-        if self._native_session_active:
-            try:
-                if self.ota.abort() is not True:
-                    errors.append("native abort unconfirmed")
-                else:
-                    self._native_session_active = False
-            except Exception as exc:
-                errors.append(str(exc) or "native abort failed")
-        if not errors and not self._native_session_active and not self._release_motion_lock():
-            errors.append("motion inhibit release failed")
-        return errors
 
-    def _cleanup_without_native_abort(self):
-        errors = []
+        if self._cleanup_request is not None:
+            result = self.ota_worker.poll(self._cleanup_request)
+            if not result.get("done"):
+                self._publish_cleanup_errors(errors)
+                return
+            self._cleanup_request = None
+            if result.get("error"):
+                self._cleanup_abort_required = True
+                errors.append(result["error"])
+                self._publish_cleanup_errors(errors)
+                return
+            if result.get("result") is not True:
+                self._cleanup_abort_required = True
+                errors.append("native abort unconfirmed")
+                self._publish_cleanup_errors(errors)
+                return
+            self._cleanup_abort_required = False
+
+        native_active, native_error = self._native_session_state()
+        if native_active is not False:
+            self._cleanup_abort_required = True
+            if native_error:
+                errors.append(native_error)
+
+        if self._cleanup_abort_required:
+            if self.ota_worker is None:
+                errors.append("OTA worker unavailable")
+                self._publish_cleanup_errors(errors)
+                return
+            request = self.ota_worker.submit("abort")
+            if not request.get("accepted"):
+                errors.append(request.get("reason") or "native abort submit failed")
+            else:
+                self._cleanup_request = request
+            self._publish_cleanup_errors(errors)
+            return
+
+        if errors:
+            self._publish_cleanup_errors(errors)
+            return
+        if not self._release_motion_lock():
+            self._publish_cleanup_errors(["motion inhibit release failed"])
+            return
+
+        self._state = self._cleanup_target_state
+        self._error = self._cleanup_base_error
+        self._cleanup_pending = False
+        self._cleanup_request = None
+        self._cleanup_abort_required = False
+        self._cleanup_target_state = None
+        self._cleanup_base_error = None
+
+    def _native_session_state(self):
+        if self.ota is None or not hasattr(self.ota, "session_active"):
+            return None, "native session state unavailable"
         try:
-            self.motion.cancel("ota")
+            active = self.ota.session_active()
         except Exception as exc:
-            errors.append(str(exc) or "motion cleanup failed")
-        try:
-            if not self._disable_servo_output():
-                errors.append("OE cleanup unconfirmed")
-        except Exception as exc:
-            errors.append(str(exc) or "OE cleanup failed")
-        if not errors and not self._release_motion_lock():
-            errors.append("motion inhibit release failed")
-        return errors
+            return None, str(exc) or "native session state unavailable"
+        if active is True or active is False:
+            return active, None
+        return None, "native session state unavailable"
+
+    def _publish_cleanup_errors(self, errors):
+        self._state = "failed"
+        self._error = self._join_errors(self._cleanup_base_error, *errors)
+
+    @staticmethod
+    def _join_errors(*errors):
+        unique = []
+        for error in errors:
+            if error and error not in unique:
+                unique.append(error)
+        return "; ".join(unique)
 
     def _disable_servo_output(self):
         if self.servo_gate.set_disabled(True) is not True:

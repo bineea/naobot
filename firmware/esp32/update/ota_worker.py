@@ -14,7 +14,7 @@ except ImportError:
     default_ota_module = None
 
 
-SUPPORTED_OPERATIONS = ("finish", "activate")
+SUPPORTED_OPERATIONS = ("finish", "activate", "abort")
 
 
 def sleep_ms(delay_ms):
@@ -25,7 +25,7 @@ def sleep_ms(delay_ms):
 
 
 class OtaWorker:
-    """单线程串行执行会整镜像验证的 OTA 原生操作。"""
+    """单线程串行执行可能阻塞安全循环的 OTA 原生操作。"""
 
     def __init__(
         self,

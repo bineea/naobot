@@ -53,6 +53,7 @@ class FakeOta:
 
     def abort(self):
         self.calls.append("abort")
+        return True
 
 
 def make_worker():
@@ -69,7 +70,7 @@ def make_worker():
     return worker, ota, thread_module
 
 
-def test_worker_serializes_only_finish_and_activate_outside_submitter() -> None:
+def test_worker_serializes_finish_activate_and_abort_outside_submitter() -> None:
     worker, ota, thread_module = make_worker()
     assert thread_module.started is not None
 
@@ -94,12 +95,17 @@ def test_worker_serializes_only_finish_and_activate_outside_submitter() -> None:
     assert worker.poll(activate)["result"] is True
     assert ota.calls == ["finish", "activate"]
 
-    for forbidden in ("begin", "write", "abort", "unknown"):
+    abort = worker.submit("abort")
+    assert worker._run_one() is True
+    assert worker.poll(abort)["result"] is True
+    assert ota.calls == ["finish", "activate", "abort"]
+
+    for forbidden in ("begin", "write", "unknown"):
         assert worker.submit(forbidden) == {
             "accepted": False,
             "reason": "unsupported OTA worker operation",
         }
-    assert ota.calls == ["finish", "activate"]
+    assert ota.calls == ["finish", "activate", "abort"]
 
 
 def test_worker_publishes_native_exception_without_escaping() -> None:

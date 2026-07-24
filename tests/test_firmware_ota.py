@@ -207,7 +207,9 @@ class FakeOta:
         self.valid_signature = True
         self.writes = []
         self.begin_args = None
+        self.begin_error = None
         self.abort_calls = 0
+        self.abort_results = []
         self.finish_calls = 0
         self.reboot_calls = 0
         self.pending = False
@@ -220,6 +222,8 @@ class FakeOta:
         self.boot_selected = False
         self.activate_calls = 0
         self.running_target_value = False
+        self.native_active = False
+        self.session_active_error = None
 
     def verify_manifest(self, manifest_bytes, signature_der):
         assert isinstance(manifest_bytes, bytes)
@@ -228,6 +232,9 @@ class FakeOta:
 
     def begin(self, image_size, expected_sha256_bytes, sequence):
         self.begin_args = (image_size, expected_sha256_bytes, sequence)
+        self.native_active = True
+        if self.begin_error:
+            raise OSError(self.begin_error)
         return True
 
     def write(self, chunk):
@@ -239,6 +246,7 @@ class FakeOta:
         if self.finish_error:
             raise OSError(self.finish_error)
         self.staged = True
+        self.native_active = False
         return True
 
     def activate(self):
@@ -252,8 +260,17 @@ class FakeOta:
 
     def abort(self):
         self.abort_calls += 1
+        result = self.abort_results.pop(0) if self.abort_results else True
+        if result is not True:
+            return result
+        self.native_active = False
         self.staged = False
         return True
+
+    def session_active(self):
+        if self.session_active_error:
+            raise OSError(self.session_active_error)
+        return self.native_active
 
     def pending_verify(self):
         return self.pending
@@ -367,6 +384,15 @@ def tick_until(coordinator, state, limit=30):
 def complete_native_operation(coordinator):
     assert coordinator.ota_worker.complete_pending() is True
     return coordinator.tick()
+
+
+def settle_cleanup(coordinator, limit=10):
+    for _ in range(limit):
+        coordinator.ota_worker.complete_pending()
+        coordinator.tick()
+        if not coordinator._cleanup_pending:
+            return coordinator.status()
+    pytest.fail(f"OTA cleanup did not settle: {coordinator.status()}")
 
 
 def test_manifest_validation_is_exact_canonical_and_rejects_stale_sequence() -> None:
@@ -640,6 +666,9 @@ def test_gate_loss_during_install_aborts_and_keeps_oe_disabled() -> None:
     dependencies["power"].values["charging"] = None
 
     coordinator.tick()
+    assert dependencies["ota_module"].abort_calls == 0
+    assert dependencies["motion"].motion_inhibited is True
+    settle_cleanup(coordinator)
 
     assert coordinator.status()["ota_state"] == "aborted"
     assert "charging not confirmed" in coordinator.status()["ota_error"]
@@ -727,6 +756,9 @@ def test_successful_native_abort_releases_motion_lock_and_actions_can_start_agai
     dependencies["power"].values["charging"] = False
 
     coordinator.tick()
+    assert dependencies["ota_module"].abort_calls == 0
+    assert motion.motion_inhibited is True
+    settle_cleanup(coordinator)
 
     assert coordinator.status()["ota_state"] == "aborted"
     assert dependencies["ota_module"].abort_calls == 1
@@ -744,16 +776,116 @@ def test_failed_native_abort_keeps_motion_lock_until_retry_is_confirmed() -> Non
     clock[0] = 3000
     tick_until(coordinator, "installing")
     dependencies["power"].values["charging"] = False
-    abort_results = iter((False, True))
-    dependencies["ota_module"].abort = lambda: next(abort_results)
+    dependencies["ota_module"].abort_results = [False, True]
 
     coordinator.tick()
+    complete_native_operation(coordinator)
 
     assert coordinator.status()["ota_state"] == "failed"
     assert dependencies["motion"].motion_inhibited is True
 
-    assert coordinator._cleanup() == []
+    coordinator.tick()
+    complete_native_operation(coordinator)
     assert dependencies["motion"].motion_inhibited is False
+
+
+def test_new_request_is_rejected_until_failed_native_abort_retry_completes() -> None:
+    coordinator, dependencies, clock = make_system(image=b"x" * 8192)
+    ota = dependencies["ota_module"]
+    ota.abort_results = [False, True]
+    tick_until(coordinator, "waiting_for_gates")
+    clock[0] = 3000
+    tick_until(coordinator, "installing")
+    dependencies["power"].values["charging"] = False
+
+    coordinator.tick()
+    if dependencies["ota_worker"].pending is not None:
+        complete_native_operation(coordinator)
+
+    assert ota.abort_calls == 1
+    assert ota.session_active() is True
+    assert dependencies["motion"].motion_inhibited is True
+    assert coordinator.request_install(3) is False
+
+    coordinator.tick()
+    assert dependencies["ota_worker"].pending["operation"] == "abort"
+    complete_native_operation(coordinator)
+
+    assert ota.abort_calls == 2
+    assert ota.session_active() is False
+    assert dependencies["motion"].motion_inhibited is False
+    assert coordinator.request_install(3) is True
+
+
+def test_partial_begin_abort_failure_is_retried_before_motion_unlock() -> None:
+    coordinator, dependencies, clock = make_system()
+    ota = dependencies["ota_module"]
+    ota.begin_error = "sha256 initialization failed; esp_ota_abort failed"
+    ota.abort_results = [False, True]
+    tick_until(coordinator, "waiting_for_gates")
+    clock[0] = 3000
+
+    coordinator.tick()
+
+    assert ota.session_active() is True
+    assert dependencies["motion"].motion_inhibited is True
+    assert dependencies["ota_worker"].pending["operation"] == "abort"
+    assert ota.abort_calls == 0
+
+    complete_native_operation(coordinator)
+    assert ota.session_active() is True
+    assert dependencies["motion"].motion_inhibited is True
+
+    coordinator.tick()
+    complete_native_operation(coordinator)
+    assert ota.session_active() is False
+    assert dependencies["motion"].motion_inhibited is False
+    assert "sha256 initialization failed" in coordinator.status()["ota_error"]
+
+
+def test_new_coordinator_detects_and_cleans_orphan_native_session() -> None:
+    module = load_coordinator_module()
+    ota = FakeOta()
+    ota.native_active = True
+    motion = FakeMotion()
+    worker = FakeOtaWorker(ota)
+    coordinator = module.UpdateCoordinator(
+        FakeStorage({}),
+        FakePower(),
+        motion,
+        FakeGate(),
+        FakeReflex(),
+        FakeTouch(),
+        ota_module=ota,
+        ota_worker=worker,
+        clock_ms=lambda: 0,
+        reboot=lambda: None,
+    )
+
+    coordinator.tick()
+
+    assert motion.motion_inhibited is True
+    assert worker.pending["operation"] == "abort"
+    assert ota.abort_calls == 0
+    complete_native_operation(coordinator)
+    assert ota.session_active() is False
+    assert motion.motion_inhibited is False
+
+
+def test_unknown_native_session_state_rejects_request_and_stays_fail_closed() -> None:
+    coordinator, dependencies, _clock = make_system()
+    coordinator._state = "idle"
+    coordinator._release_motion_lock()
+    dependencies["ota_module"].session_active_error = "native state unavailable"
+
+    assert coordinator.request_install(3) is False
+    assert dependencies["motion"].motion_inhibited is True
+
+    coordinator.tick()
+    if dependencies["ota_worker"].pending is not None:
+        complete_native_operation(coordinator)
+    assert dependencies["motion"].motion_inhibited is True
+    assert "native state unavailable" in coordinator.status()["ota_error"]
 
 
 @pytest.mark.parametrize("failing_dependency", ["servo_gate", "ota_module"])
@@ -773,6 +905,8 @@ def test_abort_dependency_errors_do_not_escape_the_safety_tick(failing_dependenc
         dependencies["ota_module"].abort = fail
 
     coordinator.tick()
+    if dependencies["ota_worker"].pending is not None:
+        complete_native_operation(coordinator)
 
     assert coordinator.status()["ota_state"] == "failed"
     assert "charging not confirmed" in coordinator.status()["ota_error"]
@@ -826,6 +960,7 @@ def test_each_install_gate_loss_aborts(mutate, expected) -> None:
     mutate(dependencies)
 
     coordinator.tick()
+    complete_native_operation(coordinator)
 
     expected_state = (
         "failed"
@@ -865,6 +1000,7 @@ def test_firmware_chunk_read_also_times_out_after_five_seconds() -> None:
 
     clock[0] = 8000
     coordinator.tick()
+    settle_cleanup(coordinator)
 
     assert coordinator.status()["ota_state"] == "aborted"
     assert "timeout" in coordinator.status()["ota_error"]
@@ -925,6 +1061,7 @@ def test_abort_cleanup_failure_reports_combined_failed_error() -> None:
     dependencies["servo_gate"].set_disabled = fail_oe
     dependencies["ota_module"].abort = fail_abort
     coordinator.tick()
+    complete_native_operation(coordinator)
 
     status = coordinator.status()
     assert status["ota_state"] == "failed"
@@ -993,6 +1130,7 @@ def test_gate_loss_during_background_finish_defers_abort_until_worker_completes(
     dependencies["ota_worker"].stalled_operations.clear()
     complete_native_operation(coordinator)
     assert dependencies["ota_module"].finish_calls == 1
+    complete_native_operation(coordinator)
     assert dependencies["ota_module"].abort_calls == 1
     assert "charging not confirmed" in coordinator.status()["ota_error"]
 
@@ -1018,17 +1156,18 @@ def test_background_finish_timeout_is_fail_closed_without_concurrent_abort() -> 
     assert dependencies["motion"].motion_inhibited is True
 
 
-def test_unavailable_ota_worker_aborts_before_native_finish() -> None:
+def test_unavailable_ota_worker_keeps_native_session_and_motion_lock() -> None:
     coordinator, dependencies, clock = make_system()
     dependencies["ota_worker"].runtime_state = "disabled"
     tick_until(coordinator, "waiting_for_gates")
     clock[0] = 3000
-    tick_until(coordinator, "aborted")
+    tick_until(coordinator, "failed")
 
     assert "OTA worker not running" in coordinator.status()["ota_error"]
     assert dependencies["ota_module"].finish_calls == 0
-    assert dependencies["ota_module"].abort_calls == 1
+    assert dependencies["ota_module"].abort_calls == 0
     assert dependencies["servo_gate"].disabled is True
+    assert dependencies["motion"].motion_inhibited is True
 
 
 @pytest.mark.parametrize("operation", ["begin", "write", "finish", "activate"])
@@ -1112,6 +1251,7 @@ def test_native_module_surface_build_chain_and_rollback_config() -> None:
         "finish",
         "activate",
         "abort",
+        "session_active",
         "status",
         "pending_verify",
         "current_sequence",
@@ -1285,6 +1425,17 @@ def test_native_failed_terminal_abort_confirms_prior_write_or_digest_cleanup() -
     assert "return mp_const_true;" in abort_body
 
 
+def test_native_session_active_reports_the_real_handle_state() -> None:
+    source = (NATIVE_ROOT / "modnao_ota.c").read_text(encoding="utf-8")
+    session_body = source[
+        source.index("static mp_obj_t nao_ota_session_active")
+        : source.index("static MP_DEFINE_CONST_FUN_OBJ_0(nao_ota_session_active_obj")
+    ]
+
+    assert "mp_obj_new_bool(ota_active)" in session_body
+    assert "ota_state" not in session_body
+
+
 def test_native_abort_failure_keeps_active_session_for_retry() -> None:
     source = (NATIVE_ROOT / "modnao_ota.c").read_text(encoding="utf-8")
     helper_body = source[
@@ -1305,6 +1456,24 @@ def test_native_abort_failure_keeps_active_session_for_retry() -> None:
     assert "ota_state == NAOBOT_OTA_FAILED" in abort_body
     assert "esp_ota_abort" in abort_body
     assert "abort_result != ESP_OK" in abort_body
+
+
+def test_native_worker_abort_releases_the_micropython_gil() -> None:
+    source = (NATIVE_ROOT / "modnao_ota.c").read_text(encoding="utf-8")
+    helper_body = source[
+        source.index("static esp_err_t naobot_ota_abort_active")
+        : source.index("static void naobot_ota_record_failure_after_abort")
+    ]
+    abort_body = source[
+        source.index("static mp_obj_t nao_ota_abort")
+        : source.index("static MP_DEFINE_CONST_FUN_OBJ_0(nao_ota_abort_obj")
+    ]
+
+    assert "naobot_ota_abort_active(true)" in abort_body
+    release = helper_body.index("MP_THREAD_GIL_EXIT()")
+    native_abort = helper_body.index("esp_ota_abort(ota_handle)")
+    acquire = helper_body.index("MP_THREAD_GIL_ENTER()")
+    assert release < native_abort < acquire
 
 
 def test_native_abort_does_not_touch_activation_transaction_or_boot_partition() -> None:

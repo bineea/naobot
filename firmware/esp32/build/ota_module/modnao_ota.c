@@ -264,10 +264,18 @@ static esp_err_t naobot_partition_state(
     return result;
 }
 
-static esp_err_t naobot_ota_abort_active(void) {
+static esp_err_t naobot_ota_abort_active(bool release_gil) {
     esp_err_t result = ESP_OK;
     if (ota_active) {
-        result = esp_ota_abort(ota_handle);
+        if (release_gil) {
+            ota_long_operation = true;
+            MP_THREAD_GIL_EXIT();
+            result = esp_ota_abort(ota_handle);
+            MP_THREAD_GIL_ENTER();
+            ota_long_operation = false;
+        } else {
+            result = esp_ota_abort(ota_handle);
+        }
         if (result != ESP_OK) {
             return result;
         }
@@ -279,7 +287,7 @@ static esp_err_t naobot_ota_abort_active(void) {
 }
 
 static void naobot_ota_record_failure_after_abort(const char *message) {
-    esp_err_t abort_result = naobot_ota_abort_active();
+    esp_err_t abort_result = naobot_ota_abort_active(false);
     if (abort_result == ESP_OK) {
         snprintf(ota_last_error, sizeof(ota_last_error), "%s", message);
     } else {
@@ -695,7 +703,7 @@ static mp_obj_t nao_ota_abort(void) {
         naobot_ota_free_sha256();
         return mp_const_true;
     }
-    esp_err_t abort_result = naobot_ota_abort_active();
+    esp_err_t abort_result = naobot_ota_abort_active(true);
     if (abort_result != ESP_OK) {
         if (!failed_cleanup) {
             naobot_ota_set_esp_error("esp_ota_abort", abort_result);
@@ -714,6 +722,11 @@ static mp_obj_t nao_ota_abort(void) {
     return mp_const_true;
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(nao_ota_abort_obj, nao_ota_abort);
+
+static mp_obj_t nao_ota_session_active(void) {
+    return mp_obj_new_bool(ota_active);
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(nao_ota_session_active_obj, nao_ota_session_active);
 
 static void naobot_ota_dict_store(mp_obj_t dict, qstr key, mp_obj_t value) {
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(key), value);
@@ -955,6 +968,7 @@ static const mp_rom_map_elem_t nao_ota_module_globals_table[] = {
     {MP_ROM_QSTR(MP_QSTR_finish), MP_ROM_PTR(&nao_ota_finish_obj)},
     {MP_ROM_QSTR(MP_QSTR_activate), MP_ROM_PTR(&nao_ota_activate_obj)},
     {MP_ROM_QSTR(MP_QSTR_abort), MP_ROM_PTR(&nao_ota_abort_obj)},
+    {MP_ROM_QSTR(MP_QSTR_session_active), MP_ROM_PTR(&nao_ota_session_active_obj)},
     {MP_ROM_QSTR(MP_QSTR_status), MP_ROM_PTR(&nao_ota_status_obj)},
     {MP_ROM_QSTR(MP_QSTR_pending_verify), MP_ROM_PTR(&nao_ota_pending_verify_obj)},
     {MP_ROM_QSTR(MP_QSTR_current_sequence), MP_ROM_PTR(&nao_ota_current_sequence_obj)},
