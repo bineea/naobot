@@ -26,12 +26,16 @@ class MotionController:
         self._seen = []  # intent_id LRU，防重放
         self._pending = {}  # intent_id -> 待完成 skill 计数
         self._current_intent_id = None  # submit_intent 进行中的 intent_id
+        self.motion_inhibited = False
+        self.motion_inhibit_reason = None
 
     def submit_action(self, action):
         name = action.get("name")
         if name == "stop":
             self.cancel("stop")
             return True, ""
+        if self.motion_inhibited:
+            return False, "motion inhibited: " + (self.motion_inhibit_reason or "safety")
         if not self.safety.can_execute(action):
             return False, "firmware rejected unsafe action"
         if len(self.queue) + (1 if self.current else 0) >= self.queue_capacity:
@@ -77,6 +81,13 @@ class MotionController:
         return True, ""
 
     def tick(self):
+        if self.motion_inhibited:
+            if self.current is not None or self.queue:
+                self.cancel(self.motion_inhibit_reason or "safety")
+            else:
+                self.actions.stop()
+                self.motion_state = "inhibited"
+            return
         if self.reflex and self.reflex.check():
             self.cancel("reflex")
             return
@@ -96,16 +107,41 @@ class MotionController:
             self.current = None
         self.queue = []
         self.actions.stop()
-        self.motion_state = "stopped" if reason == "stop" else "cancelled"
+        if self.motion_inhibited:
+            self.motion_state = "inhibited"
+        else:
+            self.motion_state = "stopped" if reason == "stop" else "cancelled"
         if self.on_intent_done:
             for intent_id in list(self._pending.keys()):
                 self.on_intent_done(intent_id, "failed", reason)
         self._pending = {}
 
+    def set_motion_inhibited(self, inhibited, reason="safety"):
+        inhibited = bool(inhibited)
+        if inhibited:
+            self.motion_inhibited = True
+            self.motion_inhibit_reason = reason or "safety"
+            self.cancel(self.motion_inhibit_reason)
+            self.motion_state = "inhibited"
+            return True
+        if not self.motion_inhibited:
+            return True
+        if reason and reason != self.motion_inhibit_reason:
+            return False
+        self.motion_inhibited = False
+        self.motion_inhibit_reason = None
+        if self.current is None and not self.queue:
+            self.motion_state = "idle"
+        return True
+
     def is_running(self):
         return self.current is not None
 
     def _start_next(self):
+        if self.motion_inhibited:
+            self.actions.stop()
+            self.motion_state = "inhibited"
+            return
         if not self.queue:
             self.motion_state = "idle"
             return

@@ -329,3 +329,34 @@ def test_motion_controller_accepts_null_skills_with_compatibility_actions() -> N
 
     assert accepted, reason
     assert motion.current.name == "blink"
+
+
+def test_motion_inhibit_cancels_running_motion_rejects_new_actions_but_allows_stop() -> None:
+    servos = FakeServos()
+    actions = ActionPlayer(servos, FakeDisplay(), FakeBuzzer())
+    reflex = ReflexController(FakePower(), FakeImu(), actions, FakeDisplay(), FakeBuzzer())
+    motion = MotionController(actions, FakeSafety(), reflex, lambda: 0)
+
+    accepted, reason = motion.submit_action(
+        {"name": "small_step_forward", "args": {"steps": 2}}
+    )
+    assert accepted, reason
+    assert motion.is_running()
+
+    assert motion.set_motion_inhibited(True, "ota") is True
+    assert motion.motion_inhibited is True
+    assert motion.is_running() is False
+    assert motion.queue == []
+    assert servos.enabled is False
+
+    accepted, reason = motion.submit_action({"name": "wave", "args": {"level": 1}})
+    assert accepted is False
+    assert reason == "motion inhibited: ota"
+    motion.tick()
+    assert not any(call[0] == "pose" for call in servos.calls)
+    assert servos.enabled is False
+
+    accepted, reason = motion.submit_action({"name": "stop", "args": {}})
+    assert accepted is True
+    assert reason == ""
+    assert servos.enabled is False

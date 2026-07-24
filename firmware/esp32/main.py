@@ -510,6 +510,7 @@ async def main():
                 motion.cancel("reflex")
                 reflex.run()
             boot_health_status = boot_health.tick()
+            ota.tick()
             motion.tick()
             event = adapter.poll()
             if event:
@@ -522,7 +523,6 @@ async def main():
                     envelope = protocol.event(event, power, imu, reflex, motion, network_state)
                     if not ws or not ws.connected or not ws.send_json(envelope):
                         fallback.handle(event)
-            ota.tick()
             network_state["ota"] = merge_ota_status(ota.status(), boot_health_status)
             await sleep_to_safety_deadline(loop_start, network_state)
     finally:

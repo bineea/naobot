@@ -136,6 +136,26 @@ def test_xiao_build_fails_after_each_native_make_and_removes_stale_application()
     assert firmware_make < firmware_check
 
 
+def test_ota_public_key_change_is_a_cmake_and_compile_dependency() -> None:
+    script = (BUILD_ROOT / "build.ps1").read_text(encoding="utf-8")
+    ota_cmake = (BUILD_ROOT / "ota_module" / "micropython.cmake").read_text(
+        encoding="utf-8"
+    )
+
+    assert '$StagedOtaKeyDir = Join-Path $Workspace "naobot-ota"' in script
+    assert '$StagedOtaPublicKeyHeader = Join-Path $StagedOtaKeyDir' in script
+    assert "Get-FileHash -LiteralPath $SelectedOtaPublicKeyHeader" in script
+    assert "source_path_sha256" in script
+    assert "content_sha256" in script
+    assert (
+        "$env:NAOBOT_OTA_PUBLIC_KEY_HEADER = $StagedOtaPublicKeyHeader"
+        in script
+    )
+    assert "CMAKE_CONFIGURE_DEPENDS" in ota_cmake
+    assert '"${NAOBOT_OTA_PUBLIC_KEY_HEADER}"' in ota_cmake
+    assert '"${CMAKE_CURRENT_BINARY_DIR}/ota_public_key_selected.h"' in ota_cmake
+
+
 def test_xiao_micropython_board_header_declares_mcu_and_external_i2c() -> None:
     board_header = (
         BUILD_ROOT / "XIAO_ESP32S3_SENSE" / "mpconfigboard.h"

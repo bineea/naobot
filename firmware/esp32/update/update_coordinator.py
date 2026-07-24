@@ -38,6 +38,20 @@ MANIFEST_FIELDS = {
     "sha256",
     "min_runtime_api",
 }
+MOTION_INHIBIT_STATES = (
+    "loading_manifest",
+    "loading_signature",
+    "waiting_for_gates",
+    "installing",
+    "finalizing",
+    "finalize_timeout",
+    "awaiting_activation_release",
+    "waiting_for_activation",
+    "activating",
+    "activation_timeout",
+    "activated",
+    "activated_reboot_failed",
+)
 
 
 def now_ms():
@@ -208,22 +222,11 @@ class UpdateCoordinator:
         self._native_started_ms = None
         self._native_gate_error = None
         self._native_timed_out = False
+        self._motion_lock_held = False
+        self._native_session_active = False
 
     def request_install(self, sequence):
-        if self.ota is None or self.ota_worker is None or self._state in (
-            "loading_manifest",
-            "loading_signature",
-            "waiting_for_gates",
-            "installing",
-            "finalizing",
-            "finalize_timeout",
-            "awaiting_activation_release",
-            "waiting_for_activation",
-            "activating",
-            "activation_timeout",
-            "activated",
-            "activated_reboot_failed",
-        ):
+        if self.ota is None or self.ota_worker is None or self._state in MOTION_INHIBIT_STATES:
             return False
         worker = self.ota_worker.snapshot()
         if worker.get("runtime_state") not in ("starting", "running") or worker.get("busy"):
@@ -244,6 +247,8 @@ class UpdateCoordinator:
             or pending_verify is not False
         ):
             return False
+        if not self._acquire_motion_lock():
+            return False
         self._state = "loading_manifest"
         self._error = None
         self._sequence = sequence
@@ -257,10 +262,14 @@ class UpdateCoordinator:
         self._activation_touch_started_ms = None
         self._storage_start_wait_started_ms = None
         self._clear_native_request()
+        self._native_session_active = False
         return True
 
     def tick(self):
         try:
+            if self._state in MOTION_INHIBIT_STATES:
+                if not self._acquire_motion_lock():
+                    raise RuntimeError("OTA motion inhibit unavailable")
             if self._state in (
                 "loading_manifest",
                 "loading_signature",
@@ -370,8 +379,9 @@ class UpdateCoordinator:
                 self._sequence,
             )
         except Exception as exc:
-            self._fail(str(exc))
+            self._fail(str(exc), abort=True)
             return
+        self._native_session_active = True
         self._state = "installing"
         self._error = None
         self._clear_request()
@@ -539,6 +549,7 @@ class UpdateCoordinator:
             self._activation_touch_started_ms = None
             return
 
+        self._native_session_active = False
         self._state = "activated"
         self._error = None
         if timed_out or gate_error is not None:
@@ -580,7 +591,8 @@ class UpdateCoordinator:
         if (
             self.motion.current is not None
             or self.motion.queue
-            or self.motion.motion_state != "idle"
+            or self.motion.motion_state not in ("idle", "inhibited")
+            or getattr(self.motion, "motion_inhibited", False) is not True
         ):
             return "motion not idle"
         if getattr(self.servo_gate, "available", False) is not True:
@@ -630,8 +642,10 @@ class UpdateCoordinator:
         ) >= TOUCH_HOLD_MS
 
     def _deny(self, error):
-        self._state = "denied"
-        self._error = error
+        cleanup_errors = self._cleanup_without_native_abort()
+        errors = [error] + cleanup_errors
+        self._state = "failed" if cleanup_errors else "denied"
+        self._error = "; ".join(errors)
         self._clear_request()
 
     def _abort(self, error):
@@ -643,8 +657,10 @@ class UpdateCoordinator:
 
     def _fail(self, error, abort=False):
         errors = [error or "OTA failed"]
-        if abort:
+        if abort or self._native_session_active:
             errors.extend(self._cleanup())
+        elif self._state not in ("activated", "activated_reboot_failed"):
+            errors.extend(self._cleanup_without_native_abort())
         self._state = "failed"
         self._error = "; ".join(errors)
         self._clear_request()
@@ -670,21 +686,68 @@ class UpdateCoordinator:
     def _cleanup(self):
         errors = []
         try:
-            if self.servo_gate.set_disabled(True) is not True:
+            self.motion.cancel("ota")
+        except Exception as exc:
+            errors.append(str(exc) or "motion cleanup failed")
+        try:
+            if not self._disable_servo_output():
                 errors.append("OE cleanup unconfirmed")
-            elif (
-                not hasattr(self.servo_gate, "confirm_disabled")
-                or self.servo_gate.confirm_disabled() is not True
-            ):
-                errors.append("OE cleanup readback failed")
         except Exception as exc:
             errors.append(str(exc) or "OE cleanup failed")
-        try:
-            if self.ota.abort() is not True:
-                errors.append("native abort unconfirmed")
-        except Exception as exc:
-            errors.append(str(exc) or "native abort failed")
+        if self._native_session_active:
+            try:
+                if self.ota.abort() is not True:
+                    errors.append("native abort unconfirmed")
+                else:
+                    self._native_session_active = False
+            except Exception as exc:
+                errors.append(str(exc) or "native abort failed")
+        if not errors and not self._native_session_active and not self._release_motion_lock():
+            errors.append("motion inhibit release failed")
         return errors
+
+    def _cleanup_without_native_abort(self):
+        errors = []
+        try:
+            self.motion.cancel("ota")
+        except Exception as exc:
+            errors.append(str(exc) or "motion cleanup failed")
+        try:
+            if not self._disable_servo_output():
+                errors.append("OE cleanup unconfirmed")
+        except Exception as exc:
+            errors.append(str(exc) or "OE cleanup failed")
+        if not errors and not self._release_motion_lock():
+            errors.append("motion inhibit release failed")
+        return errors
+
+    def _disable_servo_output(self):
+        if self.servo_gate.set_disabled(True) is not True:
+            return False
+        if not hasattr(self.servo_gate, "confirm_disabled"):
+            return False
+        return self.servo_gate.confirm_disabled() is True
+
+    def _acquire_motion_lock(self):
+        if self._motion_lock_held:
+            return (
+                getattr(self.motion, "motion_inhibited", False) is True
+                and getattr(self.motion, "motion_inhibit_reason", None) == "ota"
+            )
+        if not hasattr(self.motion, "set_motion_inhibited"):
+            return False
+        if self.motion.set_motion_inhibited(True, "ota") is not True:
+            return False
+        self._motion_lock_held = True
+        return True
+
+    def _release_motion_lock(self):
+        if not self._motion_lock_held:
+            return True
+        if self.motion.set_motion_inhibited(False, "ota") is not True:
+            return False
+        self._motion_lock_held = False
+        return True
 
     def _submit_read(self, filename, offset, max_bytes, abort=False):
         request = self.storage.submit_update_read(

@@ -69,7 +69,33 @@ if (-not (Test-Path -LiteralPath $ProjectPython)) {
 if ($LASTEXITCODE -ne 0) {
     throw "OTA 公钥必须是可解析的 ECDSA P-256 public key。"
 }
-$env:NAOBOT_OTA_PUBLIC_KEY_HEADER = $SelectedOtaPublicKeyHeader
+$StagedOtaKeyDir = Join-Path $Workspace "naobot-ota"
+$StagedOtaPublicKeyHeader = Join-Path $StagedOtaKeyDir "ota_public_key_selected.h"
+New-Item -ItemType Directory -Force -Path $StagedOtaKeyDir | Out-Null
+$OtaKeyContentHash = (
+    Get-FileHash -LiteralPath $SelectedOtaPublicKeyHeader -Algorithm SHA256
+).Hash.ToLowerInvariant()
+$OtaKeyPathBytes = [Text.Encoding]::UTF8.GetBytes(
+    $SelectedOtaPublicKeyHeader.ToLowerInvariant()
+)
+$OtaKeyPathHashAlgorithm = [Security.Cryptography.SHA256]::Create()
+try {
+    $OtaKeyPathHash = [BitConverter]::ToString(
+        $OtaKeyPathHashAlgorithm.ComputeHash($OtaKeyPathBytes)
+    ).Replace("-", "").ToLowerInvariant()
+} finally {
+    $OtaKeyPathHashAlgorithm.Dispose()
+}
+$OtaKeyContent = [IO.File]::ReadAllText($SelectedOtaPublicKeyHeader)
+$OtaKeyFingerprint = (
+    "/* source_path_sha256=$OtaKeyPathHash content_sha256=$OtaKeyContentHash */`n"
+)
+[IO.File]::WriteAllText(
+    $StagedOtaPublicKeyHeader,
+    $OtaKeyFingerprint + $OtaKeyContent,
+    [Text.UTF8Encoding]::new($false)
+)
+$env:NAOBOT_OTA_PUBLIC_KEY_HEADER = $StagedOtaPublicKeyHeader
 $BuildDir = Join-Path $MicroPythonDir "ports/esp32/build-XIAO_ESP32S3_SENSE-SPIRAM_OCT"
 $ApplicationBin = Join-Path $BuildDir "micropython.bin"
 

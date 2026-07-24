@@ -16,6 +16,10 @@ NATIVE_ROOT = FIRMWARE_ROOT / "build" / "ota_module"
 if str(FIRMWARE_ROOT) not in sys.path:
     sys.path.insert(0, str(FIRMWARE_ROOT))
 
+firmware_main = __import__("main")
+from control.motion_controller import MotionController  # noqa: E402
+from motion.action_player import ActionPlayer  # noqa: E402
+
 
 def load_coordinator_module():
     assert COORDINATOR_PATH.exists(), "OTA 协调器尚未实现"
@@ -98,11 +102,20 @@ class FakeMotion:
         self.queue = []
         self.motion_state = "idle"
         self.cancelled = []
+        self.motion_inhibited = False
+        self.motion_inhibit_reason = None
 
     def cancel(self, reason):
         self.cancelled.append(reason)
         self.current = None
         self.queue = []
+
+    def set_motion_inhibited(self, inhibited, reason):
+        self.motion_inhibited = bool(inhibited)
+        self.motion_inhibit_reason = reason if inhibited else None
+        if inhibited:
+            self.cancel(reason)
+        return True
 
 
 class FakeGate:
@@ -127,11 +140,66 @@ class FakeReflex:
     emergency_stop = False
     shutdown_failed_latched = False
 
+    @staticmethod
+    def check():
+        return False
+
 
 class FakeTouch:
     available = True
     touch_mask = 0x03
     both_touched = True
+
+
+class GateBackedServos:
+    def __init__(self, gate):
+        self.gate = gate
+        self.enabled = False
+        self.pose_calls = 0
+
+    def pose(self, _positions):
+        self.pose_calls += 1
+        if not self.gate.set_disabled(False):
+            return False
+        self.enabled = True
+        return True
+
+    def stop(self):
+        disabled = self.gate.set_disabled(True)
+        self.enabled = not disabled
+        return disabled
+
+
+class PassiveDisplay:
+    def set_face(self, _face):
+        return None
+
+
+class AllowAllSafety:
+    @staticmethod
+    def can_execute(_action):
+        return True
+
+
+class RecordingWs:
+    def __init__(self):
+        self.sent = []
+
+    def send_json(self, payload):
+        self.sent.append(payload)
+        return True
+
+
+def make_real_motion(gate, clock):
+    servos = GateBackedServos(gate)
+    actions = ActionPlayer(servos, PassiveDisplay())
+    motion = MotionController(
+        actions,
+        AllowAllSafety(),
+        FakeReflex(),
+        lambda: clock[0],
+    )
+    return motion, actions, servos
 
 
 class FakeOta:
@@ -374,6 +442,7 @@ def test_signature_is_checked_before_manifest_is_parsed() -> None:
     tick_until(coordinator, "denied")
 
     assert coordinator.status()["ota_error"] == "invalid manifest signature"
+    assert dependencies["motion"].motion_inhibited is False
 
 
 @pytest.mark.parametrize("sequence", [-1, True, 1, 0x1_0000_0000])
@@ -523,6 +592,7 @@ def test_reboot_callback_failure_after_activate_preserves_boot_and_pending_metad
     assert ota.pending_sequence() == 2
     assert ota.phase() == "activated"
     assert ota.abort_calls == 0
+    assert dependencies["motion"].motion_inhibited is True
 
 
 def test_second_touch_must_also_be_continuous() -> None:
@@ -575,6 +645,111 @@ def test_gate_loss_during_install_aborts_and_keeps_oe_disabled() -> None:
     assert "charging not confirmed" in coordinator.status()["ota_error"]
     assert dependencies["ota_module"].abort_calls == 1
     assert dependencies["servo_gate"].disabled is True
+    assert dependencies["motion"].motion_inhibited is False
+
+
+def test_ota_motion_lock_blocks_network_intent_and_keeps_shared_output_disabled() -> None:
+    clock = [0]
+    gate = FakeGate()
+    motion, actions, servos = make_real_motion(gate, clock)
+    coordinator, dependencies, coordinator_clock = make_system(
+        motion=motion,
+        servo_gate=gate,
+        clock_ms=lambda: clock[0],
+    )
+    assert coordinator_clock == [0]
+    assert dependencies["motion"] is motion
+    assert motion.motion_inhibited is True
+    assert gate.disabled is True
+
+    ws = RecordingWs()
+    message = {
+        "id": "ota-blocked-intent",
+        "type": "intent",
+        "ts_ms": 1_000,
+        "deadline_ms": 1_000,
+        "payload": {"actions": [{"name": "wave", "args": {"level": 1}}]},
+    }
+    firmware_main.execute_intent(
+        message,
+        actions,
+        AllowAllSafety(),
+        firmware_main.FirmwareProtocol("ota-test"),
+        ws,
+        motion=motion,
+        reflex=FakeReflex(),
+        state={"last_host_ts_ms": 1_000, "last_host_clock_seen_ms": 0},
+        clock=lambda: 0,
+    )
+    motion.tick()
+
+    assert ws.sent[-1]["type"] == "error"
+    assert ws.sent[-1]["payload"]["code"] == "EXECUTION_FAILED"
+    assert "motion inhibited: ota" in ws.sent[-1]["payload"]["message"]
+    assert motion.current is None
+    assert motion.queue == []
+    assert servos.pose_calls == 0
+    assert servos.enabled is False
+    assert gate.disabled is True
+
+    stop = {
+        "id": "ota-stop",
+        "type": "intent",
+        "payload": {"actions": [{"name": "stop", "args": {}}]},
+    }
+    firmware_main.execute_intent(
+        stop,
+        actions,
+        AllowAllSafety(),
+        firmware_main.FirmwareProtocol("ota-test"),
+        ws,
+        motion=motion,
+        reflex=None,
+    )
+    assert ws.sent[-1]["type"] == "ack"
+    assert gate.disabled is True
+    assert coordinator.status()["ota_state"] == "loading_manifest"
+
+
+def test_successful_native_abort_releases_motion_lock_and_actions_can_start_again() -> None:
+    clock = [0]
+    gate = FakeGate()
+    motion, _actions, servos = make_real_motion(gate, clock)
+    coordinator, dependencies, _ = make_system(
+        image=b"x" * 8192,
+        motion=motion,
+        servo_gate=gate,
+        clock_ms=lambda: clock[0],
+    )
+    tick_until(coordinator, "waiting_for_gates")
+    clock[0] = 3000
+    tick_until(coordinator, "installing")
+    dependencies["power"].values["charging"] = False
+
+    coordinator.tick()
+
+    assert coordinator.status()["ota_state"] == "aborted"
+    assert dependencies["ota_module"].abort_calls == 1
+    assert motion.motion_inhibited is False
+    accepted, reason = motion.submit_action({"name": "wave", "args": {"level": 1}})
+    assert accepted, reason
+    motion.tick()
+    assert servos.pose_calls == 1
+    assert servos.enabled is True
+
+
+def test_failed_native_abort_keeps_motion_lock_fail_closed() -> None:
+    coordinator, dependencies, clock = make_system(image=b"x" * 8192)
+    tick_until(coordinator, "waiting_for_gates")
+    clock[0] = 3000
+    tick_until(coordinator, "installing")
+    dependencies["power"].values["charging"] = False
+    dependencies["ota_module"].abort = lambda: False
+
+    coordinator.tick()
+
+    assert coordinator.status()["ota_state"] == "failed"
+    assert dependencies["motion"].motion_inhibited is True
 
 
 @pytest.mark.parametrize("failing_dependency", ["servo_gate", "ota_module"])
@@ -836,6 +1011,7 @@ def test_background_finish_timeout_is_fail_closed_without_concurrent_abort() -> 
     assert dependencies["ota_module"].finish_calls == 0
     assert dependencies["ota_module"].abort_calls == 0
     assert dependencies["servo_gate"].disabled is True
+    assert dependencies["motion"].motion_inhibited is True
 
 
 def test_unavailable_ota_worker_aborts_before_native_finish() -> None:

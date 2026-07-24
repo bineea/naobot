@@ -9,6 +9,10 @@ endif()
 if(NOT EXISTS "${NAOBOT_OTA_PUBLIC_KEY_HEADER}")
     message(FATAL_ERROR "NAOBOT OTA public key header not found: ${NAOBOT_OTA_PUBLIC_KEY_HEADER}")
 endif()
+set_property(
+    DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${NAOBOT_OTA_PUBLIC_KEY_HEADER}"
+)
 
 configure_file(
     "${NAOBOT_OTA_PUBLIC_KEY_HEADER}"
