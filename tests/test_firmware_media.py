@@ -1380,12 +1380,13 @@ def test_custom_image_recipe_static_structure_pins_exact_upstream_versions() -> 
     assert "esp32-camera" in cmake
 
 
-def test_readme_reports_recipe_only_and_no_freertos_isolation_claim() -> None:
+def test_readme_reports_real_build_without_claiming_hardware_acceptance() -> None:
     readme = (FIRMWARE_ROOT / "README.md").read_text(encoding="utf-8")
 
     assert "静态编译" not in readme
-    assert "未实际执行 C 编译" in readme
+    assert "完成项目定制 C 编译、链接和分区尺寸检查" in readme
+    assert "这不等于硬件验收" in readme
+    assert "均未验收" in readme
     assert "不提供 FreeRTOS 高优先级隔离保证" in readme
-    assert "静态结构检查" in readme
     assert "DNS/TCP/WebSocket 握手" in readme
     assert "独立 `MediaRuntimeWorker` 线程" in readme

@@ -23,23 +23,22 @@
 - 当前动作假设四个 180 度关节舵机按 `lf/rf/lr/rr` 表示左前、右前、左后、右后；动作序列以明显可见和可调参为目标。
 - `demo/` 目录只用于硬件 bring-up 验证，不参与主固件运行链路。
 
-## N16R8 44 针板卡
+## Seeed XIAO ESP32S3 Sense
 
-固定 profile 位于 `boards/n16r8_44pin.py`，目标为 ESP32-S3 N16R8（16 MB Flash、8 MB Octal PSRAM）：
+固定 profile 位于 `boards/xiao_esp32s3_sense.py`，目标为 Seeed XIAO ESP32S3 Sense（8 MB Flash、8 MB Octal PSRAM）：
 
 | 设备 | 固定 GPIO |
 | --- | --- |
-| OV2640 D0-D7 | 4, 5, 10, 11, 12, 13, 14, 18 |
-| OV2640 XCLK/PCLK/VSYNC/HREF | 21, 38, 39, 40 |
-| OV2640 SCCB SDA/SCL | 8, 9 |
-| INMP441 SCK/WS/SD | 41, 42, 47 |
-| MAX98357A BCLK/LRC/DIN | 19, 20, 45 |
-| Touch head/back | 1, 2 |
-| Servo lf/rf/lr/rr | 6, 7, 15, 16 |
-| OLED + MPU6050 SDA/SCL | 8, 9 |
-| Buzzer | 17 |
+| OV2640 D0-D7 | 15, 17, 18, 16, 14, 12, 11, 48 |
+| OV2640 XCLK/PCLK/VSYNC/HREF | 10, 13, 38, 47 |
+| OV2640 SCCB SDA/SCL | 40, 39 |
+| PDM 麦克风 CLK/DATA | 42, 41 |
+| MAX98357A BCLK/LRC/DIN | 43, 44, 4 |
+| microSD CS/SCK/MISO/MOSI | 3, 7, 8, 9 |
+| OLED + MPU6050 SDA/SCL | 5, 6 |
+| PCA9685 OE | 1 |
 
-GPIO8/9 由摄像头 SCCB、OLED 和 MPU6050 共用；定制 `camera` 模块复用主程序已建立的 I2C0，不重复安装总线 driver。不要连接 GPIO35-37 或 GPIO48；下载、日志和 REPL 只使用板载 **CH343**，不要切换到原生 USB/JTAG 引脚方案。
+定制 `camera` 模块管理摄像头 SCCB；外部 OLED 与 MPU6050 使用 I2C0 GPIO5/6。下载、日志和 REPL 使用原生 USB CDC。
 
 ## 网络配置
 
@@ -87,7 +86,7 @@ Stage 1 的原生写入入口是
 
 - MicroPython `v1.28.0`，commit `2b0015629f67fd186f980079b2e696ad0bc7343c`
 - Espressif `esp32-camera v2.1.6`，commit `2ac69a6f1749694804f5196e63fa1f79800b74bf`
-- 外置 `N16R8_44PIN` board profile + `SPIRAM_OCT`，16 MB Flash，`CONFIG_CAMERA_PSRAM_DMA=y`
+- 外置 `XIAO_ESP32S3_SENSE` board profile + `SPIRAM_OCT`，8 MB Flash，`CONFIG_CAMERA_PSRAM_DMA=y`
 - `camera_module/` 提供 `camera` MicroPython C 模块；`manifest.py` 冻结 board、media 和 config
 
 在已安装 Git、GNU Make、ESP-IDF 及其工具链的 PowerShell 环境运行：
@@ -96,7 +95,7 @@ Stage 1 的原生写入入口是
 firmware/esp32/build/build.ps1 -Clean
 ```
 
-脚本会把源码放在 `firmware/esp32/build/_work/`，校验两个固定 commit 后调用 MicroPython ESP32 构建。输出目录为 `_work/micropython/ports/esp32/build-N16R8_44PIN-SPIRAM_OCT/`。仓库没有附带或声称已经生成真实 `.bin`；构建输出需由执行者检查并在目标板上验证。
+生产构建必须通过 `-OtaPublicKeyHeader <path>` 提供生产 P-256 公钥头；未指定时仅使用仓库开发公钥，不得发布。脚本会把源码放在 `firmware/esp32/build/_work/`，校验两个固定 commit 后调用 MicroPython ESP32 构建。输出目录为 `_work/micropython/ports/esp32/build-XIAO_ESP32S3_SENSE-SPIRAM_OCT/`。仓库不提交构建产物；每次构建仍需检查输出并在目标板上验证。
 
 ## 上传
 
@@ -141,4 +140,4 @@ mpremote connect COM3 soft-reset
 
 ## 硬件验证状态
 
-当前只完成 CPython fake、Python 语法检查、协议测试和构建配方静态结构检查，未实际执行 C 编译，也未生成项目定制真实 `.bin`。仓库 generic bin 不含定制 `camera` 模块。尚未在真实 N16R8 44 针板、OV2640、INMP441、MAX98357A、PSRAM、舵机或 CH343 串口链路上验证，30 分钟硬件指标也未执行。首次 bring-up 必须检查 GPIO8/9 共线、摄像头 10/15 FPS、I2S 声道/幅值、PSRAM 余量、半双工排空恢复、TTS 连续播放、控制连接重连、媒体 worker 重连以及媒体拥塞时 50 ms 安全循环抖动；指标门槛见 `docs/product/roadmap.md`。
+2026-07-24 已在 HEAD `ce8a77e` 使用固定上游版本完成项目定制 C 编译、链接和分区尺寸检查，生成 1,838,064 字节的 OTA 应用镜像 `micropython.bin`。这不等于硬件验收；仓库 generic bin 也仍不含定制 `camera` 模块。真实 XIAO ESP32S3 Sense 上的烧录、签名 OTA、失败回滚、OV2640、PDM/I2S、PSRAM、USB CDC、OLED、MPU6050、触摸、舵机和 30 分钟稳定性均未验收。首次 bring-up 必须检查摄像头 10/15 FPS、音频声道/幅值、PSRAM 余量、半双工排空恢复、TTS 连续播放、控制连接重连、媒体 worker 重连以及媒体拥塞时 50 ms 安全循环抖动；指标门槛见 `docs/product/roadmap.md`。

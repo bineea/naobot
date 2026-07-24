@@ -175,11 +175,11 @@ git config core.hooksPath .githooks
 firmware/esp32/build/build.ps1 -Clean
 ```
 
-预期输出目录为 `firmware/esp32/build/_work/micropython/ports/esp32/build-N16R8_44PIN-SPIRAM_OCT/`。只有目录中真实存在 `firmware.bin` 后才能执行：
+预期输出目录为 `firmware/esp32/build/_work/micropython/ports/esp32/build-XIAO_ESP32S3_SENSE-SPIRAM_OCT/`。只有目录中真实存在 `firmware.bin` 后才能执行：
 
 ```powershell
 esptool.py --chip esp32s3 --port COM3 erase_flash
-esptool.py --chip esp32s3 --port COM3 --baud 460800 write_flash -z 0x0 firmware/esp32/build/_work/micropython/ports/esp32/build-N16R8_44PIN-SPIRAM_OCT/firmware.bin
+esptool.py --chip esp32s3 --port COM3 --baud 460800 write_flash -z 0x0 firmware/esp32/build/_work/micropython/ports/esp32/build-XIAO_ESP32S3_SENSE-SPIRAM_OCT/firmware.bin
 ```
 
-源码上传命令见 `firmware/esp32/README.md`。当前仓库只验证了配方静态结构，未在本机真实执行 C 编译，未生成或验收定制 bin，也未实测 N16R8、OV2640、I2S、PSRAM、CH343 或 30 分钟指标。
+源码上传命令见 `firmware/esp32/README.md`。2026-07-24 已完成项目定制镜像的真实 C 编译、链接和分区尺寸检查；这仅是构建证据，不代表定制 bin 已在目标硬件验收。XIAO ESP32S3 Sense 的真实烧录、签名 OTA、失败回滚、OV2640、PDM/I2S、PSRAM、USB CDC 和 30 分钟指标仍未验收。

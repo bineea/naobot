@@ -55,4 +55,4 @@ L3 只输出 `goal/text/expression/skills/memory_suggestion`；L2 `BehaviorRunti
 
 ## 硬件事实边界
 
-CPython fake、协议测试、Python 语法检查和静态构建配方不等于硬件安全验收。当前没有真实 C 编译、项目定制 bin、N16R8、OV2640、I2S、PSRAM、CH343、舵机或 30 分钟稳定性实测记录；在记录产生前必须维持“未验收”状态。
+CPython fake、协议测试、Python 语法检查、静态构建配方以及真实 C 编译均不等于硬件安全验收。2026-07-24 已有项目定制 bin 的构建、链接和分区尺寸证据，但 XIAO ESP32S3 Sense 的真实烧录、签名 OTA、失败回滚、OV2640、PDM/I2S、PSRAM、USB CDC、舵机和 30 分钟稳定性仍无实测记录；在记录产生前必须维持“未验收”状态。
