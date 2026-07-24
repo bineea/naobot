@@ -7,6 +7,7 @@ except ImportError:
 HEALTHY_WINDOW_MS = 10000
 VERIFY_DEADLINE_MS = 30000
 SAFE_POSTURES = ("upright", "sitting")
+MOTION_INHIBIT_OWNER = "ota_boot_health"
 
 
 def now_ms():
@@ -45,6 +46,7 @@ class BootHealthMonitor:
         self._running_target = False
         self._pending_started_ms = None
         self._healthy_started_ms = None
+        self._motion_lock_held = False
 
     def tick(self):
         try:
@@ -111,7 +113,12 @@ class BootHealthMonitor:
             if metadata_error is None:
                 metadata_error = str(exc) or "OTA target partition state unavailable"
 
-        if not self._is_protected_boot():
+        if self._has_confirmed_no_pending_transaction():
+            if not self._release_motion_lock():
+                self._state = "error"
+                self._error = "boot health motion inhibit release failed"
+                self._healthy_started_ms = None
+                return
             self._pending = False
             self._pending_started_ms = None
             self._healthy_started_ms = None
@@ -120,6 +127,8 @@ class BootHealthMonitor:
                 self._error = None
             return
 
+        if not self._acquire_motion_lock():
+            raise RuntimeError("boot health motion inhibit unavailable")
         current_ms = self.clock_ms()
         if self._pending_started_ms is None:
             self._pending_started_ms = current_ms
@@ -211,15 +220,46 @@ class BootHealthMonitor:
             self._pending_sequence = "unknown"
             self._phase = "unknown"
             self._running_target = "unknown"
-        self._state = "healthy"
-        self._error = None
+        if self._release_motion_lock():
+            self._state = "healthy"
+            self._error = None
+        else:
+            self._state = "error"
+            self._error = "boot health motion inhibit release failed"
 
     def _is_protected_boot(self):
+        return not self._has_confirmed_no_pending_transaction()
+
+    def _has_confirmed_no_pending_transaction(self):
         return (
-            self._pending in (True, "unknown")
-            or self._pending_sequence not in (None, False)
-            or self._phase in ("prepared", "activated", "confirming", "rollback", "unknown")
+            self._pending is False
+            and self._pending_sequence in (None, False)
+            and self._phase in (None, False)
         )
+
+    def _acquire_motion_lock(self):
+        if self._motion_lock_held:
+            if hasattr(self.motion, "has_motion_inhibit"):
+                return self.motion.has_motion_inhibit(MOTION_INHIBIT_OWNER) is True
+            return (
+                getattr(self.motion, "motion_inhibited", False) is True
+                and getattr(self.motion, "motion_inhibit_reason", None)
+                == MOTION_INHIBIT_OWNER
+            )
+        if not hasattr(self.motion, "set_motion_inhibited"):
+            return False
+        if self.motion.set_motion_inhibited(True, MOTION_INHIBIT_OWNER) is not True:
+            return False
+        self._motion_lock_held = True
+        return True
+
+    def _release_motion_lock(self):
+        if not self._motion_lock_held:
+            return True
+        if self.motion.set_motion_inhibited(False, MOTION_INHIBIT_OWNER) is not True:
+            return False
+        self._motion_lock_held = False
+        return True
 
     def _rollback(self, reason):
         self._state = "rollback"

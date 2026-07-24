@@ -28,6 +28,7 @@ class MotionController:
         self._current_intent_id = None  # submit_intent 进行中的 intent_id
         self.motion_inhibited = False
         self.motion_inhibit_reason = None
+        self._motion_inhibit_owners = []
 
     def submit_action(self, action):
         name = action.get("name")
@@ -118,21 +119,28 @@ class MotionController:
 
     def set_motion_inhibited(self, inhibited, reason="safety"):
         inhibited = bool(inhibited)
+        owner = reason or "safety"
         if inhibited:
-            self.motion_inhibited = True
-            self.motion_inhibit_reason = reason or "safety"
-            self.cancel(self.motion_inhibit_reason)
+            if owner not in self._motion_inhibit_owners:
+                self._motion_inhibit_owners.append(owner)
+            self._sync_motion_inhibit_state()
+            self.cancel(owner)
             self.motion_state = "inhibited"
             return True
-        if not self.motion_inhibited:
+        if owner not in self._motion_inhibit_owners:
             return True
-        if reason and reason != self.motion_inhibit_reason:
-            return False
-        self.motion_inhibited = False
-        self.motion_inhibit_reason = None
+        self._motion_inhibit_owners.remove(owner)
+        self._sync_motion_inhibit_state()
+        if self.motion_inhibited:
+            self.actions.stop()
+            self.motion_state = "inhibited"
+            return True
         if self.current is None and not self.queue:
             self.motion_state = "idle"
         return True
+
+    def has_motion_inhibit(self, owner):
+        return (owner or "safety") in self._motion_inhibit_owners
 
     def is_running(self):
         return self.current is not None
@@ -174,3 +182,9 @@ class MotionController:
         self._seen.append(intent_id)
         if len(self._seen) > self.seen_capacity:
             del self._seen[0]
+
+    def _sync_motion_inhibit_state(self):
+        self.motion_inhibited = bool(self._motion_inhibit_owners)
+        self.motion_inhibit_reason = (
+            self._motion_inhibit_owners[0] if self._motion_inhibit_owners else None
+        )

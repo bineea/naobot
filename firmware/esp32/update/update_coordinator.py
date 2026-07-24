@@ -730,6 +730,8 @@ class UpdateCoordinator:
 
     def _acquire_motion_lock(self):
         if self._motion_lock_held:
+            if hasattr(self.motion, "has_motion_inhibit"):
+                return self.motion.has_motion_inhibit("ota") is True
             return (
                 getattr(self.motion, "motion_inhibited", False) is True
                 and getattr(self.motion, "motion_inhibit_reason", None) == "ota"
