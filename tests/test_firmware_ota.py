@@ -913,6 +913,105 @@ def test_abort_dependency_errors_do_not_escape_the_safety_tick(failing_dependenc
     assert "abort dependency failed" in coordinator.status()["ota_error"]
 
 
+def test_persistent_cleanup_poll_error_does_not_stop_l0_and_retries_next_ticks() -> None:
+    coordinator, dependencies, clock = make_system(image=b"x" * 8192)
+    tick_until(coordinator, "waiting_for_gates")
+    clock[0] = 3000
+    tick_until(coordinator, "installing")
+    dependencies["power"].values["charging"] = False
+    coordinator.tick()
+
+    worker = dependencies["ota_worker"]
+    original_poll = worker.poll
+
+    def fail_poll(_request):
+        raise OSError("cleanup poll unavailable")
+
+    worker.poll = fail_poll
+    l0_ticks = 0
+    for _ in range(3):
+        coordinator.tick()
+        l0_ticks += 1
+        assert dependencies["motion"].motion_inhibited is True
+        assert dependencies["servo_gate"].disabled is True
+        assert dependencies["ota_module"].session_active() is True
+
+    assert l0_ticks == 3
+    assert "cleanup poll unavailable" in coordinator.status()["ota_error"]
+
+    worker.poll = original_poll
+    assert worker.complete_pending() is True
+    coordinator.tick()
+
+    assert dependencies["ota_module"].session_active() is False
+    assert dependencies["motion"].motion_inhibited is False
+
+
+def test_cleanup_submit_error_is_contained_and_retried_next_tick() -> None:
+    coordinator, dependencies, clock = make_system(image=b"x" * 8192)
+    tick_until(coordinator, "waiting_for_gates")
+    clock[0] = 3000
+    tick_until(coordinator, "installing")
+    dependencies["power"].values["charging"] = False
+
+    worker = dependencies["ota_worker"]
+    original_submit = worker.submit
+
+    def fail_submit(_operation):
+        raise OSError("cleanup submit unavailable")
+
+    worker.submit = fail_submit
+    for _ in range(2):
+        coordinator.tick()
+        assert dependencies["motion"].motion_inhibited is True
+        assert dependencies["servo_gate"].disabled is True
+        assert dependencies["ota_module"].session_active() is True
+
+    assert "cleanup submit unavailable" in coordinator.status()["ota_error"]
+
+    worker.submit = original_submit
+    coordinator.tick()
+    assert worker.pending["operation"] == "abort"
+    assert worker.complete_pending() is True
+    coordinator.tick()
+
+    assert dependencies["ota_module"].session_active() is False
+    assert dependencies["motion"].motion_inhibited is False
+
+
+def test_cleanup_motion_release_error_is_contained_until_release_succeeds() -> None:
+    coordinator, dependencies, clock = make_system(image=b"x" * 8192)
+    tick_until(coordinator, "waiting_for_gates")
+    clock[0] = 3000
+    tick_until(coordinator, "installing")
+    dependencies["power"].values["charging"] = False
+    coordinator.tick()
+
+    worker = dependencies["ota_worker"]
+    assert worker.complete_pending() is True
+    motion = dependencies["motion"]
+    original_set_motion_inhibited = motion.set_motion_inhibited
+
+    def fail_release(inhibited, reason):
+        if not inhibited:
+            raise OSError("motion release unavailable")
+        return original_set_motion_inhibited(inhibited, reason)
+
+    motion.set_motion_inhibited = fail_release
+    coordinator.tick()
+
+    assert dependencies["ota_module"].session_active() is False
+    assert motion.motion_inhibited is True
+    assert dependencies["servo_gate"].disabled is True
+    assert "motion release unavailable" in coordinator.status()["ota_error"]
+
+    motion.set_motion_inhibited = original_set_motion_inhibited
+    coordinator.tick()
+
+    assert motion.motion_inhibited is False
+    assert coordinator._cleanup_pending is False
+
+
 def test_native_digest_failure_is_reported_and_does_not_reboot() -> None:
     coordinator, dependencies, clock = make_system()
     dependencies["ota_module"].finish_error = "firmware digest mismatch"

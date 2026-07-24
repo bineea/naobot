@@ -732,7 +732,6 @@ class UpdateCoordinator:
             target_state="failed",
             abort_required=self._state in MOTION_INHIBIT_STATES,
         )
-        self._tick_cleanup()
 
     def _start_cleanup(self, error, *, target_state, abort_required):
         if self._cleanup_pending:
@@ -758,8 +757,11 @@ class UpdateCoordinator:
         if not self._cleanup_pending:
             return
         errors = []
-        if not self._acquire_motion_lock():
-            errors.append("OTA motion inhibit unavailable")
+        try:
+            if not self._acquire_motion_lock():
+                errors.append("OTA motion inhibit unavailable")
+        except Exception as exc:
+            errors.append(str(exc) or "OTA motion inhibit unavailable")
         try:
             self.motion.cancel("ota")
         except Exception as exc:
@@ -771,7 +773,16 @@ class UpdateCoordinator:
             errors.append(str(exc) or "OE cleanup failed")
 
         if self._cleanup_request is not None:
-            result = self.ota_worker.poll(self._cleanup_request)
+            try:
+                result = self.ota_worker.poll(self._cleanup_request)
+            except Exception as exc:
+                errors.append(str(exc) or "native abort poll failed")
+                self._publish_cleanup_errors(errors)
+                return
+            if not isinstance(result, dict):
+                errors.append("native abort poll invalid")
+                self._publish_cleanup_errors(errors)
+                return
             if not result.get("done"):
                 self._publish_cleanup_errors(errors)
                 return
@@ -799,7 +810,16 @@ class UpdateCoordinator:
                 errors.append("OTA worker unavailable")
                 self._publish_cleanup_errors(errors)
                 return
-            request = self.ota_worker.submit("abort")
+            try:
+                request = self.ota_worker.submit("abort")
+            except Exception as exc:
+                errors.append(str(exc) or "native abort submit failed")
+                self._publish_cleanup_errors(errors)
+                return
+            if not isinstance(request, dict):
+                errors.append("native abort submit invalid")
+                self._publish_cleanup_errors(errors)
+                return
             if not request.get("accepted"):
                 errors.append(request.get("reason") or "native abort submit failed")
             else:
@@ -810,7 +830,14 @@ class UpdateCoordinator:
         if errors:
             self._publish_cleanup_errors(errors)
             return
-        if not self._release_motion_lock():
+        try:
+            released = self._release_motion_lock()
+        except Exception as exc:
+            self._publish_cleanup_errors(
+                [str(exc) or "motion inhibit release failed"]
+            )
+            return
+        if not released:
             self._publish_cleanup_errors(["motion inhibit release failed"])
             return
 
