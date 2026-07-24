@@ -140,4 +140,4 @@ mpremote connect COM3 soft-reset
 
 ## 硬件验证状态
 
-2026-07-24 已在 HEAD `891e60a` 使用固定上游版本完成项目定制 C 编译、链接和分区尺寸检查，生成 1,840,272 字节的 OTA 应用镜像 `micropython.bin`。这不等于硬件验收；仓库 generic bin 也仍不含定制 `camera` 模块。真实 XIAO ESP32S3 Sense 上的烧录、签名 OTA、失败回滚、OV2640、PDM/I2S、PSRAM、USB CDC、OLED、MPU6050、触摸、舵机和 30 分钟稳定性均未验收。首次 bring-up 必须检查摄像头 10/15 FPS、音频声道/幅值、PSRAM 余量、半双工排空恢复、TTS 连续播放、控制连接重连、媒体 worker 重连以及媒体拥塞时 50 ms 安全循环抖动；指标门槛见 `docs/product/roadmap.md`。
+2026-07-24 已在 HEAD `240b4e9` 使用固定上游版本完成项目定制 C 编译、链接和分区尺寸检查，生成 1,840,304 字节的 OTA 应用镜像 `micropython.bin`。这不等于硬件验收；仓库 generic bin 也仍不含定制 `camera` 模块。真实 XIAO ESP32S3 Sense 上的烧录、签名 OTA、失败回滚、OV2640、PDM/I2S、PSRAM、USB CDC、OLED、MPU6050、触摸、舵机和 30 分钟稳定性均未验收。首次 bring-up 必须检查摄像头 10/15 FPS、音频声道/幅值、PSRAM 余量、半双工排空恢复、TTS 连续播放、控制连接重连、媒体 worker 重连以及媒体拥塞时 50 ms 安全循环抖动；指标门槛见 `docs/product/roadmap.md`。
